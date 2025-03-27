@@ -693,6 +693,11 @@ def _wait_and_warmup(
     image_token_text: str,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
+    if server_args.disaggregation_mode != "null":
+        logger.warning(f"No need warmp UP in mode : {server_args.disaggregation_mode}")
+
+        return
+
     headers = {}
     url = server_args.url()
     if server_args.api_key:

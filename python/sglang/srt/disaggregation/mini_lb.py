@@ -34,7 +34,9 @@ class MiniLoadBalancer:
         modified_request.update(
             {
                 "bootstrap_host": bootstrap_host,
-                "bootstrap_room": random.randint(0, 2**63 - 1),
+                "bootstrap_room": 1234567,
+
+                # "bootstrap_room": random.randint(0, 2**63 - 1),
             }
         )
 
@@ -161,6 +163,9 @@ async def handle_generate_request(request_data: dict):
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
+    print("hostname: ",hostname)
+    print("prefill_server: ",prefill_server)
+
     modified_request = request_data.copy()
     modified_request.update(
         {

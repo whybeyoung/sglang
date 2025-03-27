@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVReceiver
+from sglang.srt.disaggregation.conn2 import KVArgs, KVManager, KVPoll, KVReceiver
 from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     poll_and_all_reduce,
@@ -158,7 +158,7 @@ class DecodePreallocQueue:
 
         preallocated_reqs = []
         indices_to_remove = set()
-        allocatable_tokens = self._allocatable_tokens(count_retracted=True)
+        allocatable_tokens = self._allocatable_tokens()
 
         for i, decode_req in enumerate(self.queue):
             if not decode_req.waiting_for_input:
