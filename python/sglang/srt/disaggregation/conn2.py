@@ -29,7 +29,7 @@ os.environ['UCX_MAX_RNDV_LANES'] = "16"
 os.environ['UCX_IB_GID_INDEX'] = '3'
 logger = logging.getLogger(__name__)
 
-from sglang.srt.utils import global_room_data, get_open_port
+from sglang.srt.utils import  get_open_port
 
 UCX_CONFIG = {
     # "RNDV_SCHEME": "put_zcopy"
@@ -40,8 +40,6 @@ class KVBootstrapServer:
     def __init__(self, port: int):
         self.bootstrap_server_port = port
         self.ucx_server = self.start_server()
-        global global_sessions
-        self.global_sessions = global_sessions
 
     def start_server(self):
         server = start_bootstrap_server("0.0.0.0", self.bootstrap_server_port)
@@ -82,6 +80,37 @@ class KVManager:
         self.bootstrap_server = bootstrap_server
 
 
+    def calculate_token_kv_address(self,  layer_id: int, token_index: int):
+        # 获取基础地址 - 每层的KV数据指针
+        base_address = self.args.kv_data_ptrs[layer_id]
+        # 每个token的KV数据大小
+        token_kv_size =self.args.kv_item_lens[layer_id]
+        # 计算偏移量
+        offset = token_kv_size * token_index
+        # 最终地址 = 基址 + 偏移量
+        token_kv_address = base_address + offset
+        return token_kv_address, offset
+
+    def calculate_all_token_kv_addresses(self, token_indices: list[int]):
+        # 结果存储
+        addresses_by_layer = []
+        offsets_by_layer = []
+
+        # 对每一层计算
+        for layer_id in range(len(self.args.kv_data_ptrs)):
+            token_addresses = []
+            token_offsets = []
+
+            # 计算每个token的地址和偏移量
+            for token_index in token_indices:
+                address, offset = self.calculate_token_kv_address( layer_id, token_index)
+                token_addresses.append(address)
+                token_offsets.append(offset)
+
+            addresses_by_layer.append(token_addresses)
+            offsets_by_layer.append(token_offsets)
+
+        return addresses_by_layer, offsets_by_layer
 class KVPoll:
     """Status codes for KV operations"""
     Failed = 0
@@ -120,7 +149,7 @@ class KVSender:
         self.current_indices = None
         self.current_layer = 0
         # 保存初始化信息
-        self.num_layers = mgr.layer_num
+       # self.num_layers = mgr.layer_num
 
 
     def init(self, num_tokens: int, aux_idx: int) -> bool:
@@ -193,7 +222,9 @@ class KVSender:
 
         #self.has_sent = True
         # 收集要传输的数据
-        transfer_data = self._collect_transfer_data(kv_indices)
+        result= self.mgr.calculate_all_token_kv_addresses(kv_indices)
+
+        #transfer_data = self._collect_transfer_data(kv_indices)
         asyncio.run(self.a_send(kv_indices))
 
     def _collect_transfer_data(self, kv_indices: npt.NDArray[np.int32]):

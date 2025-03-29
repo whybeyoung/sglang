@@ -36,7 +36,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 
-from sglang.srt.utils import global_room_data
 
 #  Copyright (c) 2022. Lorem ipsum dolor sit amet, consectetur adipiscing elit.
 #  Morbi non lorem porttitor neque feugiat blandit. Ut vitae ipsum eget quam lacinia accumsan.
@@ -189,9 +188,7 @@ def start_bootstrap_server(bootstrap_host: str, bootstrap_port: int, server_args
     Returns:
         tuple: (UvicornServer instance, shared data dictionary)
     """
-    global_room_data.update({"server_args":server_args})
-
-    server = UvicornServer(app, bootstrap_host, bootstrap_port, global_room_data)
+    server = UvicornServer(app, bootstrap_host, bootstrap_port, {})
     server.start()
 
     return server
