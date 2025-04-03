@@ -89,7 +89,6 @@ async def handshake(request: HandshakeRequest):
     try:
         room_id = request.room_id
         global room_to_port_mapping
-        print(request)
         logging.info(f"Handshake successful for room_id: {room_id}")
         if room_id not in room_to_port_mapping:
             room_to_port_mapping[room_id] = {request.engine_rank: request.ip_addr}
