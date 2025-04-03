@@ -11,10 +11,11 @@ import time
 import requests
 
 from sglang.srt.bootstrap.app import start_bootstrap_server
+from sglang.srt.disaggregation.ib_devices import find_best_roce_for_gpu
 
 os.environ["RAPIDS_LIBUCX_PREFER_SYSTEM_LIBRARY"] = "true"
 
-import ucp
+import torch
 import uuid
 from typing import Dict, Optional
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ class KVArgs:
     aux_data_lens: list[int]
     aux_item_lens: list[int]
     ib_device: str = "all"
+    gpu_id: int
 
 
 class KVManager:
@@ -66,6 +68,13 @@ class KVManager:
 
         self.active_sessions = {}
         self.bootstrap_server = bootstrap_server
+        self.args.ib_device, net_card = find_best_roce_for_gpu(self.args.gpu_id)
+        if self.args.ib_device:
+            logger.info(
+                "Current Process Using the  gpu id: {}, ib_device: {} net:{}".format(self.args.gpu_id, self.args.ib_device,
+                                                                                     net_card))
+        else:
+            raise Exception("No ROCE IB device found...")
 
     def set_bootstrap_server(self, bootstrap_server):
         self.bootstrap_server = bootstrap_server
@@ -170,6 +179,7 @@ class KVSender:
 
         self.mrs_to_send = []  # 数据段待发送的内存区域
         self.meta_has_sent = False  # meta 还没有发送
+
     def handshake(self):
         resp = requests.get(f"http://{self.bootstrap_addr}/get_room_info/{self.bootstrap_room}")
 
@@ -195,7 +205,7 @@ class KVSender:
         metadata_ptr_length = self.mgr.aux_item_lens[0]
 
         try:
-            self.qp = RdmaClient(host_ip=self.target_ip, socket_port=self.target_port)
+            self.qp = RdmaClient(host_ip=self.target_ip, ib_device=self.mgr.args.ib_device, socket_port=self.target_port)
             if self.qp.init(metadata_ptr, metadata_ptr_length):
                 logger.debug("Transferring...")
                 self.state = KVPoll.Transferring
@@ -298,7 +308,7 @@ class KVReceiver:
 
         self.ip = self.get_local_ip(self.bootstrap_addr)
 
-        self.qp = RdmaQP(socket_port=self.rdma_port)
+        self.qp = RdmaQP(socket_port=self.rdma_port, ib_device=self.mgr.args.ib_device)
 
         # todo remove http handshake
         self.handshake()
@@ -313,6 +323,7 @@ class KVReceiver:
             s.connect((host, int(port.strip())))  # 连接到外部服务器，不会真正发送数据
             logger.debug("getting local ip addr: {}".format(addr))
             return s.getsockname()[0]
+
     def handshake(self):
         post_data = {
             "room_id": self.bootstrap_room,
@@ -351,7 +362,7 @@ class KVReceiver:
         metadata_ptr = self.mgr.aux_data_ptrs[0] + (aux_index * self.mgr.aux_item_lens[0])
         metadata_length = self.mgr.aux_item_lens[0]
         # 创建每一岑layer的mr 得到对应的key 传给客户端
-        rkeys= []
+        rkeys = []
 
         for layer_id, base_addr in enumerate(self.mgr.kv_data_ptrs):
             layer_mr = self.qp.create_mr(base_addr, self.mgr.kv_data_lens[layer_id])
@@ -372,7 +383,7 @@ class KVReceiver:
             groups_mrs_info.append(mrs_info)
 
         try:
-            self.qp.init( groups_mrs_info, metadata_ptr, metadata_length)
+            self.qp.init(groups_mrs_info, metadata_ptr, metadata_length)
             self.state = KVPoll.Transferring
             self.qp.recv_metadata_mr()
 

@@ -55,10 +55,12 @@ class PrefillBootstrapQueue:
         tp_size: int,
         bootstrap_port: int,
         gloo_group: ProcessGroup,
+        scheduler: Scheduler,
     ):
+        self.scheduler = scheduler
+
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
-
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -95,6 +97,8 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
+        kv_args.gpu_id = self.scheduler.gpu_id
+
         kv_manager = KVManager(kv_args)
         return kv_manager
 
