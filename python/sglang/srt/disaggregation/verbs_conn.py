@@ -253,6 +253,7 @@ class KVSender:
         continous_indices = groups_by_continuity_numpy(kv_indices)
         for group_id, continue_kv_indices in enumerate(continous_indices):
             mrs_info = []
+            logger.debug("Sending continuity indices {}".format(continue_kv_indices))
             address_lengths = self.mgr.caculate_layer_kv_addresses(continue_kv_indices)
             for layer_id, (address, length) in enumerate(address_lengths):
                 mr = self.qp.create_mr(address, length)
