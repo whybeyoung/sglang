@@ -221,8 +221,8 @@ class KVSender:
                 self.state = KVPoll.Bootstrapping
             else:
                 logger.debug(data)
-                self.target_ip = data.get(str(self.mgr.engine_rank), {})['ip']
-                self.target_port = data.get(str(self.mgr.engine_rank),{})['port']
+                self.target_ip = data.get(str(self.mgr.engine_rank), {}).get('ip',None)
+                self.target_port = data.get(str(self.mgr.engine_rank),{}).get('port',None)
                 if not self.target_ip and not self.target_port:
                     self.state = KVPoll.Bootstrapping
                 else:
