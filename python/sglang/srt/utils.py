@@ -1706,3 +1706,13 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+def get_local_ip_by_remote(addr):
+    """
+    Get Local IP Connecting Remote Addr
+    """
+
+    host, port = addr.split(":")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((host, int(port.strip())))  # 连接到外部服务器，不会真正发送数据
+        return s.getsockname()[0]

@@ -24,7 +24,7 @@ from sglang.srt.bootstrap.rdma_utils import RdmaQP, RdmaClient
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.utils import get_open_port
+from sglang.srt.utils import get_open_port,get_local_ip_by_remote
 from sglang.srt.disaggregation.group_indics import groups_by_continuity_numpy
 
 UCX_CONFIG = {
@@ -221,10 +221,12 @@ class KVSender:
                 self.state = KVPoll.Bootstrapping
             else:
                 logger.debug(data)
-                self.target_ip = data.get(str(self.mgr.engine_rank))['ip']
-                self.target_port = data.get(str(self.mgr.engine_rank))['port']
-
-                self.state = KVPoll.WaitingForInput
+                self.target_ip = data.get(str(self.mgr.engine_rank), {})['ip']
+                self.target_port = data.get(str(self.mgr.engine_rank),{})['port']
+                if not self.target_ip and not self.target_port:
+                    self.state = KVPoll.Bootstrapping
+                else:
+                    self.state = KVPoll.WaitingForInput
         if self.state == KVPoll.Failed:
             return KVPoll.Failed
 
@@ -306,23 +308,13 @@ class KVReceiver:
         self.start_time = time.time()
         # todo ip
 
-        self.ip = self.get_local_ip(self.bootstrap_addr)
+        self.ip = get_local_ip_by_remote(self.bootstrap_addr)
 
         self.qp = RdmaQP(socket_port=self.rdma_port, ib_device=self.mgr.args.ib_device)
 
         # todo remove http handshake
         self.handshake()
         self.mrs_to_receive = []  # 数据段待接收的内存区域
-
-    def get_local_ip(self, addr):
-        '''
-        addr: 172.1.3.1:8998
-        '''
-        host, port = addr.split(":")
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect((host, int(port.strip())))  # 连接到外部服务器，不会真正发送数据
-            logger.debug("getting local ip addr: {}".format(addr))
-            return s.getsockname()[0]
 
     def handshake(self):
         post_data = {
