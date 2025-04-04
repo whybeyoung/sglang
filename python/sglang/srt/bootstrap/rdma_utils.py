@@ -197,8 +197,10 @@ class RdmaQP():
             'groups_mrs_info': groups_mrs_info
         }
         self.conn.sendall(pickle.dumps(local_info))
+        rcv = self.conn.recv(8192)
+        logger.debug(f"getting {len(rcv)} messages from decode server")
         # 接收远程信息
-        return pickle.loads(self.conn.recv(4096))
+        return pickle.loads(rcv)
 
     def check_complete(self):
         npolled, wc_list = self.recv_cq.poll()
