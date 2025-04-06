@@ -294,7 +294,7 @@ class KVSender:
         # 传输状态
         self.current_indices = None
         self.current_layer = 0
-        self.rdma_ep = RdmaEndpoint(max_send_wr=1500)
+        self.rdma_ep = RdmaEndpoint(max_send_wr=1500, ib_device=self.mgr.args.ib_device)
 
         self.mrs_to_send = []  # 数据段待发送的内存区域
         self.meta_has_sent = False  # meta 还没有发送
@@ -425,7 +425,7 @@ class KVReceiver:
         self.num_tokens = 0
         self.aux_idx = -1
         self.kv_indices = None
-        self.rdma_ep = RdmaEndpoint()
+        self.rdma_ep = RdmaEndpoint(ib_device=self.mgr.args.ib_device)
         self.rdma_port = get_open_port()
 
         self.start_time = time.time()
