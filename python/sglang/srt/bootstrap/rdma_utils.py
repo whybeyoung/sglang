@@ -55,7 +55,7 @@ logging.basicConfig(
 
 class RdmaEndpoint(object):
     def __init__(self, ib_device='mlx5_bond_0', max_send_wr=10, max_recv_wr=10, max_send_sge=30, max_recv_sge=30,
-                 rcq_num=1000, scq_num=1600, debug=True):
+                 rcq_num=1000, scq_num=1600, debug=False):
         logger.setLevel(logging.DEBUG if debug else logging.INFO)
         self.ib_device = ib_device
         self.ctx = Context(name=self.ib_device)
@@ -198,7 +198,7 @@ class RdmaEndpoint(object):
 
 
 class RdmaQP():
-    def __init__(self, ib_device='mlx5_bond_0', host_ip='0.0.0.0', socket_port=17777, debug=True):
+    def __init__(self, ib_device='mlx5_bond_0', host_ip='0.0.0.0', socket_port=17777, debug=False):
         logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
         self.listen_sock = socket.socket()
