@@ -1,3 +1,13 @@
+from typing import Dict, List, Optional, Tuple, Union
+from sglang.srt.disaggregation.base.conn import (
+    BaseKVBootstrapServer,
+    BaseKVManager,
+    BaseKVReceiver,
+    BaseKVSender,
+    KVArgs,
+    KVPoll,
+)
+
 # For warmup reqs, we don't kv transfer, we use the fake sender and receiver
 class FakeKVSender:
     def __init__(self):
