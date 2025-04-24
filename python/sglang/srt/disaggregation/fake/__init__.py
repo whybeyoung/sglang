@@ -1,4 +1,1 @@
-from .conn import (
-    FakeKVReceiver,
-    FakeKVSender,
-)
+from .conn import FakeKVReceiver, FakeKVSender

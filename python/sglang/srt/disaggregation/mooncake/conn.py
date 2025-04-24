@@ -7,9 +7,9 @@ import queue
 import socket
 import struct
 import threading
+import time
 from functools import cache
 from typing import Dict, List, Optional, Tuple, Union
-import time
 
 import numpy as np
 import numpy.typing as npt
@@ -372,12 +372,13 @@ class MooncakeKVSender(BaseKVSender):
         self.session_id = self.kv_mgr.get_session_id()
         self.transfer_start_time = None
 
-
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
         self.transfer_start_time = time.time()
-        logger.info(f"KVSender[{self.bootstrap_room}] transfer started at {time.time() - self.transfer_start_time:.3f}s")
+        logger.info(
+            f"KVSender[{self.bootstrap_room}] transfer started at {time.time() - self.transfer_start_time:.3f}s"
+        )
 
     def send(
         self,
@@ -385,7 +386,7 @@ class MooncakeKVSender(BaseKVSender):
         index_slice: slice,
         is_last: bool,
     ):
- 
+
         if not is_last:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room, kv_indices, index_slice, False
@@ -403,7 +404,9 @@ class MooncakeKVSender(BaseKVSender):
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status == KVPoll.Success and self.transfer_start_time is not None:
             transfer_time = time.time() - self.transfer_start_time
-            logger.info(f"KVSender[{self.bootstrap_room}] transfer completed in {transfer_time:.3f}s")
+            logger.info(
+                f"KVSender[{self.bootstrap_room}] transfer completed in {transfer_time:.3f}s"
+            )
             self.transfer_start_time = None
         return status
 
@@ -422,7 +425,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
     ):
-        
+
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
@@ -552,14 +555,18 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 str(aux_index).encode("ascii"),
             ]
         )
-        logger.info(f"KVReceiver[{self.bootstrap_room}] transfer request sent at {time.time() - self.transfer_start_time:.3f}s")
+        logger.info(
+            f"KVReceiver[{self.bootstrap_room}] transfer request sent at {time.time() - self.transfer_start_time:.3f}s"
+        )
 
     def poll(self) -> KVPoll:
 
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status == KVPoll.Success and self.transfer_start_time is not None:
             transfer_time = time.time() - self.transfer_start_time
-            logger.info(f"KVReceiver[{self.bootstrap_room}] transfer completed in {transfer_time:.3f}s")
+            logger.info(
+                f"KVReceiver[{self.bootstrap_room}] transfer completed in {transfer_time:.3f}s"
+            )
             self.transfer_start_time = None
         return status
 

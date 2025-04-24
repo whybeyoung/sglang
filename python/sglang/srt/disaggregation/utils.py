@@ -8,10 +8,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.disaggregation.fake import (
-    FakeKVReceiver,
-    FakeKVSender,
-)
 
 class DisaggregationMode(Enum):
     NULL = "null"
@@ -62,7 +58,13 @@ class KVClassType(Enum):
     BOOTSTRAP_SERVER = "bootstrap_server"
 
 
-def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType, fake_transfer: bool = False):
+def get_kv_class(
+    transfer_backend: TransferBackend,
+    class_type: KVClassType,
+    fake_transfer: bool = False,
+):
+    from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+
     if transfer_backend == TransferBackend.MOONCAKE:
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
@@ -74,7 +76,9 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType, fak
         class_mapping = {
             KVClassType.MANAGER: MooncakeKVManager,
             KVClassType.SENDER: MooncakeKVSender if not fake_transfer else FakeKVSender,
-            KVClassType.RECEIVER: MooncakeKVReceiver if not fake_transfer else FakeKVReceiver,
+            KVClassType.RECEIVER: (
+                MooncakeKVReceiver if not fake_transfer else FakeKVReceiver
+            ),
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
         return class_mapping.get(class_type)
@@ -89,7 +93,9 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType, fak
         class_mapping = {
             KVClassType.MANAGER: NixlKVManager,
             KVClassType.SENDER: NixlKVSender if not fake_transfer else FakeKVSender,
-            KVClassType.RECEIVER: NixlKVReceiver if not fake_transfer else FakeKVReceiver,
+            KVClassType.RECEIVER: (
+                NixlKVReceiver if not fake_transfer else FakeKVReceiver
+            ),
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
