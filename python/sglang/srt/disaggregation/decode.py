@@ -97,10 +97,7 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = int(
-            os.environ.get("SGLANG_HACK_PD_DECODE_NUM_RESERVED_DECODE_TOKENS", "512")
-        )
-        print(f"HACK: {self.num_reserved_decode_tokens=}")
+        self.num_reserved_decode_tokens = 512
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -137,8 +134,11 @@ class DecodePreallocQueue:
 
     def add(self, req: Req) -> None:
         """Add a request to the pending queue."""
-
-        kv_receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+        if req.bootstrap_room == -1 and req.bootstrap_host == "2.2.2.2":
+            # Fake transfer for warmup reqs
+            kv_receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER, fake_transfer=True)
+        else:
+            kv_receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",

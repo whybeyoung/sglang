@@ -698,10 +698,12 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
+
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
     )
+
 
 
 def launch_server(
@@ -841,9 +843,27 @@ def _wait_and_warmup(
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
+        elif server_args.disaggregation_mode == "prefill":
+            # do the pre cache
+            generate_req_input = GenerateReqInput(
+                input_ids=[0, 1, 2, 3],
+                sampling_params={
+                    "temperature": 0.0,
+                    "max_new_tokens": 8,
+                    "ignore_eos": True,
+                
+                },
+                bootstrap_host= "2.2.2.2",
+                bootstrap_room= -1,
+            )
+            logger.info("Generate warm up request for compiling DeepGEMM...")
+            asyncio.run(_global_state.tokenizer_manager.generate_request(generate_req_input, None).__anext__())
+            logger.info("Warm up request for compiling DeepGEMM finished")
+
+
         else:
-            # Warmup request currently hangs in disaggregation mode, so we skip it.
             logger.info("Skipping warmup request in disaggregation mode")
+
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:

@@ -60,7 +60,10 @@ async def warm_up_compile(tokenizer_manager: TokenizerManager):
             "temperature": 0.0,
             "max_new_tokens": 8,
             "ignore_eos": True,
+        
         },
+        bootstrap_host= "2.2.2.2",
+        bootstrap_room= -1,
     )
     await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
@@ -109,7 +112,6 @@ def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
     # Set watchdog timeout to compile_args.timeout because compilation will take a long time
     server_args.watchdog_timeout = compile_args.timeout
     server_args.warmups = "compile-deep-gemm"
-
 
 def run_compile(server_args: ServerArgs, compile_args: CompileArgs):
     print(

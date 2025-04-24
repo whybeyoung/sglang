@@ -9,6 +9,7 @@ import struct
 import threading
 from functools import cache
 from typing import Dict, List, Optional, Tuple, Union
+import time
 
 import numpy as np
 import numpy.typing as npt
@@ -369,10 +370,14 @@ class MooncakeKVSender(BaseKVSender):
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
         self.session_id = self.kv_mgr.get_session_id()
+        self.transfer_start_time = None
+
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
+        self.transfer_start_time = time.time()
+        logger.info(f"KVSender[{self.bootstrap_room}] transfer started at {time.time() - self.transfer_start_time:.3f}s")
 
     def send(
         self,
@@ -380,6 +385,7 @@ class MooncakeKVSender(BaseKVSender):
         index_slice: slice,
         is_last: bool,
     ):
+ 
         if not is_last:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room, kv_indices, index_slice, False
@@ -394,16 +400,20 @@ class MooncakeKVSender(BaseKVSender):
             )
 
     def poll(self) -> KVPoll:
-        return self.kv_mgr.check_status(self.bootstrap_room)
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Success and self.transfer_start_time is not None:
+            transfer_time = time.time() - self.transfer_start_time
+            logger.info(f"KVSender[{self.bootstrap_room}] transfer completed in {transfer_time:.3f}s")
+            self.transfer_start_time = None
+        return status
 
     def failure_exception(self):
-        raise Exception("Fake KVSender Exception")
+        raise Exception("KVSender Exception")
 
 
 class MooncakeKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
     _socket_cache = {}
-    _socket_locks = {}
     _global_lock = threading.Lock()
 
     def __init__(
@@ -412,11 +422,13 @@ class MooncakeKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
     ):
+        
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
+        self.transfer_start_time = None
 
         if not self.kv_mgr.enable_dp_attention:
             # We assume dp_attention should be activated simultaneously for
@@ -509,10 +521,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
-                cls._socket_locks[endpoint] = threading.Lock()
-            return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+            return cls._socket_cache[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+
+        self.transfer_start_time = time.time()
         self.prefill_server_url = (
             f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
         )
@@ -526,23 +539,29 @@ class MooncakeKVReceiver(BaseKVReceiver):
         packed_aux_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
         )
-        sock, lock = self._connect("tcp://" + self.prefill_server_url)
-        with lock:
-            sock.send_multipart(
-                [
-                    str(self.bootstrap_room).encode("ascii"),
-                    get_local_ip_by_remote().encode("ascii"),
-                    str(self.kv_mgr.rank_port).encode("ascii"),
-                    self.session_id.encode("ascii"),
-                    packed_kv_data_ptrs,
-                    kv_indices.tobytes(),
-                    packed_aux_data_ptrs,
-                    str(aux_index).encode("ascii"),
-                ]
-            )
+        sock = self._connect("tcp://" + self.prefill_server_url)
+        sock.send_multipart(
+            [
+                str(self.bootstrap_room).encode("ascii"),
+                get_local_ip_by_remote().encode("ascii"),
+                str(self.kv_mgr.rank_port).encode("ascii"),
+                self.session_id.encode("ascii"),
+                packed_kv_data_ptrs,
+                kv_indices.tobytes(),
+                packed_aux_data_ptrs,
+                str(aux_index).encode("ascii"),
+            ]
+        )
+        logger.info(f"KVReceiver[{self.bootstrap_room}] transfer request sent at {time.time() - self.transfer_start_time:.3f}s")
 
     def poll(self) -> KVPoll:
-        return self.kv_mgr.check_status(self.bootstrap_room)
+
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Success and self.transfer_start_time is not None:
+            transfer_time = time.time() - self.transfer_start_time
+            logger.info(f"KVReceiver[{self.bootstrap_room}] transfer completed in {transfer_time:.3f}s")
+            self.transfer_start_time = None
+        return status
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
