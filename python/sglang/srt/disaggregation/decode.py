@@ -39,6 +39,8 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     kv_to_page_indices,
     poll_and_all_reduce,
+    FakeBootstrapRoom,
+    FakeBootstrapHost,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -134,7 +136,7 @@ class DecodePreallocQueue:
 
     def add(self, req: Req) -> None:
         """Add a request to the pending queue."""
-        if req.bootstrap_room == -1 and req.bootstrap_host == "2.2.2.2":
+        if req.bootstrap_room == FakeBootstrapRoom and req.bootstrap_host == FakeBootstrapHost:
             # Fake transfer for warmup reqs
             kv_receiver_class = get_kv_class(
                 self.transfer_backend, KVClassType.RECEIVER, fake_transfer=True

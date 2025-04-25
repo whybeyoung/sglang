@@ -35,6 +35,8 @@ from sglang.srt.disaggregation.utils import (
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
+    FakeBootstrapRoom,
+    FakeBootstrapHost,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 
@@ -115,7 +117,7 @@ class PrefillBootstrapQueue:
         return kv_manager
 
     def add(self, req: Req) -> None:
-        if req.bootstrap_room == -1 and req.bootstrap_host == "2.2.2.2":
+        if req.bootstrap_room == FakeBootstrapRoom and req.bootstrap_host == FakeBootstrapHost:
             # Fake transfer for warmup reqs
             kv_sender_class = get_kv_class(
                 self.transfer_backend, KVClassType.SENDER, fake_transfer=True

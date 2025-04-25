@@ -50,7 +50,7 @@ async def voice_chat(tokenizer_manager: TokenizerManager):
 @warmup("compile-deep-gemm")
 async def warm_up_compile(tokenizer_manager: TokenizerManager):
 
-    print("\nGenerate warm up request for compiling DeepGEMM...\n")
+    print("\n Strarting Generate warm up request for compiling DeepGEMM...\n")
     generate_req_input = GenerateReqInput(
         input_ids=[0, 1, 2, 3],
         sampling_params={
@@ -62,3 +62,4 @@ async def warm_up_compile(tokenizer_manager: TokenizerManager):
         bootstrap_room=-1,
     )
     await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+    print("\n End Generate warm up request for compiling DeepGEMM...\n")

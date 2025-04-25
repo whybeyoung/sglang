@@ -120,6 +120,7 @@ def set_global_state(global_state: _GlobalState):
 async def lifespan(fast_api_app: FastAPI):
     server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
+        logger.info("Warmup started")
         await execute_warmups(
             server_args.warmups.split(","), _global_state.tokenizer_manager
         )
@@ -841,26 +842,6 @@ def _wait_and_warmup(
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
-        elif server_args.disaggregation_mode == "prefill":
-            # do the pre cache
-            generate_req_input = GenerateReqInput(
-                input_ids=[0, 1, 2, 3],
-                sampling_params={
-                    "temperature": 0.0,
-                    "max_new_tokens": 8,
-                    "ignore_eos": True,
-                },
-                bootstrap_host="2.2.2.2",
-                bootstrap_room=-1,
-            )
-            logger.info("Generate warm up request for compiling DeepGEMM...")
-            asyncio.run(
-                _global_state.tokenizer_manager.generate_request(
-                    generate_req_input, None
-                ).__anext__()
-            )
-            logger.info("Warm up request for compiling DeepGEMM finished")
-
         else:
             logger.info("Skipping warmup request in disaggregation mode")
 
