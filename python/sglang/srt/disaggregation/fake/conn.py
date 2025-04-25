@@ -3,14 +3,17 @@ from typing import Dict, List, Optional, Tuple, Union
 from sglang.srt.disaggregation.base.conn import (
     BaseKVReceiver,
     BaseKVSender,
+    BaseKVManager,
     KVArgs,
     KVPoll,
 )
 
 
 # For warmup reqs, we don't kv transfer, we use the fake sender and receiver
-class FakeKVSender:
-    def __init__(self):
+class FakeKVSender(BaseKVSender):
+    def __init__(
+        self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int
+    ):
         self.has_sent = False
 
     def poll(self) -> KVPoll:
@@ -29,15 +32,25 @@ class FakeKVSender:
     ):
         pass
 
-    def send(self, up_to_index: int):
+    def send(
+        self,
+        kv_indices: npt.NDArray[np.int64],
+        index_slice: slice,
+        is_last: bool,
+    ):
         self.has_sent = True
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 
 
-class FakeKVReceiver:
-    def __init__(self):
+class FakeKVReceiver(BaseKVReceiver):
+    def __init__(
+        self,
+        mgr: BaseKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: Optional[int] = None,
+    ):
         self.has_init = False
 
     def poll(self) -> KVPoll:
