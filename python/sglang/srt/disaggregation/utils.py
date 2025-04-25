@@ -14,6 +14,8 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+FakeBootstrapRoom = -1
+FakeBootstrapHost = "2.2.2.2"
 
 def poll_and_all_reduce(pollers, gloo_group):
     polls = [int(poller.poll()) for poller in pollers]
