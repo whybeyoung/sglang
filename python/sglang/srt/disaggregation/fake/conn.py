@@ -1,5 +1,6 @@
 from typing import Dict, List, Optional, Tuple, Union
-
+import numpy as np
+import numpy.typing as npt
 from sglang.srt.disaggregation.base.conn import (
     BaseKVReceiver,
     BaseKVSender,
