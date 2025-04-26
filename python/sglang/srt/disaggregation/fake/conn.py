@@ -43,7 +43,12 @@ class FakeKVSender(BaseKVSender):
         is_last: bool,
     ):
         logger.info(f"FakeKVSender send with kv_indices: {kv_indices}, index_slice: {index_slice}, is_last: {is_last}")
-        self.has_sent = True
+        if is_last:
+            self.has_sent = True
+            logger.info(f"FakeKVSender send success")
+        else:
+            self.has_sent = False
+            logger.info(f"FakeKVSender send fake transfering")
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
