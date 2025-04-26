@@ -867,6 +867,8 @@ def _wait_and_warmup(
                 headers=headers,
                 timeout=1800,
             )
+            logger.info(f"End of prefill warmup with status {res.status_code}")
+
             os.environ["SGL_IN_DEEPGEMM_PRECOMPILE_STAGE"] = "0"
         # Force enable deep gemm
 
