@@ -843,6 +843,7 @@ def _wait_and_warmup(
             )
             assert res.status_code == 200, f"{res}"
         else:
+
             logger.info("Skipping warmup request in disaggregation mode")
 
     except Exception:
