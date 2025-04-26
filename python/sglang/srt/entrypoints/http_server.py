@@ -867,7 +867,7 @@ def _wait_and_warmup(
                 headers=headers,
                 timeout=1800,
             )
-            logger.info(f"End of prefill warmup with status {res.status_code}, {res.json}")
+            logger.info(f"End of prefill warmup with status {res.status_code}, {res.json()}")
 
         # Force enable deep gemm
 
