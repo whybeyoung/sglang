@@ -105,7 +105,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "1"
 # Force enable mha chunked kv for DeepSeek V3 to avoid missing kv_b_proj DeepGEMM case
 os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"  
-
+os.environ["SGL_IN_DEEPGEMM_PRECOMPILE_STAGE"] = "1"
 
 # Store global states
 @dataclasses.dataclass
@@ -867,9 +867,8 @@ def _wait_and_warmup(
                 headers=headers,
                 timeout=1800,
             )
-            logger.info(f"End of prefill warmup with status {res.status_code}")
+            logger.info(f"End of prefill warmup with status {res.status_code}, {res.json}")
 
-            os.environ["SGL_IN_DEEPGEMM_PRECOMPILE_STAGE"] = "0"
         # Force enable deep gemm
 
     except Exception:
