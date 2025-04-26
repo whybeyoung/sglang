@@ -101,6 +101,12 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
+# Force enable deep gemm
+os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "1"
+# Force enable mha chunked kv for DeepSeek V3 to avoid missing kv_b_proj DeepGEMM case
+os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"  
+
+
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
@@ -842,9 +848,27 @@ def _wait_and_warmup(
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
-        else:
+        elif server_args.disaggregation_mode == "prefill":
 
-            logger.info("Skipping warmup request in disaggregation mode")
+     
+            json_data = {
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "max_new_tokens": 8,
+                    "ignore_eos": True,
+                },
+                "bootstrap_host": "2.2.2.2",
+                "bootstrap_room": -1,
+                "input_ids": [0,1,2,3]
+            }
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                timeout=1800,
+            )
+            os.environ["SGL_IN_DEEPGEMM_PRECOMPILE_STAGE"] = "0"
+        # Force enable deep gemm
 
     except Exception:
         last_traceback = get_exception_traceback()
