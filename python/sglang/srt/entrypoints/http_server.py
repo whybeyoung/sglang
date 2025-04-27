@@ -848,7 +848,7 @@ def _wait_and_warmup(
             )
             assert res.status_code == 200, f"{res}"
         elif server_args.disaggregation_mode == "prefill":
-
+            logger.info(f"Start of prefill warmup")
      
             json_data = {
                 "sampling_params": {
@@ -857,8 +857,8 @@ def _wait_and_warmup(
                     "ignore_eos": True,
                 },
                 "bootstrap_host": "2.2.2.2",
-                "bootstrap_room": -1,
-                "input_ids": [0,1,2,3]
+                "bootstrap_room": [-1] * server_args.dp_size,
+                "input_ids": [[0,1,2,3]] * server_args.dp_size
             }
             res = requests.post(
                 url + request_name,
