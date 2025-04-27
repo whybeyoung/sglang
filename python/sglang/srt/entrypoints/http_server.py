@@ -25,6 +25,7 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
+import random
 import traceback
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional
@@ -857,7 +858,7 @@ def _wait_and_warmup(
                     "ignore_eos": True,
                 },
                 "bootstrap_host": "2.2.2.2",
-                "bootstrap_room": [-1] * server_args.dp_size,
+                "bootstrap_room": [random.randint(0, 2**63 - 1) for _ in range(server_args.dp_size)],
                 "input_ids": [[0,1,2,3]] * server_args.dp_size
             }
             res = requests.post(
