@@ -857,7 +857,7 @@ def _wait_and_warmup(
                     "max_new_tokens": 8,
                     "ignore_eos": True,
                 },
-                "bootstrap_host": "2.2.2.2",
+                "bootstrap_host": ["2.2.2.2"] * server_args.dp_size,
                 "bootstrap_room": [random.randint(0, 2**63 - 1) for _ in range(server_args.dp_size)],
                 "input_ids": [[0,1,2,3]] * server_args.dp_size
             }
