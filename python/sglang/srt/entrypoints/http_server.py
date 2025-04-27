@@ -850,7 +850,6 @@ def _wait_and_warmup(
             assert res.status_code == 200, f"{res}"
         elif server_args.disaggregation_mode == "prefill":
             logger.info(f"Start of prefill warmup")
-     
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -858,6 +857,8 @@ def _wait_and_warmup(
                     "ignore_eos": True,
                 },
                 "bootstrap_host": ["2.2.2.2"] * server_args.dp_size,
+                # This is a hack to ensure fake transfer is enabled during prefill warmup
+                # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [i * (2**63 // server_args.dp_size) + (i % server_args.tp_size) for i in range(server_args.dp_size)],
                 "input_ids": [[0,1,2,3]] * server_args.dp_size
             }
@@ -865,11 +866,11 @@ def _wait_and_warmup(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=1800,
+                timeout=1800, # because of deep gemm precache is very long if not precache.
             )
             logger.info(f"End of prefill warmup with status {res.status_code}, {res.json()}")
 
-        # Force enable deep gemm
+
 
     except Exception:
         last_traceback = get_exception_traceback()
