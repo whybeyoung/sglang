@@ -12,15 +12,10 @@ from sglang.srt.utils import (
 import torch
 _num_sms = None
 
-def get_num_sms():
-    """Get the number of SMs from the current GPU device."""
-    global _num_sms
-    if _num_sms is None:
-        _num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count
-    return _num_sms
+
 
 # TODO do not hardcode
-DEEPEP_NUM_SMS = get_num_sms()
+DEEPEP_NUM_SMS = 24
 
 _enable_jit_deepgemm = False
 try:
