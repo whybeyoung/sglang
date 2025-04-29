@@ -15,7 +15,7 @@ _num_sms = None
 
 
 # TODO do not hardcode
-DEEPEP_NUM_SMS = 24
+DEEPEP_NUM_SMS = 12
 
 _enable_jit_deepgemm = False
 try:
