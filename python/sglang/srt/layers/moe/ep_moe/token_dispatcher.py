@@ -7,6 +7,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_sm,
     get_int_env_var,
+    get_communication_num_sms
 )
 
 import torch
@@ -14,8 +15,9 @@ _num_sms = None
 
 
 
-# TODO do not hardcode
-DEEPEP_NUM_SMS = 12
+
+
+DEEPEP_NUM_SMS = get_communication_num_sms()
 
 _enable_jit_deepgemm = False
 try:
@@ -148,11 +150,12 @@ class DeepEPBuffer:
 
         # TODO temp hack
         if sglang_hack_deepep_new_mode and deepep_mode == DeepEPMode.normal:
-            # TODO indeed: num_qps_per_rank = max(num_sms // 2, ll_num_experts // num_ranks if test_ll_compatibility else 0)
-            num_qps_per_rank = DEEPEP_NUM_SMS // 2
+            # 参考 DeepEP 示例实现
+            num_qps_per_rank = max(DEEPEP_NUM_SMS // 2, 1)
         else:
-            num_qps_per_rank = (
-                num_experts // group.size() if deepep_mode.enable_low_latency() else 1
+            num_qps_per_rank = max(
+                num_experts // group.size() if deepep_mode.enable_low_latency() else 1,
+                DEEPEP_NUM_SMS // 2
             )
 
         cls._buffer = Buffer(

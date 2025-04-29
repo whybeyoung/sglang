@@ -116,6 +116,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    get_communication_num_sms,
 )
 
 _is_hip = is_hip()
@@ -1998,7 +1999,7 @@ class DeepseekV2Model(nn.Module):
         total_num_sm = torch.cuda.get_device_properties(
             device="cuda"
         ).multi_processor_count
-        extend_mode_communication_num_sm = DEEPEP_NUM_SMS
+        extend_mode_communication_num_sm = get_communication_num_sms()
         num_sm_context = (
             configure_deep_gemm_num_sms(
                 num_sms=total_num_sm - extend_mode_communication_num_sm

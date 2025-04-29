@@ -2128,3 +2128,12 @@ def configure_deep_gemm_num_sms(num_sms):
         yield
     finally:
         deep_gemm.set_num_sms(original_num_sms)
+
+
+def get_communication_num_sms():
+    """Get the number of SMs used for communication."""
+    total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+    # 从环境变量获取比例，默认为 1/4
+    ratio = float(os.getenv("SGLANG_COMMUNICATION_SM_RATIO", "0.25"))
+    min_sms = int(os.getenv("SGLANG_MIN_COMMUNICATION_SMS", "8"))
+    return max(int(total_num_sm * ratio), min_sms)
