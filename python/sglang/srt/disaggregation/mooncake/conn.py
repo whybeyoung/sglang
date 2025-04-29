@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import dataclasses
 import logging
 import os
@@ -11,7 +10,6 @@ import struct
 import threading
 from functools import cache
 from typing import Dict, List, Optional, Tuple, Union
-import time
 
 import numpy as np
 import numpy.typing as npt
@@ -34,6 +32,8 @@ from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
+MAX_CONTIGUOUS = 32
+
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
@@ -46,7 +46,7 @@ def group_concurrent_contiguous(
     for i in range(1, len(src_indices)):
         src_contiguous = src_indices[i] == src_indices[i - 1] + 1
         dst_contiguous = dst_indices[i] == dst_indices[i - 1] + 1
-        if src_contiguous and dst_contiguous:
+        if src_contiguous and dst_contiguous and len(current_src) < MAX_CONTIGUOUS:
             current_src.append(src_indices[i])
             current_dst.append(dst_indices[i])
         else:
@@ -147,11 +147,6 @@ class MooncakeKVManager(BaseKVManager):
             self.start_prefill_thread()
             self._register_to_bootstrap()
 
-            # Determine the number of threads to use for kv sender
-            cpu_count = os.cpu_count()
-            self.executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(cpu_count // 4, 16)
-            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -191,17 +186,11 @@ class MooncakeKVManager(BaseKVManager):
         )
 
         num_layers = len(self.kv_args.kv_data_ptrs)
-        layers_params = [
-            (
-                self.kv_args.kv_data_ptrs[layer_id],
-                dst_kv_ptrs[layer_id],
-                self.kv_args.kv_item_lens[layer_id],
-            )
-            for layer_id in range(num_layers)
-        ]
+        for layer_id in range(num_layers):
+            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
 
-        # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -212,26 +201,6 @@ class MooncakeKVManager(BaseKVManager):
                 )
                 if status != 0:
                     return status
-            return 0
-
-        futures = [
-            self.executor.submit(
-                process_layer,
-                src_ptr,
-                dst_ptr,
-                item_len,
-            )
-            for (src_ptr, dst_ptr, item_len) in layers_params
-        ]
-
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                # Immediate shutdown on first error (existing tasks will finish)
-                executor.shutdown(wait=False)
-                for f in futures:
-                    f.cancel()
-                return status
 
         return 0
 
@@ -430,15 +399,10 @@ class MooncakeKVSender(BaseKVSender):
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
         self.session_id = self.kv_mgr.get_session_id()
-        self.transfer_start_time = None
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
-        self.transfer_start_time = time.time()
-        logger.info(
-            f"KVSender[{self.bootstrap_room}] transfer started at {time.time() - self.transfer_start_time:.3f}s"
-        )
 
     def send(
         self,
@@ -460,14 +424,7 @@ class MooncakeKVSender(BaseKVSender):
             )
 
     def poll(self) -> KVPoll:
-        status = self.kv_mgr.check_status(self.bootstrap_room)
-        if status == KVPoll.Success and self.transfer_start_time is not None:
-            transfer_time = time.time() - self.transfer_start_time
-            logger.info(
-                f"KVSender[{self.bootstrap_room}] transfer completed in {transfer_time:.3f}s"
-            )
-            self.transfer_start_time = None
-        return status
+        return self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
@@ -490,7 +447,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
-        self.transfer_start_time = None
 
         if not self.kv_mgr.enable_dp_attention:
             # We assume dp_attention should be activated simultaneously for
@@ -613,7 +569,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
-        self.transfer_start_time = time.time()
         self.prefill_server_url = (
             f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
         )
@@ -633,19 +588,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     str(aux_index).encode("ascii"),
                 ]
             )
-        logger.info(
-            f"KVReceiver[{self.bootstrap_room}] transfer request sent at {time.time() - self.transfer_start_time:.3f}s"
-        )
 
     def poll(self) -> KVPoll:
-        status = self.kv_mgr.check_status(self.bootstrap_room)
-        if status == KVPoll.Success and self.transfer_start_time is not None:
-            transfer_time = time.time() - self.transfer_start_time
-            logger.info(
-                f"KVReceiver[{self.bootstrap_room}] transfer completed in {transfer_time:.3f}s"
-            )
-            self.transfer_start_time = None
-        return status
+        return self.kv_mgr.check_status(self.bootstrap_room)
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
@@ -713,7 +658,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
                 "rank_port": rank_port,
             }
             logger.debug(
-                f"Registere Prefill bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f"Register Prefill bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             )
 
         return web.Response(text="OK", status=200)

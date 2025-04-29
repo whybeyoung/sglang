@@ -34,6 +34,7 @@ class MyServerArgs:
     tp_size: int
     enable_expert_location_by_eplb: bool
     init_expert_location: Optional[str]
+    deepseek_eplb_hack_shuffle: bool = False
 
 
 @dataclass
@@ -56,6 +57,7 @@ class MyExpertLocationMetadata:
                 num_groups=model_config_for_expert_location.num_groups,
                 num_nodes=server_args.nnodes,
                 num_gpus=server_args.tp_size,
+                hack_shuffle=server_args.deepseek_eplb_hack_shuffle,
             )
         )
 
@@ -74,10 +76,12 @@ _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION = ModelConfigForExpertLocation(
 _MY_MODEL_CONFIG_NUM_EXPERTS_PER_TOK = 8
 
 
-def read_physical_count_of_forward_pass(dir_data: Path):
+def read_physical_count_of_forward_pass_id_and_rank(dir_data: Path):
     physical_count_of_forward_pass_id_and_rank = defaultdict(lambda: defaultdict())
     for path in tqdm(list(dir_data.glob("*.pt"))):
-        for record in torch.load(path, weights_only=True):
+        data_pack = torch.load(path, weights_only=True)
+        last_physical_to_logical_map = data_pack["last_physical_to_logical_map"]
+        for record in data_pack["records"]:
             assert (
                 physical_count_of_forward_pass_id_and_rank[
                     record["forward_pass_id"]
@@ -88,6 +92,13 @@ def read_physical_count_of_forward_pass(dir_data: Path):
                 record["rank"]
             ] = record["physical_count"]
     # print(len(physical_count_of_forward_pass_id_and_rank))
+    return physical_count_of_forward_pass_id_and_rank, last_physical_to_logical_map
+
+
+def read_physical_count_of_forward_pass(dir_data: Path):
+    physical_count_of_forward_pass_id_and_rank, last_physical_to_logical_map = (
+        read_physical_count_of_forward_pass_id_and_rank(dir_data)
+    )
 
     items = []
     for forward_pass_id, physical_count_of_rank in sorted(
@@ -104,7 +115,7 @@ def read_physical_count_of_forward_pass(dir_data: Path):
     physical_count_of_forward_pass = torch.stack(items)
     print(f"{physical_count_of_forward_pass.shape=}")
 
-    return physical_count_of_forward_pass
+    return physical_count_of_forward_pass, last_physical_to_logical_map
 
 
 def scan_combinations(

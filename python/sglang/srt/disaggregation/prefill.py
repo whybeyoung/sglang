@@ -112,7 +112,10 @@ class PrefillBootstrapQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
-            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args
+            kv_args,
+            DisaggregationMode.PREFILL,
+            self.scheduler.server_args,
+            # self.scheduler.disagg_launch_done,
         )
         return kv_manager
 
@@ -184,7 +187,7 @@ class SchedulerDisaggregationPrefillMixin:
     """
 
     @torch.no_grad()
-    def event_loop_normal_disagg_prefill(self):
+    def event_loop_normal_disagg_prefill(self: Scheduler):
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         while True:
@@ -192,7 +195,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             self.model_runner_event_loop_step()
             self.waiting_queue.extend(
-                self.disagg_prefill_pending_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
@@ -207,8 +210,20 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
+                # NOTE: never influence the kernel launch
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.clear()
+
                 result = self.run_batch(batch)
+
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.set()
+
                 self.process_batch_result_disagg_prefill(batch, result)
+            else:
+                # NOTE: no batch to forward, release the event
+                if self.disagg_launch_done is not None:
+                    self.disagg_launch_done.set()
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
@@ -223,14 +238,14 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
 
     @torch.no_grad()
-    def event_loop_overlap_disagg_prefill(self):
+    def event_loop_overlap_disagg_prefill(self: Scheduler):
         self.result_queue = deque()
 
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
-                self.disagg_prefill_pending_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
@@ -244,13 +259,17 @@ class SchedulerDisaggregationPrefillMixin:
 
             self.cur_batch = batch
 
-            if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
-
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
+
+            if batch:
+                # mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+                # while not mgr.transfer_queue.empty():
+                #     mgr.send_kv_done.wait()
+
+                result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), result))
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
@@ -292,6 +311,9 @@ class SchedulerDisaggregationPrefillMixin:
             _, next_token_ids = self.tp_worker.resolve_batch_result(bid)
         else:
             next_token_ids = result.next_token_ids.tolist()
+
+        if self.disagg_launch_done is not None:
+            self.disagg_launch_done.clear()
 
         for req, next_token_id in zip(batch.reqs, next_token_ids, strict=True):
             req: Req
@@ -335,7 +357,7 @@ class SchedulerDisaggregationPrefillMixin:
                 raise Exception("Transferring failed")
 
         for req in done_reqs:
-            self.disagg_prefill_pending_queue.req_to_metadata_buffer_idx_allocator.free(
+            self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.free(
                 req.metadata_buffer_index
             )
 
@@ -351,9 +373,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # only finished requests to running_batch.
                 self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
                 self.tree_cache.cache_unfinished_req(self.chunked_req)
-                if (
-                    self.enable_overlap
-                ):  # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                if self.enable_overlap:
+                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     self.chunked_req.tmp_end_idx = min(
                         len(self.chunked_req.fill_ids),
                         len(self.chunked_req.origin_input_ids),
@@ -399,7 +420,7 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         if last_chunk is True:
-            self.disagg_prefill_pending_queue.store_prefill_results(
+            self.disagg_prefill_bootstrap_queue.store_prefill_results(
                 req.metadata_buffer_index, token_id
             )
         page_indices = kv_to_page_indices(kv_indices, page_size)

@@ -172,6 +172,7 @@ def rebalance_experts(
     num_groups: int,
     num_nodes: int,
     num_gpus: int,
+    hack_shuffle: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Entry point for expert-parallelism load balancer.
@@ -214,7 +215,42 @@ def rebalance_experts(
             num_layers, -1
         ),
     )
+
+    if hack_shuffle:
+        print("EPLB hack shuffle!!!")
+        phy2log, log2phy, logcnt = _hack_shuffle(phy2log, log2phy, logcnt)
+
     return phy2log, log2phy, logcnt
+
+
+# TODO super hacky and hardcode and slow
+def _hack_shuffle(phy2log_old, log2phy_old, logcnt_old):
+    import random
+
+    r = random.Random(42)
+
+    num_layers, num_phy_experts = phy2log_old.shape
+    _, num_log_experts, log2phy_last_dim = log2phy_old.shape
+    phy2log_new = torch.zeros_like(phy2log_old)
+    log2phy_new = torch.zeros_like(log2phy_old)
+
+    for layer_id in range(num_layers):
+        phy_old2new = list(range(num_phy_experts))
+        r.shuffle(phy_old2new)
+        phy_old2new = torch.tensor(phy_old2new)
+
+        phy2log_new[layer_id, :] = phy2log_old[layer_id, :][phy_old2new]
+
+        for logical_expert_id in range(num_log_experts):
+            for last_dim_index in range(log2phy_last_dim):
+                old_value = log2phy_old[layer_id, logical_expert_id, last_dim_index]
+                if old_value == -1:
+                    new_value = -1
+                else:
+                    new_value = phy_old2new[old_value].item()
+                log2phy_new[layer_id, logical_expert_id, last_dim_index] = new_value
+
+    return phy2log_new, log2phy_new, None
 
 
 __all__ = ["rebalance_experts"]
