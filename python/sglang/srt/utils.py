@@ -2136,4 +2136,6 @@ def get_communication_num_sms():
     # 从环境变量获取比例，默认为 1/4
     ratio = float(os.getenv("SGLANG_COMMUNICATION_SM_RATIO", "0.25"))
     min_sms = int(os.getenv("SGLANG_MIN_COMMUNICATION_SMS", "8"))
-    return max(int(total_num_sm * ratio), min_sms)
+    # 确保返回偶数
+    num_sms = max(int(total_num_sm * ratio), min_sms)
+    return num_sms + (num_sms % 2)  # 如果是奇数，加1使其变为偶数
