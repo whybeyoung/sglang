@@ -9,6 +9,7 @@ from sglang.srt.utils import (
     get_int_env_var,
 )
 
+import torch
 _num_sms = None
 
 def get_num_sms():
@@ -71,7 +72,6 @@ except ImportError:
 from enum import IntEnum, auto
 from typing import Optional, Tuple, Union
 
-import torch
 import torch.distributed as dist
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
