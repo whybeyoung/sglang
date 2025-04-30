@@ -18,6 +18,8 @@ import numpy.typing as npt
 import requests
 import zmq
 from aiohttp import web
+import torch
+import torch.cuda
 
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
@@ -178,6 +180,18 @@ class MooncakeKVManager(BaseKVManager):
         socket.connect(endpoint)
         return socket
 
+    def read_gpu_memory(self, ptr: int, length: int) -> torch.Tensor:
+        """Read GPU memory content using CUDA."""
+        try:
+            # Create a tensor from the GPU memory pointer
+            tensor = torch.tensor([], dtype=torch.float32, device=f'cuda:{torch.cuda.current_device()}')
+            tensor.data_ptr = ptr
+            tensor.size = (length // 4,)  # Assuming float32 (4 bytes)
+            return tensor
+        except Exception as e:
+            logger.error(f"Failed to read GPU memory: {e}")
+            return None
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -202,30 +216,37 @@ class MooncakeKVManager(BaseKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            logger.info("Transfer EngineErank: {} src_ptr {}  dst_ptr: {} len: {}".format(self.kv_args.engine_rank,src_ptr, dst_ptr, item_len))
+            layer_id = layers_params.index((src_ptr, dst_ptr, item_len))
+            logger.info(f"TP Rank {self.kv_args.engine_rank} Layer {layer_id} KVCache Transfer:")
+            
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
 
-                # Add logging to print KVCache content
-                logger.info(f"TP Rank {self.kv_args.engine_rank} Layer {layers_params.index((src_ptr, dst_ptr, item_len))} KVCache:")
-                logger.info(f"  Source indices: {prefill_index}")
-                logger.info(f"  Destination indices: {decode_index}")
+                logger.info(f"  Transfer details:")
+                logger.info(f"    Source indices: {prefill_index}")
+                logger.info(f"    Destination indices: {decode_index}")
                 
-                # Read and print actual KVCache content
+                # Read and print KVCache content using CUDA
                 try:
                     # Read source content
-                    src_content = self.engine.read_memory(src_addr, length)
-                    src_array = np.frombuffer(src_content, dtype=np.float32)
-                    logger.info(f"  Source KVCache content (first 10 elements): {src_array[:10]}")
-                    logger.info(f"  Source KVCache shape: {src_array.shape}")
+                    src_tensor = self.read_gpu_memory(src_addr, length)
+                    if src_tensor is not None:
+                        src_np = src_tensor.cpu().numpy()
+                        logger.info(f"    Source KVCache content (first 10 elements): {src_np[:10]}")
+                        logger.info(f"    Source KVCache shape: {src_np.shape}")
+                        logger.info(f"    Source KVCache mean: {np.mean(src_np)}")
+                        logger.info(f"    Source KVCache std: {np.std(src_np)}")
                     
-                    # Read destination content before transfer
-                    dst_content = self.engine.read_memory(dst_addr, length)
-                    dst_array = np.frombuffer(dst_content, dtype=np.float32)
-                    logger.info(f"  Destination KVCache content before transfer (first 10 elements): {dst_array[:10]}")
-                    logger.info(f"  Destination KVCache shape: {dst_array.shape}")
+                    # Read destination content
+                    dst_tensor = self.read_gpu_memory(dst_addr, length)
+                    if dst_tensor is not None:
+                        dst_np = dst_tensor.cpu().numpy()
+                        logger.info(f"    Destination KVCache content (first 10 elements): {dst_np[:10]}")
+                        logger.info(f"    Destination KVCache shape: {dst_np.shape}")
+                        logger.info(f"    Destination KVCache mean: {np.mean(dst_np)}")
+                        logger.info(f"    Destination KVCache std: {np.std(dst_np)}")
                 except Exception as e:
                     logger.error(f"Failed to read KVCache content: {e}")
 
@@ -233,7 +254,9 @@ class MooncakeKVManager(BaseKVManager):
                     mooncake_session_id, src_addr, dst_addr, length
                 )
                 if status != 0:
+                    logger.error(f"Transfer failed with status: {status}")
                     return status
+                logger.info(f"    Transfer completed successfully")
             return 0
 
         futures = [
