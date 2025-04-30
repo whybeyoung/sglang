@@ -149,7 +149,7 @@ class DeepEPBuffer:
             num_qps_per_rank = DEEPEP_NUM_SMS // 2
         else:
             num_qps_per_rank = (
-                num_experts // group.size() if deepep_mode.enable_low_latency() else 1
+                num_experts // group.size() if deepep_mode.enable_low_latency() else DEEPEP_NUM_SMS // 2 ,
             )
 
         cls._buffer = Buffer(
