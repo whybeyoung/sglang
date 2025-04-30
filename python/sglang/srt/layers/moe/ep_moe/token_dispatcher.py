@@ -268,7 +268,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
-            num_recv_tokens_per_expert_list
+            num_recv_tokens_per_expert_list,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
         )
 
         return (
