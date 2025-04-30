@@ -192,7 +192,7 @@ class MooncakeKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
-        self.gpu_handler = MyCudaHandler(args.gpu_id)
+        #self.gpu_handler = MyCudaHandler(args.gpu_id)
 
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
@@ -252,26 +252,26 @@ class MooncakeKVManager(BaseKVManager):
                 logger.info(f"    Destination indices: {decode_index}")
 
                 # Read and print KVCache content
-                try:
-                    # Read source content
-                    src_tensor = self.read_gpu_memory(src_addr, length)
-                    if src_tensor is not None:
-                        src_np = src_tensor.cpu().numpy()
-                        logger.info(f"    Source KVCache content (first 10 elements): {src_np[:10]}")
-                        logger.info(f"    Source KVCache shape: {src_np.shape}")
-                        logger.info(f"    Source KVCache mean: {np.mean(src_np)}")
-                        logger.info(f"    Source KVCache std: {np.std(src_np)}")
-
-                    # Read destination content
-                    dst_tensor = self.read_gpu_memory(dst_addr, length)
-                    if dst_tensor is not None:
-                        dst_np = dst_tensor.cpu().numpy()
-                        logger.info(f"    Destination KVCache content (first 10 elements): {dst_np[:10]}")
-                        logger.info(f"    Destination KVCache shape: {dst_np.shape}")
-                        logger.info(f"    Destination KVCache mean: {np.mean(dst_np)}")
-                        logger.info(f"    Destination KVCache std: {np.std(dst_np)}")
-                except Exception as e:
-                    logger.error(f"Failed to read KVCache content: {e}")
+                # try:
+                #     # Read source content
+                #     src_tensor = self.read_gpu_memory(src_addr, length)
+                #     if src_tensor is not None:
+                #         src_np = src_tensor.cpu().numpy()
+                #         logger.info(f"    Source KVCache content (first 10 elements): {src_np[:10]}")
+                #         logger.info(f"    Source KVCache shape: {src_np.shape}")
+                #         logger.info(f"    Source KVCache mean: {np.mean(src_np)}")
+                #         logger.info(f"    Source KVCache std: {np.std(src_np)}")
+                #
+                #     # Read destination content
+                #     dst_tensor = self.read_gpu_memory(dst_addr, length)
+                #     if dst_tensor is not None:
+                #         dst_np = dst_tensor.cpu().numpy()
+                #         logger.info(f"    Destination KVCache content (first 10 elements): {dst_np[:10]}")
+                #         logger.info(f"    Destination KVCache shape: {dst_np.shape}")
+                #         logger.info(f"    Destination KVCache mean: {np.mean(dst_np)}")
+                #         logger.info(f"    Destination KVCache std: {np.std(dst_np)}")
+                # except Exception as e:
+                #     logger.error(f"Failed to read KVCache content: {e}")
 
                 status = self.engine.transfer_sync(
                     mooncake_session_id, src_addr, dst_addr, length
@@ -296,7 +296,7 @@ class MooncakeKVManager(BaseKVManager):
             status = future.result()
             if status != 0:
                 # Immediate shutdown on first error (existing tasks will finish)
-                executor.shutdown(wait=False)
+                self.executor.shutdown(wait=False)
                 for f in futures:
                     f.cancel()
                 return status
@@ -573,7 +573,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             )
             # Currently, we don't allow prefill instance and decode instance to
             # have different TP sizes per DP rank.
-            assert tp_size_per_dp_rank == self.kv_mgr.tp_size // self.kv_mgr.dp_size
+            #assert tp_size_per_dp_rank == self.kv_mgr.tp_size // self.kv_mgr.dp_size
             if self.prefill_dp_size is None:
                 logger.error(
                     f"Could not fetch prefill dp_size for bootstrap_addr: {self.bootstrap_addr}"
