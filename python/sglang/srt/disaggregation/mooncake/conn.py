@@ -20,7 +20,9 @@ import zmq
 from aiohttp import web
 import torch
 import torch.cuda
-
+import pycuda.driver as cuda
+import pycuda.autoinit
+import numpy as np
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -180,19 +182,16 @@ class MooncakeKVManager(BaseKVManager):
         socket.connect(endpoint)
         return socket
 
-    def read_gpu_memory(self, ptr: int, length: int) -> torch.Tensor:
-        """Read GPU memory content using CUDA."""
-        try:
-            # Create a tensor with the specified size
-            tensor = torch.empty((length // 4,), dtype=torch.float32, device=f'cuda:{torch.cuda.current_device()}')
-            
-            # Use CUDA memory copy to read the content
-            torch.cuda.memcpy(tensor.data_ptr(), ptr, length)
-            
-            return tensor
-        except Exception as e:
-            logger.error(f"Failed to read GPU memory: {e}")
-            return None
+
+
+    def read_gpu_memory(self, addr: int, num_bytes: int):
+        # 创建 host buffer
+        host_buf = np.empty(num_bytes, dtype=np.uint8)
+        
+        # 👇 直接使用整数地址
+        cuda.memcpy_dtoh(host_buf, addr)
+
+        return host_buf
 
     def send_kvcache(
         self,
@@ -230,21 +229,25 @@ class MooncakeKVManager(BaseKVManager):
                 logger.info(f"    Source indices: {prefill_index}")
                 logger.info(f"    Destination indices: {decode_index}")
                 
-                # Read and print KVCache content using CUDA
+                # Read and print KVCache content
                 try:
                     # Read source content
                     src_tensor = self.read_gpu_memory(src_addr, length)
                     if src_tensor is not None:
                         src_np = src_tensor.cpu().numpy()
                         logger.info(f"    Source KVCache content (first 10 elements): {src_np[:10]}")
-           
+                        logger.info(f"    Source KVCache shape: {src_np.shape}")
+                        logger.info(f"    Source KVCache mean: {np.mean(src_np)}")
+                        logger.info(f"    Source KVCache std: {np.std(src_np)}")
                     
                     # Read destination content
                     dst_tensor = self.read_gpu_memory(dst_addr, length)
                     if dst_tensor is not None:
                         dst_np = dst_tensor.cpu().numpy()
                         logger.info(f"    Destination KVCache content (first 10 elements): {dst_np[:10]}")
-               
+                        logger.info(f"    Destination KVCache shape: {dst_np.shape}")
+                        logger.info(f"    Destination KVCache mean: {np.mean(dst_np)}")
+                        logger.info(f"    Destination KVCache std: {np.std(dst_np)}")
                 except Exception as e:
                     logger.error(f"Failed to read KVCache content: {e}")
 
