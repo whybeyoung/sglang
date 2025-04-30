@@ -44,9 +44,8 @@ class MyCudaHandler:
         self.context = None
         self.device_id = device
         # 显式选择设备
-        device = cuda.Device(self.device_id)
-        # 创建 CUDA 上下文
-        self.make_context(device)
+        self.device = cuda.Device(self.device_id)
+
     def make_context(self, device: cuda.Device, *args, **kwargs):
         """创建一个 CUDA 上下文"""
         self.context = device.make_context()
@@ -54,6 +53,8 @@ class MyCudaHandler:
     def read_gpu_memory(self, addr: int, num_bytes: int):
         """从 GPU 内存读取数据"""
         try:
+            # 创建 CUDA 上下文
+            self.make_context(self.device)
             # 创建 host buffer
             host_buf = np.empty(num_bytes, dtype=np.uint8)
 
