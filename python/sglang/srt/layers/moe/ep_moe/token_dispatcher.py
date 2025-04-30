@@ -1,81 +1,25 @@
 from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
-from sglang.srt.utils import (
-    DeepEPMode,
-    DisposibleTensor,
-    get_bool_env_var,
-    get_device_sm,
-    get_int_env_var,
-    get_communication_num_sms
-)
+from sglang.srt.utils import DeepEPMode, DisposibleTensor
 
-import torch
-_num_sms = None
-
-
-
-
-
-DEEPEP_NUM_SMS = get_communication_num_sms()
-
-_enable_jit_deepgemm = False
 try:
-    import deep_ep
     from deep_ep import Buffer
 
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
-
-    sm_version = get_device_sm()
-    if sm_version == 90:
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="false"):
-            _enable_jit_deepgemm = True
     use_deepep = True
-
-    # TODO do not hardcode
-    sglang_hack_deepep_new_mode = get_bool_env_var(
-        "SGLANG_HACK_DEEPEP_NEW_MODE", "true"
-    )
-    if sglang_hack_deepep_new_mode:
-        _HACK_NORMAL_DISPATCH_CONFIG = deep_ep.Config(
-            num_sms=DEEPEP_NUM_SMS,
-            num_max_nvl_chunked_send_tokens=16,
-            num_max_nvl_chunked_recv_tokens=get_int_env_var(
-                "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_NVL_CHUNKED_RECV_TOKENS", 512
-            ),
-            num_max_rdma_chunked_send_tokens=8,
-            num_max_rdma_chunked_recv_tokens=get_int_env_var(
-                "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS", 128
-            ),
-        )
-        _HACK_NORMAL_COMBINE_CONFIG = deep_ep.Config(
-            num_sms=DEEPEP_NUM_SMS,
-            num_max_nvl_chunked_send_tokens=32,
-            num_max_nvl_chunked_recv_tokens=get_int_env_var(
-                "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_NVL_CHUNKED_RECV_TOKENS", 512
-            ),
-            num_max_rdma_chunked_send_tokens=20,
-            num_max_rdma_chunked_recv_tokens=get_int_env_var(
-                "SGLANG_HACK_DEEPEP_NORMAL_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS", 128
-            ),
-        )
-    else:
-        _HACK_NORMAL_DISPATCH_CONFIG = _HACK_NORMAL_COMBINE_CONFIG = None
 except ImportError:
     use_deepep = False
 
 from enum import IntEnum, auto
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
+import torch
 import torch.distributed as dist
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
-    per_token_cast_to_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -109,24 +53,13 @@ class DeepEPBuffer:
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
 
-        Buffer.set_num_sms(DEEPEP_NUM_SMS)
-
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
-
-            if _HACK_NORMAL_DISPATCH_CONFIG is not None:
-                configs = (
-                    _HACK_NORMAL_DISPATCH_CONFIG,
-                    _HACK_NORMAL_COMBINE_CONFIG,
-                )
-            else:
-                configs = (
-                    Buffer.get_dispatch_config(group.size()),
-                    Buffer.get_combine_config(group.size()),
-                )
-
-            for config in configs:
+            for config in (
+                Buffer.get_dispatch_config(group.size()),
+                Buffer.get_combine_config(group.size()),
+            ):
                 num_nvl_bytes = max(
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
                     num_nvl_bytes,
@@ -148,22 +81,14 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
-        # TODO temp hack
-        if sglang_hack_deepep_new_mode and deepep_mode == DeepEPMode.normal:
-            # 参考 DeepEP 示例实现
-            num_qps_per_rank = max(DEEPEP_NUM_SMS // 2, 1)
-        else:
-            num_qps_per_rank = max(
-                num_experts // group.size() if deepep_mode.enable_low_latency() else 1,
-                DEEPEP_NUM_SMS // 2
-            )
-
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
-            num_qps_per_rank=num_qps_per_rank,
+            num_qps_per_rank=(
+                max(num_experts // group.size(), Buffer.num_sms // 2)
+            ),
         )
         return cls._buffer
 
@@ -216,9 +141,7 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_HACK_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
-        )
+        self.num_max_dispatch_tokens_per_rank = 128
 
         self.handle = None
 
@@ -262,76 +185,45 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        # NOTE fix
-        if _enable_jit_deepgemm:
-            # hidden_states = per_token_cast_to_fp8(hidden_states)
-            hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        if _enable_jit_deepgemm:
-            (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                num_recv_tokens_per_expert_list,
-                event,
-            ) = self._dispatch_core(
-                hidden_states, topk_idx, topk_weights, previous_event
-            )
-            event.current_stream_wait() if self.async_finish else ()
-            return (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                None,
-                num_recv_tokens_per_expert_list,
-                None,
-                None,
-                None,
+        (
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            event,
+        ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+        event.current_stream_wait() if self.async_finish else ()
+        if hidden_states.shape[0] > 0:
+            reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
+                hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
             )
         else:
-            (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                num_recv_tokens_per_expert_list,
-                event,
-            ) = self._dispatch_core(
-                hidden_states, topk_idx, topk_weights, previous_event
+            reorder_topk_ids = torch.empty(
+                (0,), device=hidden_states.device, dtype=torch.int64
             )
-            event.current_stream_wait() if self.async_finish else ()
-            if hidden_states.shape[0] > 0:
-                reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
-                    hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
-                )
-            else:
-                reorder_topk_ids = torch.empty(
-                    (0,), device=hidden_states.device, dtype=torch.int64
-                )
-                seg_indptr = torch.zeros(
-                    (self.num_experts + 1,),
-                    device=hidden_states.device,
-                    dtype=torch.int64,
-                )
+            seg_indptr = torch.zeros(
+                (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+            )
             hidden_states = DisposibleTensor(hidden_states)
 
-            masked_m = expected_m = None
-            return (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                reorder_topk_ids,
-                None,
-                seg_indptr,
-                masked_m,
-                expected_m,
-            )
+        masked_m = expected_m = None
+
+        return (
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            reorder_topk_ids,
+            seg_indptr,
+            masked_m,
+            expected_m,
+        )
 
     def _dispatch_core(
         self,
-        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        x: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         previous_event,
@@ -373,23 +265,16 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if _enable_jit_deepgemm else 1,
-            config=_HACK_NORMAL_DISPATCH_CONFIG,
         )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
-            num_recv_tokens_per_expert_list,
-            # TODO hack
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
+            num_recv_tokens_per_expert_list
         )
 
         return (
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,
             event,
         )
 
@@ -438,33 +323,29 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        # TODO support deepgemm
-        if _enable_jit_deepgemm:
-            output = hidden_states
+        if hidden_states.shape[0] > 0:
+            num_tokens = self.src2dst.shape[0] // self.router_topk
+            output = torch.empty(
+                (num_tokens, hidden_states.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            deepep_post_reorder_triton_kernel[(num_tokens,)](
+                hidden_states,
+                output,
+                self.src2dst,
+                topk_idx,
+                topk_weights,
+                self.router_topk,
+                hidden_states.shape[1],
+                BLOCK_SIZE=512,
+            )
         else:
-            if hidden_states.shape[0] > 0:
-                num_tokens = self.src2dst.shape[0] // self.router_topk
-                output = torch.empty(
-                    (num_tokens, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-                deepep_post_reorder_triton_kernel[(num_tokens,)](
-                    hidden_states,
-                    output,
-                    self.src2dst,
-                    topk_idx,
-                    topk_weights,
-                    self.router_topk,
-                    hidden_states.shape[1],
-                    BLOCK_SIZE=512,
-                )
-            else:
-                output = torch.zeros(
-                    (0, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
+            output = torch.zeros(
+                (0, hidden_states.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
 
@@ -483,13 +364,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
-            config=_HACK_NORMAL_COMBINE_CONFIG,
         )
         return combined_x, event
 
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_normal()
-
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
@@ -560,7 +439,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_idx,
             topk_weights,
             reorder_topk_ids,
-            None,
             seg_indptr,
             masked_m,
             expected_m,
@@ -706,8 +584,7 @@ class DeepEPDispatcher:
 
     def dispatch(self, *args, **kwargs) -> Tuple:
         self.dispatch_a(*args, **kwargs)
-        ret = self.dispatch_b()
-        return ret
+        return self.dispatch_b()
 
     def dispatch_a(
         self,
@@ -730,8 +607,7 @@ class DeepEPDispatcher:
 
     def combine(self, *args, **kwargs) -> Tuple:
         self.combine_a(*args, **kwargs)
-        ret = self.combine_b()
-        return ret
+        return self.combine_b()
 
     def combine_a(
         self,
