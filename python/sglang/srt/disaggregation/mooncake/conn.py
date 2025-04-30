@@ -18,7 +18,11 @@ import numpy.typing as npt
 import requests
 import zmq
 from aiohttp import web
-
+import torch
+import torch.cuda
+import pycuda.driver as cuda
+import pycuda.autoinit
+import numpy as np
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -34,6 +38,33 @@ from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
+
+class MyCudaHandler:
+    def __init__(self,device):
+        self.context = None
+        self.device_id = device
+        # 显式选择设备
+        device = cuda.Device(self.device_id)
+        # 创建 CUDA 上下文
+        self.make_context(device)
+    def make_context(self, device: cuda.Device, *args, **kwargs):
+        """创建一个 CUDA 上下文"""
+        self.context = device.make_context()
+
+    def read_gpu_memory(self, addr: int, num_bytes: int):
+        """从 GPU 内存读取数据"""
+        try:
+            # 创建 host buffer
+            host_buf = np.empty(num_bytes, dtype=np.uint8)
+
+            # 从 GPU 地址读取数据到 host buffer
+            cuda.memcpy_dtoh(host_buf, addr)
+
+        finally:
+            # 释放上下文
+            self.context.pop()
+
+        return host_buf
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
@@ -160,6 +191,7 @@ class MooncakeKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+        self.gpu_handler = MyCudaHandler()
 
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
@@ -177,6 +209,10 @@ class MooncakeKVManager(BaseKVManager):
         socket = zmq.Context().socket(zmq.PUSH)
         socket.connect(endpoint)
         return socket
+
+    def read_gpu_memory(self, addr: int, num_bytes: int):
+        return  self.gpu_handler.read_gpu_memory(addr, num_bytes)
+
 
     def send_kvcache(
         self,
@@ -202,17 +238,47 @@ class MooncakeKVManager(BaseKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            logger.info("Transfer EngineErank: {} src_ptr {}  dst_ptr: {} len: {}".format(self.kv_args.engine_rank,src_ptr, dst_ptr, item_len))
+            layer_id = layers_params.index((src_ptr, dst_ptr, item_len))
+            logger.info(f"TP Rank {self.kv_args.engine_rank} Layer {layer_id} KVCache Transfer:")
+
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
 
+                logger.info(f"  Transfer details:")
+                logger.info(f"    Source indices: {prefill_index}")
+                logger.info(f"    Destination indices: {decode_index}")
+
+                # Read and print KVCache content
+                try:
+                    # Read source content
+                    src_tensor = self.read_gpu_memory(src_addr, length)
+                    if src_tensor is not None:
+                        src_np = src_tensor.cpu().numpy()
+                        logger.info(f"    Source KVCache content (first 10 elements): {src_np[:10]}")
+                        logger.info(f"    Source KVCache shape: {src_np.shape}")
+                        logger.info(f"    Source KVCache mean: {np.mean(src_np)}")
+                        logger.info(f"    Source KVCache std: {np.std(src_np)}")
+
+                    # Read destination content
+                    dst_tensor = self.read_gpu_memory(dst_addr, length)
+                    if dst_tensor is not None:
+                        dst_np = dst_tensor.cpu().numpy()
+                        logger.info(f"    Destination KVCache content (first 10 elements): {dst_np[:10]}")
+                        logger.info(f"    Destination KVCache shape: {dst_np.shape}")
+                        logger.info(f"    Destination KVCache mean: {np.mean(dst_np)}")
+                        logger.info(f"    Destination KVCache std: {np.std(dst_np)}")
+                except Exception as e:
+                    logger.error(f"Failed to read KVCache content: {e}")
+
                 status = self.engine.transfer_sync(
                     mooncake_session_id, src_addr, dst_addr, length
                 )
                 if status != 0:
+                    logger.error(f"Transfer failed with status: {status}")
                     return status
+                logger.info(f"    Transfer completed successfully")
             return 0
 
         futures = [
