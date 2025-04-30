@@ -20,8 +20,6 @@ import zmq
 from aiohttp import web
 import torch
 import torch.cuda
-import pycuda.driver as cuda
-import pycuda.autoinit
 import numpy as np
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
@@ -38,34 +36,6 @@ from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
-
-class MyCudaHandler:
-    def __init__(self,device):
-        self.context = None
-        self.device_id = device
-        # 显式选择设备
-        self.device = cuda.Device(self.device_id)
-
-    def make_context(self, device: cuda.Device, *args, **kwargs):
-        """创建一个 CUDA 上下文"""
-        self.context = device.make_context()
-
-    def read_gpu_memory(self, addr: int, num_bytes: int):
-        """从 GPU 内存读取数据"""
-        try:
-            # 创建 CUDA 上下文
-            self.make_context(self.device)
-            # 创建 host buffer
-            host_buf = np.empty(num_bytes, dtype=np.uint8)
-
-            # 从 GPU 地址读取数据到 host buffer
-            cuda.memcpy_dtoh(host_buf, addr)
-
-        finally:
-            # 释放上下文
-            self.context.pop()
-
-        return host_buf
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
