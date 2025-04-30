@@ -2133,9 +2133,19 @@ def configure_deep_gemm_num_sms(num_sms):
 def get_communication_num_sms():
     """Get the number of SMs used for communication."""
     total_num_sm = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    # 从环境变量获取比例，默认为 1/4
-    ratio = float(os.getenv("SGLANG_COMMUNICATION_SM_RATIO", "0.25"))
-    min_sms = int(os.getenv("SGLANG_MIN_COMMUNICATION_SMS", "8"))
+    sm_version = get_device_sm()
+    
+    # 根据 GPU 架构设置基础配置
+    if sm_version == 90:  # H20
+        base_sms = 24  # H20 需要更多的 SM 用于通信
+    else:  # A100 等其他 GPU
+        base_sms = 16  # A100 使用较少的 SM 即可
+        
+    # 确保不超过总 SM 数量的一半
+    max_sms = total_num_sm // 2
+    
+    # 取较小值
+    num_sms = min(base_sms, max_sms)
+    
     # 确保返回偶数
-    num_sms = max(int(total_num_sm * ratio), min_sms)
-    return num_sms + (num_sms % 2)  # 如果是奇数，加1使其变为偶数
+    return num_sms + (num_sms % 2)
