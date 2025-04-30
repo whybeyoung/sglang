@@ -183,10 +183,12 @@ class MooncakeKVManager(BaseKVManager):
     def read_gpu_memory(self, ptr: int, length: int) -> torch.Tensor:
         """Read GPU memory content using CUDA."""
         try:
-            # Create a tensor from the GPU memory pointer
-            tensor = torch.tensor([], dtype=torch.float32, device=f'cuda:{torch.cuda.current_device()}')
-            tensor.data_ptr = ptr
-            tensor.size = (length // 4,)  # Assuming float32 (4 bytes)
+            # Create a tensor with the specified size
+            tensor = torch.empty((length // 4,), dtype=torch.float32, device=f'cuda:{torch.cuda.current_device()}')
+            
+            # Use CUDA memory copy to read the content
+            torch.cuda.memcpy(tensor.data_ptr(), ptr, length)
+            
             return tensor
         except Exception as e:
             logger.error(f"Failed to read GPU memory: {e}")
@@ -235,18 +237,14 @@ class MooncakeKVManager(BaseKVManager):
                     if src_tensor is not None:
                         src_np = src_tensor.cpu().numpy()
                         logger.info(f"    Source KVCache content (first 10 elements): {src_np[:10]}")
-                        logger.info(f"    Source KVCache shape: {src_np.shape}")
-                        logger.info(f"    Source KVCache mean: {np.mean(src_np)}")
-                        logger.info(f"    Source KVCache std: {np.std(src_np)}")
+           
                     
                     # Read destination content
                     dst_tensor = self.read_gpu_memory(dst_addr, length)
                     if dst_tensor is not None:
                         dst_np = dst_tensor.cpu().numpy()
                         logger.info(f"    Destination KVCache content (first 10 elements): {dst_np[:10]}")
-                        logger.info(f"    Destination KVCache shape: {dst_np.shape}")
-                        logger.info(f"    Destination KVCache mean: {np.mean(dst_np)}")
-                        logger.info(f"    Destination KVCache std: {np.std(dst_np)}")
+               
                 except Exception as e:
                     logger.error(f"Failed to read KVCache content: {e}")
 
