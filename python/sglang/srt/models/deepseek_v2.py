@@ -71,6 +71,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -367,8 +368,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
-
+        shared_output = None
         if (
             forward_mode is not None
             and not forward_mode.is_idle()
@@ -376,6 +376,7 @@ class DeepseekV2MoE(nn.Module):
         ):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
         else:
             router_logits = None
 
@@ -590,6 +591,10 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_from_combine_without_scaling = hidden_states
 
     def _forward_tbo_op_shared(self, state):
+        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
+            for i in range(3):
+                self.shared_experts(state.hidden_states_after_post_attn_ln)
+
         state.shared_output = self._forward_deepep_shared_output(
             state.forward_batch.forward_mode,
             state.pop("hidden_states_after_post_attn_ln"),
@@ -1000,7 +1005,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out, q_pe, k_nope, k_pe, forward_batch = state
 
-        q = torch.cat([q_nope_out, q_pe], dim=-1)
+        # NOTE this line is deleted in PR5638, be careful when git merge!
+        # q = torch.cat([q_nope_out, q_pe], dim=-1)
         k = torch.cat([k_nope, k_pe], dim=-1)
 
         if self.attention_backend == "fa3":
@@ -1048,9 +1054,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 torch.bfloat16,
             )
         else:
+            if (num_repeat := get_int_env_var("SGLANG_HACK_SLOW_ATTN_NUM_REPEAT")) > 0:
+                for i in range(num_repeat):
+                    torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         output, _ = self.o_proj(attn_output)
+
+        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
+            for i in range(3):
+                self.o_proj(attn_output)
 
         return output
 
@@ -2129,13 +2143,22 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                             if (
                                 _is_cuda
-                                and _ENABLE_JIT_DEEPGEMM
                                 and weight_block_size[0] == 128
                                 and weight_block_size[1] == 128
                                 and model_dtype == torch.bfloat16
                             ):
-                                block_scale = weight_scale
-                                use_deep_gemm_bmm = True
+                                if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                                    "SGL_USE_DEEPGEMM_BMM", "false"
+                                ):
+                                    block_scale = weight_scale
+                                    use_deep_gemm_bmm = True
+                                else:
+                                    w = block_quant_dequant(
+                                        weight,
+                                        weight_scale,
+                                        weight_block_size,
+                                        model_dtype,
+                                    )
                             else:
                                 w, scale = block_quant_to_tensor_quant(
                                     weight, weight_scale, weight_block_size
