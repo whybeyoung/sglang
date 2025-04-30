@@ -191,7 +191,7 @@ class MooncakeKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
-        self.gpu_handler = MyCudaHandler()
+        self.gpu_handler = MyCudaHandler(args.gpu_id)
 
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
