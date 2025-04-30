@@ -208,6 +208,27 @@ class MooncakeKVManager(BaseKVManager):
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
 
+                # Add logging to print KVCache content
+                logger.info(f"TP Rank {self.kv_args.engine_rank} Layer {layers_params.index((src_ptr, dst_ptr, item_len))} KVCache:")
+                logger.info(f"  Source indices: {prefill_index}")
+                logger.info(f"  Destination indices: {decode_index}")
+                
+                # Read and print actual KVCache content
+                try:
+                    # Read source content
+                    src_content = self.engine.read_memory(src_addr, length)
+                    src_array = np.frombuffer(src_content, dtype=np.float32)
+                    logger.info(f"  Source KVCache content (first 10 elements): {src_array[:10]}")
+                    logger.info(f"  Source KVCache shape: {src_array.shape}")
+                    
+                    # Read destination content before transfer
+                    dst_content = self.engine.read_memory(dst_addr, length)
+                    dst_array = np.frombuffer(dst_content, dtype=np.float32)
+                    logger.info(f"  Destination KVCache content before transfer (first 10 elements): {dst_array[:10]}")
+                    logger.info(f"  Destination KVCache shape: {dst_array.shape}")
+                except Exception as e:
+                    logger.error(f"Failed to read KVCache content: {e}")
+
                 status = self.engine.transfer_sync(
                     mooncake_session_id, src_addr, dst_addr, length
                 )
