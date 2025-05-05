@@ -105,7 +105,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Force enable deep gemm
 os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "1"
 # Force enable mha chunked kv for DeepSeek V3 to avoid missing kv_b_proj DeepGEMM case
-os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"  
+os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"
 
 # Store global states
 @dataclasses.dataclass
@@ -859,7 +859,7 @@ def _wait_and_warmup(
                 "bootstrap_host": ["2.2.2.2"] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [i * (2**63 // server_args.dp_size) + (i % server_args.tp_size) for i in range(server_args.dp_size)],
+                "bootstrap_room": [ i for i in range(server_args.dp_size)],
                 "input_ids": [[0,1,2,3]] * server_args.dp_size
             }
             res = requests.post(
