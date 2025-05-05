@@ -25,7 +25,6 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
-import random
 import traceback
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional
@@ -47,6 +46,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.disaggregation.utils import FakeBootstrapHost
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -102,11 +102,6 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
-# Force enable deep gemm
-os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "1"
-# Force enable mha chunked kv for DeepSeek V3 to avoid missing kv_b_proj DeepGEMM case
-os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"  
-
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
@@ -126,7 +121,6 @@ def set_global_state(global_state: _GlobalState):
 async def lifespan(fast_api_app: FastAPI):
     server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
-        logger.info("Warmup started")
         await execute_warmups(
             server_args.warmups.split(","), _global_state.tokenizer_manager
         )
@@ -848,29 +842,32 @@ def _wait_and_warmup(
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
-        elif server_args.disaggregation_mode == "prefill":
-            logger.info(f"Start of prefill warmup")
+        else:
+            logger.info(f"Start of prefill warmup ...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
                     "max_new_tokens": 8,
                     "ignore_eos": True,
                 },
-                "bootstrap_host": ["2.2.2.2"] * server_args.dp_size,
+                "bootstrap_host": [FakeBootstrapHost] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [i * (2**63 // server_args.dp_size) + (i % server_args.tp_size) for i in range(server_args.dp_size)],
-                "input_ids": [[0,1,2,3]] * server_args.dp_size
+                "bootstrap_room": [
+                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    for i in range(server_args.dp_size)
+                ],
+                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
             }
             res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=1800, # because of deep gemm precache is very long if not precache.
+                timeout=1800,  # because of deep gemm precache is very long if not precache.
             )
-            logger.info(f"End of prefill warmup with status {res.status_code}, {res.json()}")
-
-
+            logger.info(
+                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
+            )
 
     except Exception:
         last_traceback = get_exception_traceback()

@@ -1113,9 +1113,10 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            input_tensor, self.w13_weight_fp8, gateup_output, m_indices
-        )
+        if not get_bool_env_var("SGLANG_HACK_DEL_MOE_GEMM_A"):
+            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+                input_tensor, self.w13_weight_fp8, gateup_output, m_indices
+            )
         down_input = torch.empty(
             (
                 all_tokens,
@@ -1132,24 +1133,30 @@ class DeepEPMoE(EPMoE):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        silu_and_mul(gateup_output.view(-1, N), down_input)
+        if not get_bool_env_var("SGLANG_HACK_DEL_MOE_ACT"):
+            silu_and_mul(gateup_output.view(-1, N), down_input)
         down_output = torch.empty(
             (all_tokens, K),
             device=gather_out.device,
             dtype=torch.bfloat16,
         )
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-            down_input, scale_block_size
+            down_input,
+            scale_block_size,
+            hack_disable=get_bool_env_var("SGLANG_HACK_DEL_MOE_QUANT"),
         )
-        down_input_scale = tma_align_input_scale(down_input_scale)
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            (down_input_fp8, down_input_scale),
-            self.w2_weight_fp8,
-            down_output,
-            m_indices,
-        )
+        if not get_bool_env_var("SGLANG_HACK_DEL_MOE_TMA"):
+            down_input_scale = tma_align_input_scale(down_input_scale)
+        if not get_bool_env_var("SGLANG_HACK_DEL_MOE_GEMM_B"):
+            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+                (down_input_fp8, down_input_scale),
+                self.w2_weight_fp8,
+                down_output,
+                m_indices,
+            )
 
-        ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
+        if not get_bool_env_var("SGLANG_HACK_DEL_MOE_EP_GATHER"):
+            ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
 
         return gather_out
 

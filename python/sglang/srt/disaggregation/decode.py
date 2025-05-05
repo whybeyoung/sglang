@@ -33,14 +33,13 @@ from torch.distributed import ProcessGroup
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FakeBootstrapHost,
     KVClassType,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
     kv_to_page_indices,
     poll_and_all_reduce,
-    FakeBootstrapRoom,
-    FakeBootstrapHost,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -99,7 +98,10 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
 
-        self.num_reserved_decode_tokens = 512
+        self.num_reserved_decode_tokens = int(
+            os.environ.get("SGLANG_HACK_PD_DECODE_NUM_RESERVED_DECODE_TOKENS", "512")
+        )
+        print(f"HACK: {self.num_reserved_decode_tokens=}")
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -138,9 +140,7 @@ class DecodePreallocQueue:
         """Add a request to the pending queue."""
         if req.bootstrap_host == FakeBootstrapHost:
             # Fake transfer for warmup reqs
-            kv_receiver_class = get_kv_class(
-                self.transfer_backend, KVClassType.RECEIVER, fake_transfer=True
-            )
+            kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
         else:
             kv_receiver_class = get_kv_class(
                 self.transfer_backend, KVClassType.RECEIVER

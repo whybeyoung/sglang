@@ -28,6 +28,7 @@ import torch
 from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FakeBootstrapHost,
     KVClassType,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -35,8 +36,6 @@ from sglang.srt.disaggregation.utils import (
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
-    FakeBootstrapRoom,
-    FakeBootstrapHost,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 
@@ -122,9 +121,7 @@ class PrefillBootstrapQueue:
     def add(self, req: Req) -> None:
         if req.bootstrap_host == FakeBootstrapHost:
             # Fake transfer for warmup reqs
-            kv_sender_class = get_kv_class(
-                self.transfer_backend, KVClassType.SENDER, fake_transfer=True
-            )
+            kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
         else:
             kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
         req.disagg_kv_sender = kv_sender_class(
