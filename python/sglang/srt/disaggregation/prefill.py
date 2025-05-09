@@ -28,15 +28,15 @@ import torch
 from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FakeBootstrapHost,
     KVClassType,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
-    FakeBootstrapRoom,
-    FakeBootstrapHost,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 
@@ -69,6 +69,7 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
+        self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.aux_dtype = aux_dtype
 
         self.metadata_buffers = metadata_buffers
@@ -112,16 +113,17 @@ class PrefillBootstrapQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
-            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args
+            kv_args,
+            DisaggregationMode.PREFILL,
+            self.scheduler.server_args,
+            self.is_mla_backend,
         )
         return kv_manager
 
     def add(self, req: Req) -> None:
         if req.bootstrap_host == FakeBootstrapHost:
             # Fake transfer for warmup reqs
-            kv_sender_class = get_kv_class(
-                self.transfer_backend, KVClassType.SENDER, fake_transfer=True
-            )
+            kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
         else:
             kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
         req.disagg_kv_sender = kv_sender_class(
@@ -184,7 +186,7 @@ class SchedulerDisaggregationPrefillMixin:
     """
 
     @torch.no_grad()
-    def event_loop_normal_disagg_prefill(self):
+    def event_loop_normal_disagg_prefill(self: Scheduler):
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         while True:
@@ -223,7 +225,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
 
     @torch.no_grad()
-    def event_loop_overlap_disagg_prefill(self):
+    def event_loop_overlap_disagg_prefill(self: Scheduler):
         self.result_queue = deque()
 
         while True:
