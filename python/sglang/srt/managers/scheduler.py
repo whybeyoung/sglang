@@ -1055,12 +1055,14 @@ class Scheduler(
 
             self.metrics_collector.log_stats(self.stats)
 
-    def log_decode_stats(self):
+    def log_decode_stats(self, can_run_cuda_graph: bool, running_batch=None):
+        batch = running_batch or self.running_batch
+
         gap_latency = time.time() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.time()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
-        num_running_reqs = len(self.running_batch.reqs)
+        num_running_reqs = len(batch.reqs)
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
@@ -1079,7 +1081,7 @@ class Scheduler(
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"{self.forward_ct_decode=}"
+                f"cuda-graph: {can_run_cuda_graph}, "
             )
             spec_accept_length = 0
         else:
@@ -1097,19 +1099,17 @@ class Scheduler(
                 f"accept len: {spec_accept_length:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
+                f"cuda-graph: {can_run_cuda_graph}, "
             )
 
-        logger.info(msg)
-        if self.enable_metrics:
-            self.stats.num_running_reqs = num_running_reqs
-            self.stats.num_used_tokens = num_used
-            self.stats.token_usage = num_used / self.max_total_num_tokens
-            self.stats.cache_hit_rate = 0.0
-            self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.spec_accept_length = spec_accept_length
-            self.metrics_collector.log_stats(self.stats)
+        debug_str = self.token_to_kv_pool_allocator.debug_print()
+        if debug_str:
+            msg += debug_str
 
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
+            msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
+            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
     def check_memory(self):
         available_size = (
             self.token_to_kv_pool_allocator.available_size()
