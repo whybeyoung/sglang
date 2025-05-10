@@ -1055,7 +1055,7 @@ class Scheduler(
 
             self.metrics_collector.log_stats(self.stats)
 
-    def log_decode_stats(self, can_run_cuda_graph: bool, running_batch=None):
+    def log_decode_stats(self, can_run_cuda_graph: bool=None, running_batch=None):
         batch = running_batch or self.running_batch
 
         gap_latency = time.time() - self.last_decode_stats_tic
