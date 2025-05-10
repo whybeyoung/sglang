@@ -1,0 +1,28 @@
+@startuml
+'https://plantuml.com/sequence-diagram
+participant PrefillServer
+
+participant LB
+participant DecodeServer
+
+
+LB --> PrefillServer: 1. request with room_id and prefill_addr
+LB --> DecodeServer: 1. request with room_id and prefill_addr
+PrefillServer <-- DecodeServer: 2. register rank and rdma_port in the room
+PrefillServer --> DecodeServer: 3. connect the rdma_port according the rank and room
+PrefillServer <--> DecodeServer: 4. exchange metadata: data's metadata，rkey, first token  buffer addr.
+loop Prefill
+    PrefillServer --> PrefillServer: 5. chunk prefilled
+end loop
+
+loop remote memory write
+    PrefillServer --> DecodeServer: Write Memory According the addresses.
+end loop
+
+PrefillServer --> DecodeServer: Prefill Completed. Write First Token Address
+
+loop Waiting First Token Address
+    DecodeServer --> DecodeServer: 6. Poll and check Final State.
+end loop
+
+@enduml

@@ -33,6 +33,8 @@ import os
 #  Vestibulum commodo. Ut rhoncus gravida arcu.
 import pyverbs.device as d
 import pynvml
+
+
 def get_device_list(prefix, gpu_no=0, roce_version=2, port_num=1):
     lst = d.get_device_list()
     if len(lst) == 0:
@@ -45,16 +47,16 @@ def get_device_list(prefix, gpu_no=0, roce_version=2, port_num=1):
                 gid_tbl_len = ctx.query_port(port_num).gid_tbl_len
                 if gid_tbl_len > 0:
                     ctx.query_gid(port_num=port_num, index=roce_version)
-                    # 从 sysfs 获取 PCI 地址
+                    # Get PCI address from sysfs
                     dev_path = f"/sys/class/infiniband/{dev.name.decode()}/device"
                     if os.path.exists(dev_path):
-                        pci_addr = os.readlink(dev_path).split("/")[-1]  # 形如 "0000:19:00.0"
+                        pci_addr = os.readlink(dev_path).split("/")[-1]  # Format like "0000:19:00.0"
                     device_list[dev.name.decode()] = pci_addr
 
     return device_list
 
 def get_gpu_pci_address(gpu_no):
-    """ 获取指定 GPU 设备的 PCI 地址 """
+    """ Get PCI address for specified GPU device """
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_no)
     pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
@@ -62,38 +64,48 @@ def get_gpu_pci_address(gpu_no):
     return pci_info.busId  #
 
 def get_net_device_from_rdma(rdma_dev):
-    """ 获取 RoCE 设备对应的网卡名 """
+    """ Get network interface name corresponding to RoCE device """
     net_path = f"/sys/class/infiniband/{rdma_dev}/device/net"
     if os.path.exists(net_path):
-        return os.listdir(net_path)[0]  # 读取网卡名
+        return os.listdir(net_path)[0]  # Read network interface name
     return None
-def normalize_pci_addr(pci_addr):
-    """ 统一 PCI 地址格式，例如 00000000:08:00.0 -> 0000:08:00.0 """
-    parts = pci_addr.split(":")
-    if len(parts) == 3:  # 形如 "00000000:08:00.0"
-        return f"{int(parts[0], 16):04x}:{parts[1]}:{parts[2]}"  # 转换为 "0000:08:00.0"
-    return pci_addr  # 返回原始格式
 
-def find_best_roce_for_gpu(gpu_no, prefix="mlx"):
-    """ 根据 GPU 设备号找到最亲和的 RoCE 网卡 """
+def normalize_pci_addr(pci_addr):
+    """ Normalize PCI address format, e.g. 00000000:08:00.0 -> 0000:08:00.0 """
+    parts = pci_addr.split(":")
+    if len(parts) == 3:  # Format like "00000000:08:00.0"
+        return f"{int(parts[0], 16):04x}:{parts[1]}:{parts[2]}"  # Convert to "0000:08:00.0"
+    return pci_addr  # Return original format
+
+def find_best_roce_for_gpu(gpu_no, prefix="", n=1):
+    """ Find the n closest RoCE network cards based on GPU device number """
     gpu_pci = normalize_pci_addr(get_gpu_pci_address(gpu_no))
     roce_devices = {k: normalize_pci_addr(v) for k, v in get_device_list(prefix).items()}
 
-    best_rdma_dev = None
-    min_distance = float("inf")
+    # List to store (distance, rdma_dev) pairs
+    device_distances = []
 
     for rdma_dev, rdma_pci in roce_devices.items():
-        if rdma_pci[:5] == gpu_pci[:5]:  # **确保同一 NUMA 节点**
+        if rdma_pci[:5] == gpu_pci[:5]:  # **Ensure same NUMA node**
             distance = abs(int(rdma_pci.split(":")[1], 16) - int(gpu_pci.split(":")[1], 16))
-            if distance < min_distance:
-                min_distance = distance
-                best_rdma_dev = rdma_dev
+            device_distances.append((distance, rdma_dev))
 
-    if best_rdma_dev:
-        net_dev = get_net_device_from_rdma(best_rdma_dev)
-        return best_rdma_dev, net_dev
+    # Sort by distance and take top n
+    device_distances.sort()  # Sort by distance (first element of tuple)
+    closest_devices = device_distances[:n]
+
+    # Get network interfaces for the closest devices
+    result = []
+    for _, rdma_dev in closest_devices:
+        net_dev = get_net_device_from_rdma(rdma_dev)
+        if net_dev:
+            result.append((rdma_dev, net_dev))
+    return result
 
 if __name__ == '__main__':
-    gpu_no = 0  # 需要查询的 GPU 设备号
-    rdma_dev, net_dev = find_best_roce_for_gpu(gpu_no)
-    print(f"GPU {gpu_no} 最亲和的 RDMA 设备: {rdma_dev}, 对应网卡: {net_dev}")
+    gpu_no = 0  # GPU device number to query
+    n = 2  # Number of closest devices to find
+    closest_devices = find_best_roce_for_gpu(gpu_no, n=n)
+    print(','.join([x[0] for x in closest_devices]))
+    for i, (rdma_dev, net_dev) in enumerate(closest_devices):
+        print(f"#{i+1} closest RDMA device for GPU {gpu_no}: {rdma_dev}, corresponding network interface: {net_dev}")

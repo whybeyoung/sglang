@@ -314,7 +314,7 @@ class KVSender:
                                 groups_mrs_info)
         zmp_end = time.time()
 
-        print(f"ZMQ Request time: {zmp_end - zmp_start}")
+        #print(f"ZMQ Request time: {zmp_end - zmp_start}")
         if resp["status"] != "ok":
             self.state = KVPoll.Failed
 
@@ -391,11 +391,11 @@ class KVSender:
         """Send actual data synchronously"""
         # 收集要传输的数据
         groups_mrs_info = []
-        print("origin indices", kv_indices)
+        #print("origin indices", kv_indices)
         continous_indices = groups_by_continuity_numpy(kv_indices)
         for group_id, continue_kv_indices in enumerate(continous_indices):
             mrs_info = []
-            print("Sending continuity indices {}".format(continue_kv_indices))
+            #fprint("Sending continuity indices {}".format(continue_kv_indices))
             address_lengths = self.mgr.caculate_layer_kv_addresses(continue_kv_indices)
             for layer_id, (address, length) in enumerate(address_lengths):
                 mr = self.rdma_ep.create_mr(address, length)
@@ -453,7 +453,7 @@ class KVReceiver:
         if resp["status"] != "ok":
             self.state = KVPoll.Failed
 
-        print("boostraped success.. qp_num={}, lid={}".format(qp_num, lid))
+        #print("boostraped success.. qp_num={}, lid={}".format(qp_num, lid))
 
     def query_room(self):
         zmq_client = KVBootstrapClient(f"tcp://{self.bootstrap_addr}")
@@ -462,7 +462,7 @@ class KVReceiver:
             clients = resp['clients']['prefill']
             if self.mgr.engine_rank in clients:
                 return clients.get(self.mgr.engine_rank, None)
-        print("no prefill targes found now... wait...")
+        #print("no prefill targes found now... wait...")
         return None
 
     def init(self, kv_indices: np.ndarray[np.int32], aux_index: Optional[int] = None):

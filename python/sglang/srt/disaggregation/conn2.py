@@ -83,11 +83,14 @@ class KVManager:
     def calculate_token_kv_address(self,  layer_id: int, token_index: int):
         # 获取基础地址 - 每层的KV数据指针
         base_address = self.args.kv_data_ptrs[layer_id]
+
         # 每个token的KV数据大小
         token_kv_size =self.args.kv_item_lens[layer_id]
         # 计算偏移量
         offset = token_kv_size * token_index
         # 最终地址 = 基址 + 偏移量
+        print("layer_id_base", base_address, offset)
+
         token_kv_address = base_address + offset
         return token_kv_address, offset
 
@@ -292,12 +295,7 @@ class KVReceiver:
         self.kv_indices = None
 
         self.ucx_port = get_open_port()
-        # Run connection setup
-        # try:
-        #     asyncio.run(self._connect_to_sender())
-        # except Exception as e:
-        #     logger.error(f"Failed to connect to sender during initialization: {e}")
-        #     self.state = KVPoll.Failed
+
         self.start_time = time.time()
         self.handshake()
 
@@ -337,6 +335,7 @@ class KVReceiver:
             print("handshake cost time", self.handshake_time - self.start_time)
             print("connected by prefill server....")
             data = await ep.recv_obj()
+            self.initialized = KVPoll.WaitingForInput
             print(data)
         except Exception as e:
             print(e)
@@ -356,6 +355,8 @@ class KVReceiver:
         Returns:
             bool: True if initialization successful
         """
+        # 收集要传输的数据
+        result= self.mgr.calculate_all_token_kv_addresses(kv_indices)
 
         self.num_tokens = kv_indices
         self.aux_idx = aux_index

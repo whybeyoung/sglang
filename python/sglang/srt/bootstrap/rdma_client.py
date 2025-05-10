@@ -41,7 +41,7 @@ from pyverbs.qp import QPInitAttr, QPCap, QPAttr, QP
 from pyverbs.mr import MR
 from pyverbs.addr import GID, AHAttr
 from pyverbs.wr import SGE, SendWR
-
+from pyverbs.enums import *
 import logging
 
 logger = logging.getLogger(__name__)
@@ -160,7 +160,7 @@ class RDMAClient:
         self.sock.sendall(pickle.dumps(local_info))
         # 接收远程信息
         self.remote_info = pickle.loads(self.sock.recv(4096))
-        logger.info(f"Received remote info: {self.remote_info}")
+        logger.debug(f"Received remote info: {self.remote_info}")
 
     def rdma_write(self, ptr, length) -> float:
         """
@@ -174,13 +174,12 @@ class RDMAClient:
         """
 
         # 创建 SGE
-        print(length)
         sge = SGE(addr=ptr,
                   length=length,
                   lkey=self.mr.lkey)
 
         # 创建发送工作请求
-        wr = SendWR(wr_id=1, sg=[sge], num_sge=1, opcode=1, send_flags=1)
+        wr = SendWR(wr_id=1, sg=[sge], num_sge=1, opcode=IBV_WR_RDMA_WRITE, send_flags=IBV_SEND_SIGNALED)
         wr.set_wr_rdma(addr=self.remote_info['addr'],
                        rkey=self.remote_info['rkey'])
 
@@ -205,7 +204,9 @@ class RDMAClient:
                     logger.info(f"[Client] Completion status: {wc.status}, "
                                 f"opcode: {wc.opcode}, byte_len: {wc.byte_len}")
                     logger.info(f"[Client] Transfer rate: {throughput:.2f} MB/s")
-
+                    if wc.status == 0:
+                        print("completed")
+                        break
                     if wc.status > 0:
                         raise RuntimeError(f"RDMA Write failed with status: {wc.status}")
                     return throughput
@@ -213,7 +214,6 @@ class RDMAClient:
             time.sleep(0.1)
             retry_count += 1
 
-        raise TimeoutError("RDMA Write operation timed out")
 
     def close(self):
         """关闭客户端"""

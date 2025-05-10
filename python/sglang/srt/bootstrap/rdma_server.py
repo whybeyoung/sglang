@@ -81,14 +81,16 @@ class RDMAServer:
         logger.info("Client connected")
 
         ts = torch.zeros(size, dtype=torch.uint8, device='cuda')
+        logger.info(f"now: {ts}")
 
         # 初始化 RDMA
         self._init_rdma(ts.data_ptr(), ts.numel())
 
         # 等待 RDMA 写入
         self._wait_for_rdma_write(ts.data_ptr(), ts.numel())
-
-        logger.info(f"[Server] GPU buffer (first 10 bytes): {ts}")
+        while True:
+             time.sleep(1)
+             logger.info(f"writing:::  {ts}")
         #
     def _init_rdma(self, ptr, length):
         """初始化 RDMA 资源"""
@@ -184,30 +186,30 @@ class RDMAServer:
         # 预先提交接收工作请求
         # 握手阶段
         recv_sge = SGE(addr=ptr,
-                       length=length,
-                       lkey=self.mr.lkey)
+                      length=length,
+                      lkey=self.mr.lkey)
         recv_wr = RecvWR(wr_id=1, sg=[recv_sge], num_sge=1)
-        self.qp.post_recv(recv_wr)
-        logger.info("[Server] Posted receive request")
-
-        # 等待接收完成
-        start_time = time.time()
-        while True:
-            npolled, wc_list = self.recv_cq.poll()
-
-            if npolled > 0:
-                for wc in wc_list:
-                    end_time = time.time()
-                    duration = end_time - start_time
-                    throughput = length / duration / (1024 * 1024)  # MB/s
-
-                    logger.info(f"[Server] Write Completed: wr_id={wc.wr_id}, "
-                                f"status={wc.status}, opcode={wc.opcode}")
-                    logger.info(f"[Server] Transfer rate: {throughput:.2f} MB/s")
-                break
-            else:
-                logger.debug("[Server] No completion event received, retrying...")
-            time.sleep(0.4)
+        # self.qp.post_recv(recv_wr)
+        # logger.info("[Server] Posted receive request")
+        #
+        # # 等待接收完成
+        # start_time = time.time()
+        # while True:
+        #     npolled, wc_list = self.recv_cq.poll()
+        #
+        #     if npolled > 0:
+        #         for wc in wc_list:
+        #             end_time = time.time()
+        #             duration = end_time - start_time
+        #             throughput = length / duration / (1024 * 1024)  # MB/s
+        #
+        #             logger.info(f"[Server] Write Completed: wr_id={wc.wr_id}, "
+        #                         f"status={wc.status}, opcode={wc.opcode}")
+        #             logger.info(f"[Server] Transfer rate: {throughput:.2f} MB/s")
+        #         break
+        #     else:
+        #         logger.debug("[Server] No completion event received, retrying...")
+        #     time.sleep(0.4)
 
     def close(self):
         """关闭服务器"""
