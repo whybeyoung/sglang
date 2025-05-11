@@ -11,8 +11,9 @@ from typing import Any, Dict, List, Optional, Type
 import einops
 import torch
 import torch.distributed
-
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
 
@@ -47,13 +48,19 @@ class ExpertDistributionRecorder:
         yield
 
     @contextmanager
-    def with_forward_pass(self, forward_pass_id: int):
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
-    def on_deepep_dispatch_normal(self, local_physical_count_of_layer: List[int]):
+    def on_deepep_dispatch_normal(
+        self,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
         pass
 
     def on_deepep_dispatch_low_latency(
@@ -91,6 +98,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
+        self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
         self._accumulator = _Accumulator.init_new(
@@ -108,27 +116,27 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._current_debug_name.with_value(debug_name)
 
     @contextmanager
-    def with_forward_pass(self, forward_pass_id: int):
-        self._on_forward_pass_start()
-        try:
-            yield
-        finally:
-            self._on_forward_pass_end(forward_pass_id)
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        with self._current_forward_pass_id.with_value(forward_pass_id):
+            self._on_forward_pass_start(forward_batch)
+            try:
+                yield
+            finally:
+                self._on_forward_pass_end(forward_pass_id)
 
-    def _on_forward_pass_start(self):
+    def _on_forward_pass_start(self, forward_batch: ForwardBatch):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
+            gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
-            single_pass_global_physical_count = gatherer.collect_global_physical_count()
-            self._accumulator.append(
-                forward_pass_id, gatherer_key, single_pass_global_physical_count
-            )
+            single_pass_data = gatherer.collect()
+            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data)
 
     def flush_buffer_depending_on_expert_location_metadata(self):
         self._accumulator.flush_buffer_depending_on_expert_location_metadata()
@@ -136,10 +144,19 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
-    def on_deepep_dispatch_normal(self, local_physical_count_of_layer: List[int]):
+    def on_deepep_dispatch_normal(
+        self,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
         self._on_hook(
             "on_deepep_dispatch_normal",
             local_physical_count_of_layer=local_physical_count_of_layer,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
         )
 
     def on_deepep_dispatch_low_latency(
@@ -230,6 +247,10 @@ class _SinglePassGatherer(ABC):
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
     ) -> "_SinglePassGatherer":
+        if server_args.expert_distribution_recorder_mode == "detail_per_token":
+            return _DetailSinglePassGatherer(
+                server_args, expert_location_metadata, rank
+            )
         if server_args.enable_deepep_moe:
             # `auto` has many restrictions now, so we lower the priority to implement low-latency capturing for auto
             if server_args.deepep_mode in ["normal", "auto"]:
@@ -246,11 +267,19 @@ class _SinglePassGatherer(ABC):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        pass
+
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
 
     def on_deepep_dispatch_normal(
-        self, layer_idx: int, local_physical_count_of_layer: List[int]
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
     ):
         pass
 
@@ -262,8 +291,80 @@ class _SinglePassGatherer(ABC):
     def reset(self):
         raise NotImplementedError
 
-    def collect_global_physical_count(self) -> torch.Tensor:
+    def collect(self) -> Dict:
         raise NotImplementedError
+
+
+class _DetailSinglePassGatherer(_SinglePassGatherer):
+    # DeepSeek V3 has this value; should generalize later
+    _TOP_K_NUM = 8
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        expert_location_metadata: "ExpertLocationMetadata",
+        rank: int,
+    ):
+        super().__init__(expert_location_metadata, rank)
+        self._metadata: Optional[Dict[str, Any]] = None
+        self._topk_ids_of_layer = torch.zeros(
+            (
+                expert_location_metadata.num_layers,
+                # TODO determine the max number
+                server_args.chunked_prefill_size * 8,
+                self._TOP_K_NUM,
+            ),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self._misc_objects: List[Dict[str, Any]] = []
+        assert (
+            not server_args.enable_two_batch_overlap
+        ), "DetailSinglePassGatherer does not support TBO yet"
+        # TODO assert shared experts fusion is disabled, o/w data is wrong
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        assert self._metadata is None
+        self._metadata = dict(
+            rids=forward_batch.rids,
+            input_ids=forward_batch.input_ids.cpu().tolist(),
+            positions=forward_batch.positions.cpu().tolist(),
+            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+            forward_mode=forward_batch.forward_mode.value,
+        )
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], :] = topk_ids
+
+    def on_deepep_dispatch_normal(
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
+        self._misc_objects.append(
+            dict(
+                layer_id=layer_idx,
+                num_tokens_per_rank=num_tokens_per_rank.cpu().tolist(),
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.cpu().tolist(),
+                num_tokens_per_expert=num_tokens_per_expert.cpu().tolist(),
+            )
+        )
+
+    def reset(self):
+        self._topk_ids_of_layer[...] = -1
+        self._misc_objects.clear()
+        self._metadata = None
+
+    def collect(self) -> Dict:
+        num_tokens = len(self._metadata["input_ids"])
+        return dict(
+            **self._metadata,
+            topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone().cpu(),
+            misc_objects=self._misc_objects,
+        )
 
 
 class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
@@ -302,37 +403,44 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         global_physical_count = [
-            0
-        ] * self._expert_location_metadata.num_physical_experts
+                                    0
+                                ] * self._expert_location_metadata.num_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
 
         self._on_layer_data(layer_idx, global_physical_count)
 
-    def collect_global_physical_count(self) -> torch.Tensor:
-        return super()._collect_objects(
+    def collect(self) -> Dict:
+        global_physical_count = super()._collect_objects(
             pad_len=self._expert_location_metadata.num_physical_experts
         )
+        return dict(global_physical_count=global_physical_count)
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
     def on_deepep_dispatch_normal(
-        self, layer_idx: int, local_physical_count_of_layer: List[int]
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
     ):
         assert isinstance(local_physical_count_of_layer, list)
         self._on_layer_data(layer_idx, local_physical_count_of_layer)
 
-    def collect_global_physical_count(self) -> torch.Tensor:
+    def collect(self) -> Dict:
         local_physical_count = super()._collect_objects(
             pad_len=self._expert_location_metadata.num_local_physical_experts
         )
-        return _convert_local_to_global_physical_count(
+        global_physical_count = _convert_local_to_global_physical_count(
             local_physical_count,
             rank=self._rank,
             num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
             num_physical_experts=self._expert_location_metadata.num_physical_experts,
         )
+        return dict(global_physical_count=global_physical_count)
 
 
 class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
@@ -351,19 +459,20 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
         # Most naive implementation, can optimize later
-        self._data[layer_idx, :] = local_physical_count_of_layer
+        self._data[layer_idx, :] += local_physical_count_of_layer
 
     def reset(self):
         self._data[...] = 0
 
-    def collect_global_physical_count(self) -> torch.Tensor:
+    def collect(self) -> Dict:
         # Can optimize if bottleneck
-        return _convert_local_to_global_physical_count(
+        global_physical_count = _convert_local_to_global_physical_count(
             self._data,
             rank=self._rank,
             num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
             num_physical_experts=self._expert_location_metadata.num_physical_experts,
         )
+        return dict(global_physical_count=global_physical_count)
 
 
 def _convert_local_to_global_physical_count(
@@ -378,7 +487,7 @@ def _convert_local_to_global_physical_count(
 
     ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
     ans[
-        :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
+    :, num_local_physical_experts * rank: num_local_physical_experts * (rank + 1)
     ] = local_physical_count
     return ans
 
@@ -402,7 +511,8 @@ class _Accumulator(ABC):
         return {
             "stat": _StatAccumulator,
             "stat_ut": _StatAndUtilizationRateAccumulator,
-            "detail": _DetailAccumulator,
+            "stat_per_pass": _DetailAccumulator,
+            "detail_per_token": _DetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
@@ -427,7 +537,7 @@ class _Accumulator(ABC):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: Dict,
     ):
         raise NotImplementedError
 
@@ -473,20 +583,27 @@ class _DetailAccumulator(_Accumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: Dict,
     ):
-        single_pass_global_physical_count = single_pass_global_physical_count.to("cpu")
-        if self._save_dir is None:
-            single_pass_global_physical_count = (
-                single_pass_global_physical_count.tolist()
-            )
+        def _process_object(obj):
+            if not isinstance(obj, torch.Tensor):
+                return obj
+
+            obj = obj.cpu().clone()
+            if self._save_dir is None:
+                obj = obj.tolist()
+            return obj
+
+        single_pass_data_processed = {
+            k: _process_object(v) for k, v in single_pass_data.items()
+        }
 
         self._records.append(
             dict(
                 forward_pass_id=forward_pass_id,
                 rank=self._rank,
                 gatherer_key=gatherer_key,
-                physical_count=single_pass_global_physical_count,
+                **single_pass_data_processed,
             )
         )
 
@@ -495,11 +612,17 @@ class _DetailAccumulator(_Accumulator):
 
     def dump(self):
         if self._save_dir is None:
+            # TODO make it unified with the other branch
             return deepcopy(self._records)
         else:
             path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
             logger.info(f"Write expert distribution to {path_output}")
-            torch.save(self._records, str(path_output))
+            output = dict(
+                records=self._records,
+                # NOTE: This may change during recording, so here we say it is the "last" one
+                last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+            )
+            torch.save(output, str(path_output))
             return [dict(path_output=str(path_output))]
 
     def flush_buffer_depending_on_expert_location_metadata(self):
@@ -537,10 +660,12 @@ class _StatAccumulator(_Accumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: Dict,
     ):
         # Can optimize if overhead here is large
-        self._buffer_global_physical_count += single_pass_global_physical_count.cpu()
+        self._buffer_global_physical_count += single_pass_data[
+            "global_physical_count"
+        ].cpu()
 
     def reset(self):
         self._buffer_global_physical_count[...] = 0
@@ -557,22 +682,23 @@ class _StatAccumulator(_Accumulator):
     def flush_buffer_depending_on_expert_location_metadata(self):
         self._logical_count += _convert_global_physical_count_to_logical_count(
             self._buffer_global_physical_count,
-            expert_location_metadata=self._expert_location_metadata,
+            num_layers=self._expert_location_metadata.num_layers,
+            num_logical_experts=self._expert_location_metadata.num_logical_experts,
+            physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
         self._buffer_global_physical_count[...] = 0
 
 
 def _convert_global_physical_count_to_logical_count(
     global_physical_count: torch.Tensor,
-    expert_location_metadata: ExpertLocationMetadata,
+    num_layers: int,
+    num_logical_experts: int,
+    physical_to_logical_map: torch.Tensor,
 ):
-    num_layers = expert_location_metadata.num_layers
-    num_logical_experts = expert_location_metadata.num_logical_experts
-
     logical_count = torch.zeros((num_layers, num_logical_experts))
     logical_count.scatter_add_(
         dim=1,
-        index=expert_location_metadata.physical_to_logical_map,
+        index=physical_to_logical_map,
         src=global_physical_count,
     )
     return logical_count
@@ -590,11 +716,11 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
         self,
         forward_pass_id: int,
         gatherer_key: str,
-        single_pass_global_physical_count: torch.Tensor,
+        single_pass_data: Dict,
     ):
-        super().append(forward_pass_id, gatherer_key, single_pass_global_physical_count)
+        super().append(forward_pass_id, gatherer_key, single_pass_data)
         self._append_utilization_rate(
-            forward_pass_id, single_pass_global_physical_count
+            forward_pass_id, single_pass_data["global_physical_count"]
         )
 
     def reset(self):
@@ -625,7 +751,8 @@ class _StatAndUtilizationRateAccumulator(_StatAccumulator):
                 f"forward_pass_id={forward_pass_id} "
                 f"current_pass_value={utilization_rate:.03f} "
                 f"{''.join(f'last_{size}_value={value:.03f} ' for size, value in self._history.mean().items())} "
-                f"gpu_physical_count_sum={gpu_physical_count_sum}"
+                f"gpu_physical_count_sum={gpu_physical_count_sum} "
+                f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
             )
 
 

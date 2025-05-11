@@ -602,6 +602,10 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
             )
+
+            # Metric for pre-allocation
+            self.num_tokens_pre_allocated = 0
+
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -617,7 +621,12 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
-            self.disagg_prefill_pending_queue = PrefillBootstrapQueue(
+            if not self.enable_overlap:
+                self.disagg_launch_done = threading.Event()
+            else:
+                self.disagg_launch_done = None
+
+            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
@@ -828,6 +837,7 @@ class Scheduler(
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
@@ -942,7 +952,7 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_pending_queue.add(req)
+            self.disagg_prefill_bootstrap_queue.add(req)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
@@ -1032,10 +1042,17 @@ class Scheduler(
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             # NOTE MODIFIED
-            f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+            f"gap_latency: {gap_latency:.3f}, "
             f"#running-req: {running_bs}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
         )
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+            f += f"#queue-req: {len(self.waiting_queue)}, "
+            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
+        else:
+            f += f"#queue-req: {len(self.waiting_queue)}"
+
         logger.info(f)
 
         if self.enable_metrics:
@@ -1055,14 +1072,12 @@ class Scheduler(
 
             self.metrics_collector.log_stats(self.stats)
 
-    def log_decode_stats(self, can_run_cuda_graph: bool=None, running_batch=None):
-        batch = running_batch or self.running_batch
-
+    def log_decode_stats(self):
         gap_latency = time.time() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.time()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
-        num_running_reqs = len(batch.reqs)
+        num_running_reqs = len(self.running_batch.reqs)
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
@@ -1073,16 +1088,14 @@ class Scheduler(
                 gap_latency / self.server_args.decode_log_interval
             )
 
+        msg = (
+            f"Decode batch. "
+            f"#running-req: {num_running_reqs}, "
+            f"#token: {num_used}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+        )
+
         if self.spec_algorithm.is_none():
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"#queue-req: {len(self.waiting_queue)}, "
-                f"cuda-graph: {can_run_cuda_graph}, "
-            )
             spec_accept_length = 0
         else:
             spec_accept_length = (
@@ -1091,25 +1104,29 @@ class Scheduler(
             self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
             self.cum_spec_accept_count += self.spec_num_total_forward_ct
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"accept len: {spec_accept_length:.2f}, "
-                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"#queue-req: {len(self.waiting_queue)}, "
-                f"cuda-graph: {can_run_cuda_graph}, "
-            )
-
-        # debug_str = self.token_to_kv_pool_allocator.debug_print()
-        # if debug_str:
-        #     msg += debug_str
+            msg += f"accept len: {spec_accept_length:.2f}, "
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
-            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
+            msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+
+        msg += (
+            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"#queue-req: {len(self.waiting_queue)}，"
+            f"{time.time()=}, "
+            f"{self.forward_ct_decode=}"
+        )
+
+        logger.info(msg)
+        if self.enable_metrics:
+            self.stats.num_running_reqs = num_running_reqs
+            self.stats.num_used_tokens = num_used
+            self.stats.token_usage = num_used / self.max_total_num_tokens
+            self.stats.cache_hit_rate = 0.0
+            self.stats.gen_throughput = self.last_gen_throughput
+            self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.spec_accept_length = spec_accept_length
+            self.metrics_collector.log_stats(self.stats)
+
     def check_memory(self):
         available_size = (
             self.token_to_kv_pool_allocator.available_size()
@@ -1551,10 +1568,17 @@ class Scheduler(
                 extend_lens=local_batch.extend_lens,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
-            local_can_run_tbo = (local_tbo_split_seq_index is not None) and not (
-                local_batch.forward_mode.is_extend()
-                and enable_deepep_moe
-                and (resolved_deepep_mode == DeepEPMode.low_latency)
+            local_can_run_tbo = (
+                (local_tbo_split_seq_index is not None)
+                and not (
+                    local_batch.forward_mode.is_extend()
+                    and enable_deepep_moe
+                    and (resolved_deepep_mode == DeepEPMode.low_latency)
+                )
+                and not (
+                    get_bool_env_var("SGLANG_HACK_DISABLE_TBO_WHEN_DECODE")
+                    and local_batch.forward_mode.is_decode()
+                )
             )
         else:
             local_tbo_split_seq_index = 0
@@ -1934,9 +1958,8 @@ class Scheduler(
                 recv_req.output_dir,
                 recv_req.num_steps,
                 recv_req.activities,
-                # # NOTE fix
+                # NOTE fix
                 # recv_req.with_stack,
-                # NOTE temp change back
                 False,
                 recv_req.record_shapes,
                 recv_req.profile_id,
@@ -1980,7 +2003,7 @@ class Scheduler(
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
-        print(f"hi {torchprof_activities=}")
+        print(f"hi {torchprof_activities=} {with_stack=} {record_shapes=}")
 
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
@@ -2039,9 +2062,19 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
+        # TODO fix?
+        print("hi set self.profiler_target_forward_ct = none")
+        self.profiler_target_forward_ct = None
+
+        if get_bool_env_var(
+            "SGLANG_HACK_DUMP_EXPERT_DISTRIBUTION_WHEN_STOP_PROFILE", "false"
+        ):
+            self.expert_distribution_handle(ExpertDistributionReq.DUMP_RECORD)
+
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        print(f"hi expert_distribution_handle {recv_req=}", flush=True)
         dump_output = None
         if recv_req == ExpertDistributionReq.START_RECORD:
             get_global_expert_distribution_recorder().start_record()

@@ -153,8 +153,7 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    enable_llama4_multimodal: Optional[bool] = None
-    enable_gemma3_multimodal: Optional[bool] = None
+    enable_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -171,8 +170,9 @@ class ServerArgs:
     enable_eplb: bool = False
     eplb_storage_dir: str = "/tmp/eplb_storage"
     eplb_rebalance_period: Optional[int] = None
+    deepseek_eplb_hack_shuffle: bool = False
     expert_distribution_recorder_mode: Optional[
-        Literal["stat", "detail", "stat_ut"]
+        Literal["stat", "stat_ut", "stat_per_pass", "detail_per_token"]
     ] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -299,10 +299,6 @@ class ServerArgs:
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
-
-        self.enable_multimodal: Optional[bool] = (
-            self.enable_llama4_multimodal or self.enable_gemma3_multimodal
-        )
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -1021,16 +1017,10 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
-            "--enable-llama4-multimodal",
-            default=ServerArgs.enable_llama4_multimodal,
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
             action="store_true",
-            help="Enable the multimodal functionality for Llama-4.",
-        )
-        parser.add_argument(
-            "--enable-gemma3-multimodal",
-            default=ServerArgs.enable_gemma3_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for Gemma-3.",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1206,6 +1196,11 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--deepseek-eplb-hack-shuffle",
+            action="store_true",
+            help="",
         )
         parser.add_argument(
             "--eplb-storage-dir",

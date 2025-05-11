@@ -363,15 +363,6 @@ class ModelRunner:
             )
             server_args.chunked_prefill_size = -1
 
-            if self.model_config.hf_config.architectures == [
-                "Qwen2VLForConditionalGeneration"
-            ] or self.model_config.hf_config.architectures == [
-                "Qwen2_5_VLForConditionalGeneration"
-            ]:
-                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
-                logger.info("Automatically disable radix cache for qwen-vl series.")
-                server_args.disable_radix_cache = True
-
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
 
@@ -1035,12 +1026,6 @@ class ModelRunner:
             return
 
         if self.server_args.disable_cuda_graph:
-            logger.warning(
-                "\n\nCUDA Graph is DISABLED.\n"
-                "This will cause significant performance degradation.\n"
-                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
-                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
-            )
             return
 
         tic = time.time()
@@ -1104,8 +1089,16 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
+
+        # NOTE HACK
+        with torch.autograd.profiler.record_function(
+            f"HACK_TIME_ALIGNMENT {time.time()=}"
+        ):
+            self.dummy_function()
+
         with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id
+            self.forward_pass_id,
+            forward_batch,
         ):
             with fine_grained_benchmark.maybe_benchmark(
                 forward_batch, self.tp_rank, self.forward_pass_id
@@ -1132,6 +1125,9 @@ class ModelRunner:
     def _forward_raw(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
     ) -> LogitsProcessorOutput:
+        print(
+            f"hi forward_raw tp_rank={get_tensor_model_parallel_rank()} {forward_batch.forward_mode=} {forward_batch.batch_size=} {forward_batch.tbo_split_seq_index=} {forward_batch.seq_lens_sum=} {self.forward_pass_id=}"
+        )
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
@@ -1148,6 +1144,7 @@ class ModelRunner:
                 f"{forward_batch.can_run_dp_cuda_graph=} "
                 f"{self.server_args.disable_cuda_graph_padding=} "
                 f"{forward_batch.can_run_tbo=} "
+                f"{forward_batch.forward_mode=}"
             )
 
         if forward_batch.forward_mode.is_decode():
