@@ -49,23 +49,6 @@ class GuidanceGrammar(BaseGrammarObject):
         self.finished = False
         self.bitmask = None
 
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        if len(self.pending_ff_tokens) > 0:
-            s = self.llguidance_tokenizer.decode_str(self.pending_ff_tokens)
-            ff_tokens = self.pending_ff_tokens
-            self.pending_ff_tokens = []
-            return (ff_tokens, s)
-
-        return None
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        return "", -1
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        pass
-
     def accept_token(self, token: int):
         backtrack, ff_tokens = self.ll_interpreter.commit_token(token)
         if len(ff_tokens) > 0 and backtrack == 0:
@@ -115,6 +98,21 @@ class GuidanceGrammar(BaseGrammarObject):
             serialized_grammar=self.serialized_grammar,
         )
 
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
+        ff_tokens = self.ll_matcher.compute_ff_tokens()
+        if ff_tokens:
+            return ff_tokens, ""
+        else:
+            return None
+
+    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
+        return "", -1
+
+    def jump_and_retokenize(
+        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
+    ):
+        pass
+
 
 class GuidanceBackend(BaseGrammarBackend):
     def __init__(self, tokenizer, whitespace_pattern: Optional[str] = None):
@@ -132,10 +130,17 @@ class GuidanceBackend(BaseGrammarBackend):
             serialized_grammar=serialized_grammar,
         )
 
-    def dispatch_json(self, key_string: str) -> GuidanceGrammar:
-        json_schema = key_string
-        compiler = llguidance.JsonCompiler(whitespace_flexible=self.whitespace_flexible)
-        serialized_grammar = compiler.compile(json_schema)
+    def dispatch_json(self, key_string: str) -> Optional[GuidanceGrammar]:
+        try:
+            serialized_grammar = LLMatcher.grammar_from_json_schema(
+                key_string,
+                defaults={
+                    "whitespace_pattern": self.whitespace_pattern,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Skip invalid grammar: {key_string=}, {e=}")
+            return None
         return self._from_serialized(serialized_grammar)
 
     def dispatch_regex(self, key_string: str) -> GuidanceGrammar:
