@@ -1109,7 +1109,6 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
-            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
     def check_memory(self):
         available_size = (
             self.token_to_kv_pool_allocator.available_size()
