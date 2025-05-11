@@ -33,11 +33,16 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
   It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
   It contains low-level tensor data. Most of the data consists of GPU tensors.
+
+TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing it in the future.
 """
 
 import copy
 import dataclasses
+import hashlib
 import logging
+import threading
+from enum import Enum, auto
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -152,9 +157,9 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message="Unknown error", status_code=None, err_type=None):
+    def __init__(self, message=None, status_code=None, err_type=None):
         super().__init__(is_error=True)
-        self.message = message
+        self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
 
@@ -454,11 +459,13 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        # Whether this request has finished output
+        self.finished_output = None
         # If we want to abort the request in the middle of the event loop, set this to true
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_abort = False
         # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
-        self.to_abort_message: str = "Unknown error"
+        self.to_abort_message: str = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
 
@@ -572,8 +579,6 @@ class Req:
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
-        # used for warmup because we don't have a pair yet when init
-        self.skip_kv_transfer: bool = False
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
@@ -581,16 +586,16 @@ class Req:
         # start_send_idx = len(req.fill_ids)
         self.start_send_idx: int = 0
 
-        self.metadata_buffer_index: int = -1
-        # The first output_id transferred from prefill instance.
-        self.transferred_output_id: Optional[int] = None
-
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
+        # The first output_id transferred from prefill instance.
+        self.transferred_output_id: Optional[int] = None
+
+        self.metadata_buffer_index: int = -1
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
 
@@ -760,10 +765,13 @@ class Req:
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
-            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids})"
+            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
+            f"{self.grammar=}, "
+            f"{self.sampling_params=})"
         )
 
 
+# Batch id
 bid = 0
 
 
@@ -1497,7 +1505,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] is not chunked_req_to_exclude
+                and self.reqs[i] not in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

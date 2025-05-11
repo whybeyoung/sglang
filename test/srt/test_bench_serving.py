@@ -134,6 +134,54 @@ class TestBenchServing(CustomTestCase):
             self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
 
+    def test_vlm_offline_throughput(self):
+        res = run_bench_serving(
+            model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
+            num_prompts=200,
+            request_rate=float("inf"),
+            other_server_args=[
+                "--mem-fraction-static",
+                "0.7",
+            ],
+            dataset_name="mmmu",
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_vlm_offline_throughput\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertGreater(res["output_throughput"], 2000)
+                # TODO: not set yet, need AMD machine
+            else:
+                self.assertGreater(res["output_throughput"], 2500)
+
+    def test_vlm_online_latency(self):
+        res = run_bench_serving(
+            model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
+            num_prompts=50,
+            request_rate=1,
+            other_server_args=[
+                "--mem-fraction-static",
+                "0.7",
+            ],
+            dataset_name="mmmu",
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_vlm_online_latency\n"
+                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+            )
+            self.assertLess(res["median_e2e_latency_ms"], 16500)
+            if os.getenv("SGLANG_AMD_CI") == "1":
+                self.assertLess(res["median_ttft_ms"], 150)
+                # TODO: not set yet, need AMD machine
+            else:
+                self.assertLess(res["median_ttft_ms"], 90)
+            self.assertLess(res["median_itl_ms"], 8)
+
     def test_online_latency_eagle(self):
         res = run_bench_serving(
             model=DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
