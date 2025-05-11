@@ -1102,9 +1102,9 @@ class Scheduler(
                 f"cuda-graph: {can_run_cuda_graph}, "
             )
 
-        debug_str = self.token_to_kv_pool_allocator.debug_print()
-        if debug_str:
-            msg += debug_str
+        # debug_str = self.token_to_kv_pool_allocator.debug_print()
+        # if debug_str:
+        #     msg += debug_str
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "

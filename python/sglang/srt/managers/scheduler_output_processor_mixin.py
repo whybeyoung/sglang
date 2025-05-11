@@ -11,8 +11,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
         GenerationBatchResult,
-        ScheduleBatch,
-    )
+        ScheduleBatch, Scheduler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ class SchedulerOutputProcessorMixin:
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
-        self,
+        self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
@@ -271,7 +271,7 @@ class SchedulerOutputProcessorMixin:
             self.attn_tp_rank == 0
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
-            self.log_decode_stats()
+            self.log_decode_stats(running_batch=batch)
 
     def add_input_logprob_return_values(
         self,
