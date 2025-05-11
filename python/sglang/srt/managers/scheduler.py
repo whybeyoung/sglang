@@ -1101,14 +1101,21 @@ class Scheduler(
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"cuda-graph: {can_run_cuda_graph}, "
             )
-
-        # debug_str = self.token_to_kv_pool_allocator.debug_print()
-        # if debug_str:
-        #     msg += debug_str
-
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
+        logger.info(msg)
+        if self.enable_metrics:
+            self.stats.num_running_reqs = num_running_reqs
+            self.stats.num_used_tokens = num_used
+            self.stats.token_usage = num_used / self.max_total_num_tokens
+            self.stats.cache_hit_rate = 0.0
+            self.stats.gen_throughput = self.last_gen_throughput
+            self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.spec_accept_length = spec_accept_length
+            self.metrics_collector.log_stats(self.stats)
+
+
     def check_memory(self):
         available_size = (
             self.token_to_kv_pool_allocator.available_size()
