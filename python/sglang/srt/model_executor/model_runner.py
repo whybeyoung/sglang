@@ -1090,12 +1090,6 @@ class ModelRunner:
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
 
-        # NOTE HACK
-        with torch.autograd.profiler.record_function(
-            f"HACK_TIME_ALIGNMENT {time.time()=}"
-        ):
-            self.dummy_function()
-
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
