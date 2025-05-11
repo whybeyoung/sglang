@@ -234,6 +234,7 @@ class CudaGraphRunner:
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
 
             # Speculative_inference
             if (
@@ -392,6 +393,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = self.mrope_positions[:, :bs]
+        self.num_token_non_padded[...] = num_tokens
 
         if self.enable_dp_attention or self.enable_sp_layernorm:
             self.global_num_tokens_gpu.copy_(
@@ -451,6 +453,7 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             tbo_split_seq_index=tbo_split_seq_index,
             global_forward_mode=self.capture_forward_mode,
+            num_token_non_padded=self.num_token_non_padded,
         )
         forward_batch.prepare_tbo()
 
@@ -528,6 +531,8 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        self.num_token_non_padded[...] = len(forward_batch.input_ids)
+
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)

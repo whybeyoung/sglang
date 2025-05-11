@@ -216,6 +216,16 @@ def biased_grouped_topk_impl(
 def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
+# TODO will fuse this into kernel, thus use slow manual operation now
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def _mask_topk_ids_padded_region(
+    topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+):
+    if num_token_non_padded is None:
+        return
+    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+    topk_ids[indices >= num_token_non_padded, :] = -1
 
 def biased_grouped_topk(
     hidden_states: torch.Tensor,
@@ -229,6 +239,8 @@ def biased_grouped_topk(
     n_share_experts_fusion: int = 0,
     routed_scaling_factor: Optional[float] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+
 ):
     assert (
         routed_scaling_factor is not None
@@ -254,6 +266,7 @@ def biased_grouped_topk(
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
@@ -290,6 +303,7 @@ def select_experts(
     torch_native: bool = False,
     routed_scaling_factor: Optional[float] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
@@ -320,6 +334,7 @@ def select_experts(
                 n_share_experts_fusion=n_share_experts_fusion,
                 routed_scaling_factor=routed_scaling_factor,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+                num_token_non_padded=num_token_non_padded,
             )
     elif torch_native and custom_routing_function is None:
         assert expert_location_dispatch_info is None
