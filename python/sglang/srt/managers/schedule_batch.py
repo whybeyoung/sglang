@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMi
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -445,6 +446,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.lora_path = lora_path
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -494,6 +496,13 @@ class Req:
         # For retraction
         self.is_retracted = False
 
+        # Incremental streamining
+        self.send_token_offset: int = 0
+        self.send_decode_id_offset: int = 0
+        # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
+        # because the decode server does not have the first output token logprobs
+        self.send_output_token_logprobs_offset: int = 0
+
         # Logprobs (arguments)
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
@@ -503,11 +512,9 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
-        # Latency Breakdown
-        self.queue_time_start = None
-        self.queue_time_end = None
-
         # Logprobs (return values)
+        # True means the input logprob has been already sent to detokenizer.
+        self.input_logprob_sent: bool = False
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
         self.input_top_logprobs_val: Optional[List[float]] = None
@@ -522,8 +529,10 @@ class Req:
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
+            # shape: (bs, 1)
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
+            # shape: (bs, k)
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
@@ -549,7 +558,12 @@ class Req:
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
-        self.lora_path = lora_path
+
+        # For metrics
+        self.time_stats: TimeStats = TimeStats()
+        self.has_log_time_stats: bool = False
+        self.queue_time_start = None
+        self.queue_time_end = None
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -574,6 +588,10 @@ class Req:
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
+        self.metadata_buffer_index: int = -1
+
+        # The first output_id transferred from prefill instance.
+        self.transferred_output_id: Optional[int] = None
 
     @property
     def seqlen(self):
