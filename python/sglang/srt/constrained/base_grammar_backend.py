@@ -32,6 +32,37 @@ class BaseGrammarObject(ABC):
     def __init__(self):
         self._finished = False
 
+    def accept_token(self, token: int) -> None:
+        """
+        Accept a token in the grammar.
+        """
+        raise NotImplementedError()
+
+    def rollback(self, k: int):
+        raise NotImplementedError()
+
+    def is_terminated(self):
+        return False
+
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        raise NotImplementedError()
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        raise NotImplementedError()
+
+    def copy(self) -> "BaseGrammarObject":
+        raise NotImplementedError()
+
     @property
     def finished(self):
         return self._finished
