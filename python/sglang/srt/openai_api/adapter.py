@@ -906,6 +906,7 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
+    rids = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -1080,7 +1081,8 @@ def v1_chat_generate_request(
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
         prompts.append(prompt)
-
+        if request.session_params and "rid" in request.session_params:
+            rids.append(request.session_params["rid"])
         sampling_params = {
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens,
@@ -1135,6 +1137,9 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
+        if len(rids) == 1:
+            request_ids = rids[0]
+
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
             prompt_kwargs = {"text": prompts[0]}
