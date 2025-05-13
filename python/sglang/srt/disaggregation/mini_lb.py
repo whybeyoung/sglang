@@ -203,6 +203,7 @@ async def handle_completion_request(request_data: dict):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
+    print(modified_request)
     modified_request.update(
         {
             "bootstrap_host": hostname,
