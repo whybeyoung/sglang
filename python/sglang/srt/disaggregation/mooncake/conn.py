@@ -491,6 +491,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def _handle_node_failure(self, failed_bootstrap_addr):
         with self.connection_lock:
+            logger.info(f"1:  {self.connection_pool} , {self.prefill_dp_size_table}, {self.prefill_dp_size_table} ")
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
@@ -503,6 +504,8 @@ class MooncakeKVManager(BaseKVManager):
 
             possible_affected_rooms = self.addr_to_rooms.get(failed_bootstrap_addr, [])
             del self.addr_to_rooms[failed_bootstrap_addr]
+            logger.info(f"2:  {self.connection_pool} , {self.prefill_dp_size_table}, {self.prefill_dp_size_table} ")
+
         affected_rooms = []
         for room in possible_affected_rooms:
             if room in self.request_status:
