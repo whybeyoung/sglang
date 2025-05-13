@@ -1406,7 +1406,7 @@ class Scheduler(
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
-
+        logger.info(f"pre running bt: {'|'.join([x.rid for x in batch.reqs])}")
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
@@ -1448,6 +1448,8 @@ class Scheduler(
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 bid=bid,
             )
+            logger.info(f"bt: {'|'.join([x.rid for x in batch.reqs])}")
+
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)

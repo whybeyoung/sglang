@@ -147,6 +147,7 @@ class DecodePreallocQueue:
             kv_receiver_class = get_kv_class(
                 self.transfer_backend, KVClassType.RECEIVER
             )
+        logger.info("Decode request add to pending queue: {}".format(req.rid))
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -207,7 +208,9 @@ class DecodePreallocQueue:
                 break
 
             allocatable_tokens -= required_tokens_for_request
+            logger.info("Request %s starting preallocating", decode_req.req.rid)
             self._pre_alloc(decode_req.req)
+            logger.info("Request %s starting preallocated", decode_req.req.rid)
 
             kv_indices = (
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
@@ -354,6 +357,7 @@ class DecodeTransferQueue:
                 assert decode_req.req.transferred_output_id is None
                 decode_req.req.transferred_output_id = output_id
                 transferred_reqs.append(decode_req.req)
+                logger.info(f"KV Transfered and poped {decode_req.req.rid}")
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
