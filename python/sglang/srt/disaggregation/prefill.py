@@ -404,6 +404,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_queue.store_prefill_results(
                 req.metadata_buffer_index, token_id
             )
+            logger.info(f'prefilled last_chunk: {req.rid}')
         page_indices = kv_to_page_indices(kv_indices, page_size)
 
         page_start_idx = start_idx // page_size
