@@ -146,6 +146,7 @@ class MooncakeKVManager(BaseKVManager):
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
+        trans_threads = os.getenv("SGLANG_MOONCAKE_TRANS_THREAD", "4")
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_queue = queue.Queue()
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
@@ -156,7 +157,7 @@ class MooncakeKVManager(BaseKVManager):
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             self.executor = concurrent.futures.ThreadPoolExecutor(
-                min(cpu_count // 4, 16)
+                min(cpu_count // 4, int(trans_threads))
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
