@@ -906,7 +906,6 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
-    rids = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -1081,8 +1080,6 @@ def v1_chat_generate_request(
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
         prompts.append(prompt)
-        if request.session_params and "rid" in request.session_params:
-            rids.append(request.session_params["rid"])
         sampling_params = {
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens,
@@ -1137,9 +1134,6 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if len(rids) == 1:
-            request_ids = rids[0]
-
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
             prompt_kwargs = {"text": prompts[0]}
@@ -1156,6 +1150,7 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
+        request_ids = request_ids[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1386,7 +1381,9 @@ async def v1_chat_completions(
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    adapted_request, request = v1_chat_generate_request(
+        all_requests, tokenizer_manager, request_ids=[all_requests[0].rid]
+    )
 
     if adapted_request.stream:
         parser_dict = {}

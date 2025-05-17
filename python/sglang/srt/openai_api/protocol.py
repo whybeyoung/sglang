@@ -362,6 +362,9 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
 
+    # The request id.
+    rid: Optional[Union[List[str], str]] = None
+
     # For PD disaggregation
     bootstrap_host: Optional[str] = None
     bootstrap_room: Optional[int] = None
