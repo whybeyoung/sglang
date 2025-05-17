@@ -28,6 +28,8 @@ class FakeKVSender(BaseKVSender):
             # Assume transfer completed instantly
             logger.info("FakeKVSender poll success")
             return KVPoll.Success
+    def set_request_id(self, request_id: str):
+        self.request_id = request_id
 
     def init(
         self,
@@ -78,6 +80,8 @@ class FakeKVReceiver(BaseKVReceiver):
             logger.info("FakeKVReceiver poll success")
             return KVPoll.Success
 
+    def set_request_id(self, request_id: str):
+        self.request_id = request_id
     def init(self, kv_indices: list[int], aux_index: Optional[int] = None):
         self.has_init = True
         logger.info(
