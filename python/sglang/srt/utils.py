@@ -990,11 +990,17 @@ def get_zmq_socket(
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
     if bind:
-        socket.bind(endpoint)
+        try:
+            socket.bind(endpoint)
+        except zmq.error.ZMQError as e:
+            logger.error("ZMQ Bind error: %s, Will terminate process", e)
+            sys.exit(-1)
     else:
         socket.connect(endpoint)
-
     return socket
+
+
+
 
 
 def dump_to_file(dirpath, name, value):
