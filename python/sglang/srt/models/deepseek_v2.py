@@ -456,7 +456,6 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    ep_rank=self.tp_rank,
                     layer_id=self.layer_id,
                 ),
                 num_token_non_padded=num_token_non_padded,
