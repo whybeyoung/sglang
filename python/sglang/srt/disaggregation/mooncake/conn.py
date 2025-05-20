@@ -57,7 +57,7 @@ class FastQueue:
                 self._cond.wait()
             return self._buf.popleft()
 
-def group_concurrent_contiguous(
+def group_concurrent_contiguous2(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
 ) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
     """Vectorised NumPy implementation."""
@@ -70,6 +70,33 @@ def group_concurrent_contiguous(
 
     src_groups = [g.tolist() for g in src_groups]
     dst_groups = [g.tolist() for g in dst_groups]
+
+    return src_groups, dst_groups
+
+
+MAX_CONTIGUOUS = 32
+def group_concurrent_contiguous(
+    src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
+) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
+    src_groups = []
+    dst_groups = []
+    current_src = [src_indices[0]]
+    current_dst = [dst_indices[0]]
+
+    for i in range(1, len(src_indices)):
+        src_contiguous = src_indices[i] == src_indices[i - 1] + 1
+        dst_contiguous = dst_indices[i] == dst_indices[i - 1] + 1
+        if src_contiguous and dst_contiguous and len(current_src) < MAX_CONTIGUOUS:
+            current_src.append(src_indices[i])
+            current_dst.append(dst_indices[i])
+        else:
+            src_groups.append(current_src)
+            dst_groups.append(current_dst)
+            current_src = [src_indices[i]]
+            current_dst = [dst_indices[i]]
+
+    src_groups.append(current_src)
+    dst_groups.append(current_dst)
 
     return src_groups, dst_groups
 
