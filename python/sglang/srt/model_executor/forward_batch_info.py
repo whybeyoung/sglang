@@ -738,6 +738,7 @@ class ForwardBatch:
             "capture_hidden_mode",
             "padded_static_len",
             "mrope_positions",  # only used by qwen2-vl, thus not care
+            "num_token_non_padded",
         ]:
             output_dict[key] = getattr(self, key)
 
