@@ -1,16 +1,21 @@
 import dataclasses
 import json
+import logging
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 import torch
+import torch.distributed
 import torch.nn.functional as F
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -18,8 +23,7 @@ class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
-    # (num_gpus, layers, num_logical_experts)
-    logical_to_rank_dispatch_physical_map: torch.Tensor
+    logical_to_rank_dispatch_physical_map: torch.Tensor  # (layers, num_logical_experts)
 
     # -------------------------------- properties ------------------------------------
 
@@ -43,7 +47,7 @@ class ExpertLocationMetadata:
 
     @property
     def ep_size(self):
-        return self.logical_to_rank_dispatch_physical_map.shape[0]
+        return torch.distributed.get_world_size()
 
     def __post_init__(self):
         num_layers_0, num_physical_experts_0 = self.physical_to_logical_map.shape
@@ -53,7 +57,7 @@ class ExpertLocationMetadata:
         num_layers_2, num_logical_experts_1 = (
             self.logical_to_all_physical_map_num_valid.shape
         )
-        ep_size_0, num_layers_3, num_logical_experts_2 = (
+        num_layers_3, num_logical_experts_2 = (
             self.logical_to_rank_dispatch_physical_map.shape
         )
         assert num_layers_0 == num_layers_1 == num_layers_2 == num_layers_3
@@ -63,9 +67,9 @@ class ExpertLocationMetadata:
     # -------------------------------- construction ------------------------------------
 
     @staticmethod
-    def init_trivial(server_args: ServerArgs):
+    def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
         """Trivial location - logical expert i corresponds to physical expert i"""
-        common = ExpertLocationMetadata._init_common(server_args)
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_layers = model_config_for_expert_location.num_layers
@@ -78,15 +82,20 @@ class ExpertLocationMetadata:
 
         return ExpertLocationMetadata.init_by_mapping(
             server_args,
+            model_config,
             physical_to_logical_map=physical_to_logical_map,
         )
 
     @staticmethod
-    def init_by_mapping(server_args: ServerArgs, physical_to_logical_map):
+    def init_by_mapping(
+        server_args: ServerArgs, model_config: ModelConfig,
+        physical_to_logical_map,
+    ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
+        physical_to_logical_map = physical_to_logical_map.to(server_args.device)
 
-        common = ExpertLocationMetadata._init_common(server_args)
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
         model_config_for_expert_location = common["model_config_for_expert_location"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
             physical_to_logical_map,
@@ -100,19 +109,29 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def init_by_eplb(server_args: ServerArgs, logical_count: torch.Tensor):
+    def init_by_eplb(server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
-        common = ExpertLocationMetadata._init_common(server_args)
+        if len(logical_count.shape) == 2:
+            logical_count = logical_count.unsqueeze(0)
+        logical_count = logical_count.to(server_args.device)
+
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
         model_config_for_expert_location = common["model_config_for_expert_location"]
+        num_physical_experts = common["num_physical_experts"]
+
+        phase = server_args.disaggregation_mode
+        if phase == "null":
+            phase = "decode"
 
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
             deepseek_eplb.rebalance_experts(
-                weight=logical_count,
-                num_replicas=common["num_physical_experts"],
+                tokens_per_expert=logical_count,
+                num_physical_experts=num_physical_experts,
+                num_local_physical_experts=num_physical_experts // common["ep_size"],
                 num_groups=model_config_for_expert_location.num_groups,
                 num_nodes=server_args.nnodes,
-                num_gpus=common["ep_size"],
+                phase=phase,
             )
         )
 
@@ -123,8 +142,7 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def _init_common(server_args: ServerArgs):
-        model_config = ModelConfig.from_server_args(server_args)
+    def _init_common(server_args: ServerArgs, model_config: ModelConfig):
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
@@ -167,9 +185,11 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=compute_logical_to_rank_dispatch_physical_map(
-                logical_to_all_physical_map,
+                logical_to_all_physical_map=logical_to_all_physical_map,
+                logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
                 num_gpus=ep_size,
                 num_physical_experts=num_physical_experts,
+                ep_rank=torch.distributed.get_rank(),
             ),
         )
 
@@ -178,40 +198,20 @@ class ExpertLocationMetadata:
     def update(
         self,
         other: "ExpertLocationMetadata",
-        layer_id_start: Optional[int] = None,
-        layer_id_len: Optional[int] = None,
     ):
         for field in [
             "ep_size",
         ]:
             assert getattr(self, field) == getattr(other, field)
 
-        for field, layer_id_dim in [
-            ("physical_to_logical_map", 0),
-            ("logical_to_all_physical_map", 0),
-            ("logical_to_all_physical_map_num_valid", 0),
-            ("logical_to_rank_dispatch_physical_map", 1),
-        ]:
-
-            def _get(obj):
-                ans = getattr(obj, field)
-                if (layer_id_start is not None) or (layer_id_len is not None):
-                    ans = ans.narrow(
-                        dim=layer_id_dim, start=layer_id_start, length=layer_id_len
-                    )
-                return ans
-
-            # Cannot update address to avoid breaking CUDA graph
-            dst = _get(self)
-            dst[...] = _get(other)
-
-    def to(self, device):
         for field in [
+            "physical_to_logical_map",
             "logical_to_all_physical_map",
             "logical_to_all_physical_map_num_valid",
             "logical_to_rank_dispatch_physical_map",
         ]:
-            setattr(self, field, getattr(self, field).to(device))
+            dst = getattr(self, field)
+            dst[...] = getattr(other, field)
 
     # -------------------------------- usage ------------------------------------
 
@@ -269,7 +269,7 @@ def _compute_logical_to_all_physical_map(
         logical_to_all_physical_map, pad_value=-1
     )
 
-    return torch.tensor(logical_to_all_physical_map)
+    return torch.tensor(logical_to_all_physical_map, device=physical_to_logical_map.device)
 
 
 def _pad_nested_array(arr, pad_value):
@@ -281,53 +281,38 @@ def _pad_nested_array(arr, pad_value):
     return padded
 
 
-# This is rarely called, so we use for loops for maximum clarity
+# TODO use more sophisticated approaches
 def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map: torch.Tensor,
+    logical_to_all_physical_map_num_valid: torch.Tensor,
     num_gpus: int,
     num_physical_experts: int,
-    seed: int = 42,
+    ep_rank: int,
+    base_seed: int = 42,
 ):
-    r = random.Random(seed)
+    device = logical_to_all_physical_map.device
 
     num_local_physical_experts = num_physical_experts // num_gpus
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
-    dtype = logical_to_all_physical_map.dtype
 
-    logical_to_rank_dispatch_physical_map = torch.full(
-        size=(num_gpus, num_layers, num_logical_experts),
-        fill_value=-1,
-        dtype=dtype,
+    g = torch.Generator(device=device)
+    g.manual_seed(base_seed + ep_rank)
+
+    output_shape = (num_layers, num_logical_experts)
+    chosen_index = (
+        torch.randint(0, 65536, output_shape, dtype=torch.int32, device=device, generator=g)
+        % logical_to_all_physical_map_num_valid
     )
+    logical_to_rank_dispatch_physical_map = torch.gather(logical_to_all_physical_map, dim=2,
+                                                         index=chosen_index.unsqueeze(-1)).squeeze(-1)
+    assert logical_to_rank_dispatch_physical_map.shape == output_shape
 
-    for layer_id in range(num_layers):
-        for logical_expert_id in range(num_logical_experts):
-            candidate_physical_expert_ids = (
-                ExpertLocationMetadata.logical_to_all_physical_raw(
-                    logical_to_all_physical_map, layer_id, logical_expert_id
-                )
-            )
-            output_partial = logical_to_rank_dispatch_physical_map[
-                :, layer_id, logical_expert_id
-            ]
-
-            for gpu_id in range(num_gpus):
-                same_gpu_physical_expert_ids = [
-                    physical_expert_id
-                    for physical_expert_id in candidate_physical_expert_ids
-                    if _compute_gpu_id_of_physical_expert(
-                        physical_expert_id, num_local_physical_experts
-                    )
-                    == gpu_id
-                ]
-                if len(same_gpu_physical_expert_ids) > 0:
-                    output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
-
-            num_remain = torch.sum(output_partial == -1).item()
-            output_partial[output_partial == -1] = torch.tensor(
-                _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r),
-                dtype=dtype,
-            )
+    for index in range(logical_to_all_physical_map_num_valid.max().item()):
+        partial_logical_to_all_physical_map = logical_to_all_physical_map[:, :, index]
+        is_valid = partial_logical_to_all_physical_map != -1
+        is_same_gpu = (partial_logical_to_all_physical_map // num_local_physical_experts) == ep_rank
+        logical_to_rank_dispatch_physical_map = torch.where(is_valid & is_same_gpu, partial_logical_to_all_physical_map,
+                                                            logical_to_rank_dispatch_physical_map)
 
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
     return logical_to_rank_dispatch_physical_map
@@ -365,3 +350,37 @@ class ModelConfigForExpertLocation:
             )
         else:
             return ModelConfigForExpertLocation.init_dummy()
+
+
+def compute_initial_expert_location_metadata(server_args: ServerArgs,
+                                             model_config: ModelConfig) -> ExpertLocationMetadata:
+    if (data := server_args.init_expert_location) is not None:
+        if data == "trivial":
+            logger.info("init_expert_location from init_expert_location=trivial")
+            return ExpertLocationMetadata.init_trivial(server_args, model_config)
+
+        # TODO unify with the utils function
+        if data.endswith(".pt"):
+            data_dict = torch.load(data, weights_only=True)
+        elif data.endswith(".json"):
+            data_dict = json.loads(Path(data).read_text())
+        else:
+            data_dict = json.loads(data)
+
+        if "physical_to_logical_map" in data_dict:
+            logger.info(
+                "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
+            )
+            return ExpertLocationMetadata.init_by_mapping(server_args, model_config, **data_dict)
+        elif "logical_count" in data_dict:
+            logger.info(
+                "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
+            )
+            return ExpertLocationMetadata.init_by_eplb(server_args, model_config,
+                                                       logical_count=data_dict["logical_count"])
+        else:
+            raise NotImplementedError(
+                f"Unknown init_expert_location format ({list(data_dict.keys())=})"
+            )
+
+    return ExpertLocationMetadata.init_trivial(server_args, model_config)

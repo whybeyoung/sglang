@@ -17,7 +17,6 @@ import asyncio
 import copy
 import dataclasses
 import logging
-import math
 import os
 import pickle
 import signal
@@ -46,7 +45,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
@@ -58,8 +56,6 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers import expert_distribution
-from sglang.srt.managers.eplb_manager import EPLBManager
-from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -71,7 +67,6 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
-    EplbRebalanceReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -98,8 +93,6 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateExpertLocationReqInput,
-    UpdateExpertLocationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -156,8 +149,6 @@ class TokenizerManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: Optional[ExpertLocationMetadata],
-        eplb_manager: Optional[EPLBManager],
     ):
         # Parse args
         self.server_args = server_args
@@ -231,10 +222,6 @@ class TokenizerManager:
                     revision=server_args.revision,
                 )
 
-        self.eplb_manager = eplb_manager
-        if eplb_manager is not None:
-            eplb_manager.bind(self)
-
         # Store states
         self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -257,7 +244,6 @@ class TokenizerManager:
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
-        self.expert_location_metadata = expert_location_metadata
 
         # Metrics
         if self.enable_metrics:
@@ -300,9 +286,6 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.expert_distribution_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.update_expert_location_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -365,10 +348,6 @@ class TokenizerManager:
                 (
                     ExpertDistributionReqOutput,
                     self.expert_distribution_communicator.handle_recv,
-                ),
-                (
-                    UpdateExpertLocationReqOutput,
-                    self.update_expert_location_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -455,7 +434,10 @@ class TokenizerManager:
             input_ids = self.tokenizer.encode(input_text)
 
         image_inputs: Dict = await self.mm_processor.process_mm_data_async(
-            obj.image_data, input_text or input_ids, obj, self.max_req_input_len
+            image_data=obj.image_data,
+            input_text=input_text or input_ids,
+            request_obj=obj,
+            max_req_input_len=self.max_req_input_len,
         )
         if image_inputs and "input_ids" in image_inputs:
             input_ids = image_inputs["input_ids"]
@@ -531,6 +513,7 @@ class TokenizerManager:
                 token_ids_logprob,
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
+                bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
@@ -780,6 +763,7 @@ class TokenizerManager:
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
     ):
+        self.auto_create_handle_loop()
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -792,78 +776,33 @@ class TokenizerManager:
         return await self._execute_profile(req)
 
     async def stop_profile(self):
+        self.auto_create_handle_loop()
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
     async def _execute_profile(self, req: ProfileReq):
+        print("hi tokenizer_manager execute_profile", flush=True)
         result = (await self.profile_communicator(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
         return result
 
     async def start_expert_distribution_record(self):
+        print("hi tokenizer_manager start_expert_distribution_record", flush=True)
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
 
     async def stop_expert_distribution_record(self):
+        print("hi tokenizer_manager stop_expert_distribution_record", flush=True)
+        self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
-        raw_outputs: List[ExpertDistributionReqOutput] = (
-            await self.expert_distribution_communicator(
-                ExpertDistributionReq.DUMP_RECORD
-            )
-        )
-        return expert_distribution.postprocess_dumps(
-            [output.dump_output for output in raw_outputs],
-            server_args=self.server_args,
-            expert_location_metadata=self.expert_location_metadata,
-        )
-
-    async def eplb_rebalance(self, obj: EplbRebalanceReqInput):
+        print("hi tokenizer_manager dump_expert_distribution_record", flush=True)
         self.auto_create_handle_loop()
-        await self.eplb_manager.rebalance(obj)
-
-    async def eplb_save_expert_distribution(self):
-        self.auto_create_handle_loop()
-        await self.eplb_manager.save_expert_distribution()
-
-    async def update_expert_location(self, obj: UpdateExpertLocationReqInput):
-        self.auto_create_handle_loop()
-        assert (
-            self.server_args.ep_dispatch_algorithm is not None
-        ), f"update_expert_location requires ep_dispatch_algorithm"
-
-        old_expert_location_metadata = copy.deepcopy(self.expert_location_metadata)
-        num_layers = old_expert_location_metadata.num_layers
-
-        # pretty arbitrary choice; can optimize if bottleneck
-        step = math.ceil(num_layers / 5)
-        layer_id_lens = list(range(step, num_layers, step)) + [num_layers]
-
-        for layer_id_end in layer_id_lens:
-            logger.info(f"update_expert_location handling up to {layer_id_end}th layer")
-            partial_expert_location_metadata = copy.deepcopy(
-                old_expert_location_metadata
-            )
-            partial_expert_location_metadata.update(
-                obj.expert_location_metadata,
-                layer_id_start=0,
-                layer_id_len=layer_id_end,
-            )
-            await self._update_expert_location_raw(
-                expert_location_metadata=partial_expert_location_metadata,
-            )
-
-    async def _update_expert_location_raw(
-        self, expert_location_metadata: ExpertLocationMetadata
-    ):
-        self.expert_location_metadata = None
-        await self.update_expert_location_communicator(
-            UpdateExpertLocationReqInput(
-                expert_location_metadata=expert_location_metadata,
-            )
+        await self.expert_distribution_communicator(
+            ExpertDistributionReq.DUMP_RECORD
         )
-        self.expert_location_metadata = expert_location_metadata
 
     async def update_weights_from_disk(
         self,
@@ -1105,11 +1044,6 @@ class TokenizerManager:
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
-        if self.eplb_manager is not None:
-            self.asyncio_tasks.add(
-                loop.create_task(print_exception_wrapper(self.eplb_manager.handle_loop))
-            )
-
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
@@ -1183,8 +1117,8 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                        state.last_output_offset :
-                    ]
+                                       state.last_output_offset:
+                                       ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]

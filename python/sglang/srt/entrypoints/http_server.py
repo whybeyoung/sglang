@@ -53,7 +53,6 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
-    EplbRebalanceReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -387,17 +386,6 @@ async def dump_expert_distribution_record_async():
     content = await _global_state.tokenizer_manager.dump_expert_distribution_record()
     return ORJSONResponse(content, status_code=200)
 
-
-@app.post("/eplb_rebalance")
-async def eplb_rebalance(obj: Optional[EplbRebalanceReqInput] = None):
-    await _global_state.tokenizer_manager.eplb_rebalance(obj or EplbRebalanceReqInput())
-    return ORJSONResponse({}, status_code=200)
-
-
-@app.post("/eplb_save_expert_distribution")
-async def eplb_save_expert_distribution():
-    await _global_state.tokenizer_manager.eplb_save_expert_distribution()
-    return ORJSONResponse({}, status_code=200)
 
 
 @app.post("/update_weights_from_disk")

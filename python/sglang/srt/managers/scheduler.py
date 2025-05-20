@@ -32,8 +32,6 @@ import psutil
 import setproctitle
 import torch
 import zmq
-from torch.distributed import barrier
-
 from sglang.global_config import global_config
 from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
@@ -91,8 +89,6 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateExpertLocationReqInput,
-    UpdateExpertLocationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -145,6 +141,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.distributed import barrier
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +176,6 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        expert_location_metadata: Optional[ExpertLocationMetadata],
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -271,7 +267,6 @@ class Scheduler(
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
-            expert_location_metadata=expert_location_metadata,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
@@ -385,8 +380,8 @@ class Scheduler(
             1.0,
         )
         self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+                                         self.init_new_token_ratio - self.min_new_token_ratio
+                                     ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -403,7 +398,7 @@ class Scheduler(
         self.input_blocker = (
             SchedulerInputBlocker(server_args, noop=self.attn_tp_rank != 0)
             if enable_colocated_batch_gen()
-            or server_args.enable_scheduler_input_blocker
+               or server_args.enable_scheduler_input_blocker
             else None
         )
 
@@ -428,7 +423,6 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
-                (UpdateExpertLocationReqInput, self.update_expert_location),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (
@@ -603,6 +597,10 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
             )
+
+            # Metric for pre-allocation
+            self.num_tokens_pre_allocated = 0
+
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -618,7 +616,12 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
-            self.disagg_prefill_pending_queue = PrefillBootstrapQueue(
+            if not self.enable_overlap:
+                self.disagg_launch_done = threading.Event()
+            else:
+                self.disagg_launch_done = None
+
+            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
@@ -639,7 +642,6 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.model_runner_event_loop_step()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -662,7 +664,6 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.model_runner_event_loop_step()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -780,11 +781,6 @@ class Scheduler(
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
 
-    def model_runner_event_loop_step(self):
-        outputs = self.tp_worker.worker.model_runner.event_loop_step()
-        for output in outputs:
-            self.send_to_tokenizer.send_pyobj(output)
-
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -829,6 +825,7 @@ class Scheduler(
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
@@ -943,7 +940,7 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_pending_queue.add(req)
+            self.disagg_prefill_bootstrap_queue.add(req)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
@@ -1033,10 +1030,17 @@ class Scheduler(
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             # NOTE MODIFIED
-            f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+            f"gap_latency: {gap_latency:.3f}, "
             f"#running-req: {running_bs}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
         )
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+            f += f"#queue-req: {len(self.waiting_queue)}, "
+            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
+        else:
+            f += f"#queue-req: {len(self.waiting_queue)}"
+
         logger.info(f)
 
         if self.enable_metrics:
@@ -1258,10 +1262,10 @@ class Scheduler(
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1286,9 +1290,9 @@ class Scheduler(
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (
-                            self.running_batch is not None
-                            and not self.running_batch.is_empty()
-                        )
+                                                               self.running_batch is not None
+                                                               and not self.running_batch.is_empty()
+                                                           )
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1396,6 +1400,13 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+
+        # NOTE HACK
+        if self.forward_ct == 5:
+            text = f"[All threads of {os.getpid()=}, {self.tp_rank=}]"
+            for thread in threading.enumerate():
+                text += f" [{thread.name=} {thread.ident=} {thread.native_id=}]"
+            print(text, flush=True)
 
         # Check profiler
         if (
@@ -1532,8 +1543,8 @@ class Scheduler(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                    )
+                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                )
                 ]
             )
 
@@ -1558,10 +1569,17 @@ class Scheduler(
                 extend_lens=local_batch.extend_lens,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
-            local_can_run_tbo = (local_tbo_split_seq_index is not None) and not (
+            local_can_run_tbo = (
+                (local_tbo_split_seq_index is not None)
+                and not (
                 local_batch.forward_mode.is_extend()
                 and enable_deepep_moe
                 and (resolved_deepep_mode == DeepEPMode.low_latency)
+            )
+                and not (
+                get_bool_env_var("SGLANG_HACK_DISABLE_TBO_WHEN_DECODE")
+                and local_batch.forward_mode.is_decode()
+            )
             )
         else:
             local_tbo_split_seq_index = 0
@@ -1853,9 +1871,6 @@ class Scheduler(
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
-    def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
-        self.tp_worker.worker.model_runner.update_expert_location_start(recv_req)
-
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
@@ -1941,9 +1956,9 @@ class Scheduler(
                 recv_req.output_dir,
                 recv_req.num_steps,
                 recv_req.activities,
-                # # NOTE fix
+                # NOTE fix
                 recv_req.with_stack,
-                # NOTE temp change back
+                # False,
                 recv_req.record_shapes,
                 recv_req.profile_id,
             )
@@ -1986,7 +2001,7 @@ class Scheduler(
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
-        print(f"hi {torchprof_activities=}")
+        print(f"hi {torchprof_activities=} {with_stack=} {record_shapes=}")
 
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
@@ -2008,6 +2023,11 @@ class Scheduler(
         else:
             self.profiler_target_forward_ct = None
             return ProfileReqOutput(success=True, message="Succeeded")
+
+        if get_bool_env_var(
+            "SGLANG_HACK_DISABLE_SLOW_DOWN_WHEN_START_PROFILE", "false"
+        ):
+            self.slow_down(SlowDownReqInput(forward_sleep_time=None))
 
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
@@ -2045,19 +2065,28 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
+        # TODO fix?
+        print("hi set self.profiler_target_forward_ct = none")
+        self.profiler_target_forward_ct = None
+
+        if get_bool_env_var(
+            "SGLANG_HACK_DUMP_EXPERT_DISTRIBUTION_WHEN_STOP_PROFILE", "false"
+        ):
+            self.expert_distribution_handle(ExpertDistributionReq.DUMP_RECORD)
+
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
-        dump_output = None
+        print(f"hi expert_distribution_handle {recv_req=}", flush=True)
         if recv_req == ExpertDistributionReq.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
         elif recv_req == ExpertDistributionReq.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
-            dump_output = get_global_expert_distribution_recorder().dump_record()
+            get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
-        return ExpertDistributionReqOutput(dump_output=dump_output)
+        return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
@@ -2108,7 +2137,6 @@ def _is_all_same(x):
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    expert_location_metadata: Optional[ExpertLocationMetadata],
     gpu_id: int,
     tp_rank: int,
     dp_rank: Optional[int],
@@ -2141,7 +2169,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(
-            server_args, port_args, expert_location_metadata, gpu_id, tp_rank, dp_rank
+            server_args, port_args, gpu_id, tp_rank, dp_rank
         )
         pipe_writer.send(
             {

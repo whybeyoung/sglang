@@ -24,6 +24,7 @@ suites = {
         TestFile("models/test_reward_models.py", 83),
         TestFile("models/test_gme_qwen_models.py", 45),
         TestFile("models/test_clip_models.py", 100),
+        TestFile("models/test_vlm_models.py", 100),
         TestFile("test_abort.py", 51),
         TestFile("test_block_int8.py", 22),
         TestFile("test_chunked_prefill.py", 336),
@@ -33,6 +34,7 @@ suites = {
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_embedding_openai_server.py", 36),
         TestFile("test_expert_location.py", 10),
+        TestFile("test_expert_location_updater.py", 60),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_int8_kernel.py", 8),
         TestFile("test_input_embeddings.py", 38),
@@ -46,7 +48,7 @@ suites = {
         TestFile("test_mla_fp8.py", 93),
         TestFile("test_no_chunked_prefill.py", 126),
         TestFile("test_no_overlap_scheduler.py", 262),
-        TestFile("test_openai_server.py", 124),
+        TestFile("test_openai_server.py", 186),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
@@ -199,7 +201,7 @@ if __name__ == "__main__":
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
     else:
-        files = files[args.range_begin : args.range_end]
+        files = files[args.range_begin: args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
