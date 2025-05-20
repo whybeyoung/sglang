@@ -100,6 +100,7 @@ class GenerateReqInput:
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[int], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
     def normalize_batch_and_arguments(self):
@@ -403,6 +404,9 @@ class GenerateReqInput:
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
             ),
+            bootstrap_port=(
+                self.bootstrap_port[i] if self.bootstrap_port is not None else None
+            ),
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
@@ -450,6 +454,7 @@ class TokenizedGenerateReqInput:
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
 
@@ -466,6 +471,8 @@ class EmbeddingReqInput:
     image_data: Optional[
         Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
     ] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[Union[List[str], str]] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
@@ -684,21 +691,6 @@ class FlushCacheReqOutput:
 
 
 @dataclass
-class EplbRebalanceReqInput:
-    debug_use_random_stat: bool = False
-
-
-@dataclass
-class UpdateExpertLocationReqInput:
-    expert_location_metadata: "ExpertLocationMetadata"
-
-
-@dataclass
-class UpdateExpertLocationReqOutput:
-    pass
-
-
-@dataclass
 class UpdateWeightFromDiskReqInput:
     # The model path with the new weights
     model_path: str
@@ -866,7 +858,7 @@ class ExpertDistributionReq(Enum):
 
 @dataclass
 class ExpertDistributionReqOutput:
-    dump_output: Optional[Any] = None
+    pass
 
 
 @dataclass

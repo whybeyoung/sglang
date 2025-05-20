@@ -20,22 +20,17 @@ This file implements python APIs for the inference engine.
 import asyncio
 import atexit
 import dataclasses
-import json
 import logging
 import multiprocessing as mp
 import os
 import signal
 import threading
-from json import JSONDecodeError
-from pathlib import Path
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
-
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 # Fix a bug of Python threading
@@ -52,7 +47,6 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
-    EplbRebalanceReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -60,7 +54,6 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
-    UpdateExpertLocationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -300,6 +293,18 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
+    def start_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.start_expert_distribution_record())
+
+    def stop_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.stop_expert_distribution_record())
+
+    def dump_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.dump_expert_distribution_record())
+
     def get_server_info(self):
         loop = asyncio.get_event_loop()
         internal_states = loop.run_until_complete(
@@ -367,27 +372,6 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
-        )
-
-    def eplb_rebalance(self):
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.eplb_rebalance(EplbRebalanceReqInput())
-        )
-
-    def eplb_save_expert_distribution(self):
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.eplb_save_expert_distribution()
-        )
-
-    def update_expert_location(self, expert_location_metadata: ExpertLocationMetadata):
-        obj = UpdateExpertLocationReqInput(
-            expert_location_metadata=expert_location_metadata,
-        )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.update_expert_location(obj)
         )
 
     def update_weights_from_disk(
@@ -533,14 +517,6 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    if server_args.node_rank == 0:
-        eplb_manager = EPLBManager(server_args) if server_args.enable_eplb else None
-        expert_location_metadata = _compute_initial_expert_location_metadata(
-            server_args, eplb_manager
-        )
-    else:
-        eplb_manager = expert_location_metadata = None
-
     scheduler_procs = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
@@ -565,7 +541,6 @@ def _launch_subprocesses(
                 args=(
                     server_args,
                     port_args,
-                    expert_location_metadata,
                     gpu_id,
                     tp_rank,
                     None,
@@ -582,7 +557,7 @@ def _launch_subprocesses(
         scheduler_pipe_readers = [reader]
         proc = mp.Process(
             target=run_data_parallel_controller_process,
-            args=(server_args, port_args, expert_location_metadata, writer),
+            args=(server_args, port_args, writer),
         )
         proc.start()
         scheduler_procs.append(proc)
@@ -620,7 +595,7 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(
-        server_args, port_args, expert_location_metadata, eplb_manager
+        server_args, port_args
     )
     if server_args.chat_template:
         load_chat_template_for_openai_api(
@@ -653,38 +628,3 @@ def _launch_subprocesses(
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, scheduler_info
-
-
-def _compute_initial_expert_location_metadata(
-    server_args: ServerArgs, eplb_manager: EPLBManager
-) -> ExpertLocationMetadata:
-    if (data := server_args.init_expert_location) is not None:
-        if data == "trivial":
-            logger.info("init_expert_location from init_expert_location=trivial")
-            return ExpertLocationMetadata.init_trivial(server_args)
-
-        try:
-            data_dict = json.loads(data)
-        except JSONDecodeError:
-            data_dict = json.loads(Path(data).read_text())
-
-        if "physical_to_logical_map" in data_dict:
-            logger.info(
-                "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
-            )
-            return ExpertLocationMetadata.init_by_mapping(server_args, **data_dict)
-        elif "logical_count" in data_dict:
-            logger.info(
-                "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
-            )
-            return ExpertLocationMetadata.init_by_eplb(server_args, **data_dict)
-        else:
-            raise NotImplementedError(
-                f"Unknown init_expert_location format ({list(data_dict.keys())=})"
-            )
-
-    if server_args.enable_eplb:
-        logger.info("init_expert_location from EPLBManager")
-        return eplb_manager.compute_expert_location_metadata()
-
-    return ExpertLocationMetadata.init_trivial(server_args)

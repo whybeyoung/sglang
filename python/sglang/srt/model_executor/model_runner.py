@@ -20,11 +20,10 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -40,6 +39,7 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
     monkey_patch_vllm_parallel_state,
 )
+from sglang.srt.hack_memory_transfer import run_memory_transfer_experiment
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -55,13 +55,13 @@ from sglang.srt.layers.quantization.deep_gemm import (
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
 )
-from sglang.srt.managers.expert_location import ExpertLocationMetadata
-from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
+from sglang.srt.managers.expert_location import ExpertLocationMetadata, compute_initial_expert_location_metadata
 from sglang.srt.managers.schedule_batch import (
     get_global_expert_location_metadata,
     global_server_args_dict,
@@ -75,8 +75,8 @@ from sglang.srt.mem_cache.memory_pool import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
@@ -122,7 +122,6 @@ class ModelRunner:
     def __init__(
         self,
         model_config: ModelConfig,
-        expert_location_metadata: Optional[ExpertLocationMetadata],
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,
@@ -193,7 +192,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -202,13 +201,7 @@ class ModelRunner:
         if _ENABLE_JIT_DEEPGEMM:
             update_deep_gemm_config(gpu_id, server_args)
 
-        [expert_location_metadata] = broadcast_pyobj(
-            data=[expert_location_metadata],
-            rank=torch.distributed.get_rank(),
-            dist_group=get_world_group().cpu_group,
-        )
-        expert_location_metadata.to(server_args.device)
-        set_global_expert_location_metadata(expert_location_metadata)
+        set_global_expert_location_metadata(compute_initial_expert_location_metadata(server_args, model_config))
         if self.tp_rank == 0 and get_bool_env_var(
             "SGLANG_LOG_EXPERT_LOCATION_METADATA"
         ):
@@ -219,11 +212,8 @@ class ModelRunner:
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
 
-        self._expert_location_updater = (
-            ExpertLocationUpdater(self)
-            if server_args.expert_location_updater_mode is not None
-            else None
-        )
+        if get_bool_env_var("SGLANG_HACK_ENABLE_MEMORY_TRANSFER_EXPERIMENT"):
+            run_memory_transfer_experiment()
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -238,6 +228,7 @@ class ModelRunner:
                 rank=self.tp_rank,
             )
         )
+        self.eplb_manager = EPLBManager(self) if self.server_args.enable_eplb else None
 
         # Load the model
         self.sampler = Sampler()
@@ -362,15 +353,6 @@ class ModelRunner:
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
             server_args.chunked_prefill_size = -1
-
-            if self.model_config.hf_config.architectures == [
-                "Qwen2VLForConditionalGeneration"
-            ] or self.model_config.hf_config.architectures == [
-                "Qwen2_5_VLForConditionalGeneration"
-            ]:
-                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
-                logger.info("Automatically disable radix cache for qwen-vl series.")
-                server_args.disable_radix_cache = True
 
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
@@ -554,13 +536,13 @@ class ModelRunner:
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
 
-    def update_expert_location_start(self, recv_req: UpdateExpertLocationReqInput):
-        self._expert_location_updater.start(recv_req)
-
-    def event_loop_step(self) -> List[Any]:
-        if self._expert_location_updater is None:
-            return []
-        return self._expert_location_updater.event_loop_step()
+    def update_expert_location(self, new_expert_location_metadata: ExpertLocationMetadata):
+        expert_location_updater.update_expert_location(
+            self.model.routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+        )
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
@@ -1020,7 +1002,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -1035,12 +1017,6 @@ class ModelRunner:
             return
 
         if self.server_args.disable_cuda_graph:
-            logger.warning(
-                "\n\nCUDA Graph is DISABLED.\n"
-                "This will cause significant performance degradation.\n"
-                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
-                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
-            )
             return
 
         tic = time.time()
@@ -1104,8 +1080,10 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
+
         with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id
+            self.forward_pass_id,
+            forward_batch,
         ):
             with fine_grained_benchmark.maybe_benchmark(
                 forward_batch, self.tp_rank, self.forward_pass_id
@@ -1127,11 +1105,19 @@ class ModelRunner:
                     f"{'-tbo' if forward_batch.can_run_tbo else ''}"
                 )
                 with torch.autograd.profiler.record_function(debug_name):
-                    return self._forward_raw(forward_batch, skip_attn_backend_init)
+                    output = self._forward_raw(forward_batch, skip_attn_backend_init)
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+
+        return output
 
     def _forward_raw(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
     ) -> LogitsProcessorOutput:
+        print(
+            f"hi forward_raw tp_rank={get_tensor_model_parallel_rank()} {forward_batch.forward_mode=} {forward_batch.batch_size=} {forward_batch.tbo_split_seq_index=}"
+        )
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
@@ -1144,10 +1130,11 @@ class ModelRunner:
         if not forward_batch.forward_mode.is_extend():
             print(
                 f"hi WARN! not using cuda graph for non-extend! "
-                f"{sum(forward_batch.global_num_tokens_cpu)=} "
+                f"{sum(forward_batch.global_num_tokens_cpu) if forward_batch.global_num_tokens_cpu is not None else None=} "
                 f"{forward_batch.can_run_dp_cuda_graph=} "
                 f"{self.server_args.disable_cuda_graph_padding=} "
                 f"{forward_batch.can_run_tbo=} "
+                f"{forward_batch.forward_mode=}"
             )
 
         if forward_batch.forward_mode.is_decode():

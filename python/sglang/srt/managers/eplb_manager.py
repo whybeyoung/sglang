@@ -1,78 +1,48 @@
-import asyncio
 import logging
-from pathlib import Path
+import time
 from typing import TYPE_CHECKING
 
-import torch
-
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers import deepseek_eplb
-from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
+import torch.cuda
+from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
-    ModelConfigForExpertLocation,
 )
-from sglang.srt.managers.io_struct import (
-    EplbRebalanceReqInput,
-    UpdateExpertLocationReqInput,
-)
-from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
 
 class EPLBManager:
-    def __init__(self, server_args: ServerArgs):
+    def __init__(self, model_runner: "ModelRunner"):
         super().__init__()
-        self._server_args = server_args
-        self._expert_distribution_storage = ExpertDistributionStorage(
-            dir_data=Path(self._server_args.eplb_storage_dir)
-            / "expert_distribution_storage"
-        )
+        self._model_runner = model_runner
+        self._server_args = model_runner.server_args
 
-    def bind(self, tokenizer_manager: "TokenizerManager"):
-        self._tokenizer_manager = tokenizer_manager
-        self._expert_distribution_storage.bind(tokenizer_manager)
+        # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
+        assert self._server_args.eplb_rebalance_num_iterations <= self._server_args.expert_distribution_recorder_buffer_size, \
+            "eplb_rebalance_num_iterations must be less than expert_distribution_recorder_buffer_size"
 
-    async def handle_loop(self):
-        await self._expert_distribution_storage.start()
-        while True:
-            sleep_time = self._server_args.eplb_rebalance_period or 1000000000
-            logger.info(
-                f"EPLBManager: Sleep {sleep_time} seconds before next automatic rebalancing"
-            )
-            await asyncio.sleep(sleep_time)
-            await self.rebalance(EplbRebalanceReqInput())
+        get_global_expert_distribution_recorder().start_record()
 
-    async def rebalance(self, obj: EplbRebalanceReqInput):
-        await self.save_expert_distribution()
-        expert_location_metadata = self.compute_expert_location_metadata(
-            debug_use_random_stat=obj.debug_use_random_stat
-        )
-        await self._tokenizer_manager.update_expert_location(
-            UpdateExpertLocationReqInput(
-                expert_location_metadata=expert_location_metadata
-            )
-        )
+        logger.info(
+            f"[EPLBManager] system started, will rebalance per {self._server_args.eplb_rebalance_num_iterations} iterations.")
 
-    async def save_expert_distribution(self):
-        await self._expert_distribution_storage.save_current()
+    def on_forward_pass_end(self, forward_pass_id: int):
+        if forward_pass_id % self._server_args.eplb_rebalance_num_iterations == 0:
+            self.rebalance()
 
-    def compute_expert_location_metadata(self, debug_use_random_stat: bool = False):
-        snapshot = self._expert_distribution_storage.get_last_snapshot()
-        if snapshot is None:
-            return ExpertLocationMetadata.init_trivial(self._server_args)
+    def rebalance(self):
+        logger.info("[EPLBManager] rebalance start")
+        torch.cuda.synchronize()
+        time_start = time.time()
 
-        if debug_use_random_stat:
-            logger.warning(
-                "EPLBManager.compute_expert_location_metadata use random stat for debugging."
-            )
-            original_logical_count = torch.tensor(snapshot["logical_count"])
-            snapshot = {
-                "logical_count": torch.randint_like(original_logical_count, high=100000)
-            }
+        logical_count = get_global_expert_distribution_recorder().dump_record(output_mode="object")["logical_count"]
+        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(self._server_args,
+                                                                       self._model_runner.model_config, logical_count)
+        self._model_runner.update_expert_location(expert_location_metadata)
 
-        return ExpertLocationMetadata.init_by_eplb(self._server_args, **snapshot)
+        torch.cuda.synchronize()
+        time_end = time.time()
+        logger.info(f"[EPLBManager] rebalance end time={time_end - time_start:.3f}s")
