@@ -35,9 +35,9 @@ from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
-
 from collections import deque
 import threading
+
 
 class FastQueue:
     def __init__(self):
@@ -56,6 +56,7 @@ class FastQueue:
             while not self._buf:
                 self._cond.wait()
             return self._buf.popleft()
+
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
@@ -133,8 +134,8 @@ class KVArgsRegisterInfo:
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
         )
 
 
@@ -170,7 +171,7 @@ class MooncakeKVManager(BaseKVManager):
         self.register_buffer_to_engine()
         trans_threads = os.getenv("SGLANG_MOONCAKE_TRANS_THREAD", "4")
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.transfer_queue = FastQueue()
+            # self.transfer_queue = FastQueue()
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
             self.start_prefill_thread()
@@ -178,8 +179,15 @@ class MooncakeKVManager(BaseKVManager):
 
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
+            shard_count = min(cpu_count // 4, int(trans_threads))
+
+            # 为每条队列启动一个 transfer 线程
+            self.transfer_queues: List[FastQueue] = [FastQueue() for _ in range(shard_count)]
+            for q in self.transfer_queues:
+                threading.Thread(target=self._transfer_worker, args=(q,), daemon=True).start()
+
             self.executor = concurrent.futures.ThreadPoolExecutor(
-                min(cpu_count // 4, int(trans_threads))
+                shard_count
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
@@ -213,6 +221,72 @@ class MooncakeKVManager(BaseKVManager):
         socket.connect(endpoint)
         return socket
 
+    def _transfer_worker(self, queue: FastQueue):
+        # TODO: Shall we use KVPoll.Transferring state?
+        while True:
+            kv_chunk: TransferKVChunk = queue.get()
+            reqs_to_be_processed = self.transfer_infos[kv_chunk.room].values()
+            polls = []
+            dst_ranks_infos = []
+            for req in reqs_to_be_processed:
+                if not req.is_dummy:
+                    chunked_dst_kv_indice = req.dst_kv_indices[
+                        kv_chunk.index_slice
+                    ]
+                    if len(chunked_dst_kv_indice) != len(kv_chunk.prefill_kv_indices):
+                        logging.error(
+                            f"truncate 1 {kv_chunk.request_id}! len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}")
+                        logger.error(
+                            f"truncate 2 {kv_chunk.request_id}, len(req.dst_kv_indices){len(req.dst_kv_indices)}, kv_chunk.index_slice: {kv_chunk.index_slice}")
+                        kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[:len(chunked_dst_kv_indice)]
+                    ret = self.send_kvcache(
+                        req.mooncake_session_id,
+                        kv_chunk.prefill_kv_indices,
+                        self.decode_kv_args_table[
+                            req.mooncake_session_id
+                        ].dst_kv_ptrs,
+                        chunked_dst_kv_indice,
+                    )
+                    if ret != 0:
+                        self.update_status(kv_chunk.room, KVPoll.Failed)
+                        self.sync_status_to_decode_endpoint(
+                            req.endpoint, req.dst_port, req.room
+                        )
+                        continue
+
+                    if kv_chunk.is_last:
+                        # Only the last chunk we need to send the aux data
+                        ret = self.send_aux(
+                            req.mooncake_session_id,
+                            kv_chunk.prefill_aux_index,
+                            self.decode_kv_args_table[
+                                req.mooncake_session_id
+                            ].dst_aux_ptrs,
+                            req.dst_aux_index,
+                        )
+                        polls.append(True if ret == 0 else False)
+                        dst_ranks_infos.append(
+                            (req.endpoint, req.dst_port, req.room)
+                        )
+
+                        # Only sync status when all the dst ranks have received the kvcache
+                        if len(polls) == req.required_dst_info_num:
+                            self.update_status(
+                                req.room,
+                                KVPoll.Success if all(polls) else KVPoll.Failed,
+                            )
+                            for endpoint, dst_port, room in dst_ranks_infos:
+                                self.sync_status_to_decode_endpoint(
+                                    endpoint, dst_port, room
+                                )
+                else:
+                    # Dummy request means the decode instance is not used, so its status can be marked as success directly
+                    # Dummy request does not need to sync status to decode endpoint
+                    if kv_chunk.is_last:
+                        self.update_status(req.room, KVPoll.Success)
+
+            if self.check_status(kv_chunk.room) == KVPoll.Success:
+                self.transfer_infos.pop(kv_chunk.room)
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -330,7 +404,6 @@ class MooncakeKVManager(BaseKVManager):
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)
-
         def transfer_thread():
             # TODO: Shall we use KVPoll.Transferring state?
             while True:
@@ -343,10 +416,12 @@ class MooncakeKVManager(BaseKVManager):
                         chunked_dst_kv_indice = req.dst_kv_indices[
                             kv_chunk.index_slice
                         ]
-                        if  len(chunked_dst_kv_indice) != len(kv_chunk.prefill_kv_indices):
-                            logging.error( f"truncate 1 {kv_chunk.request_id}! len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}")
-                            logger.error(f"truncate 2 {kv_chunk.request_id}, len(req.dst_kv_indices){len(req.dst_kv_indices)}, kv_chunk.index_slice: {kv_chunk.index_slice}")
-                            kv_chunk.prefill_kv_indices=kv_chunk.prefill_kv_indices[:len(chunked_dst_kv_indice)]
+                        if len(chunked_dst_kv_indice) != len(kv_chunk.prefill_kv_indices):
+                            logging.error(
+                                f"truncate 1 {kv_chunk.request_id}! len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}")
+                            logger.error(
+                                f"truncate 2 {kv_chunk.request_id}, len(req.dst_kv_indices){len(req.dst_kv_indices)}, kv_chunk.index_slice: {kv_chunk.index_slice}")
+                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[:len(chunked_dst_kv_indice)]
                         ret = self.send_kvcache(
                             req.mooncake_session_id,
                             kv_chunk.prefill_kv_indices,
@@ -396,9 +471,8 @@ class MooncakeKVManager(BaseKVManager):
                 if self.check_status(kv_chunk.room) == KVPoll.Success:
                     self.transfer_infos.pop(kv_chunk.room)
 
-
         threading.Thread(target=bootstrap_thread).start()
-        threading.Thread(target=transfer_thread).start()
+        #threading.Thread(target=transfer_thread).start()
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
@@ -455,7 +529,9 @@ class MooncakeKVManager(BaseKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
 
-        self.transfer_queue.put(
+        # 简单按 room 分片，也可用 request_id
+        shard_idx = bootstrap_room % len(self.transfer_queues)
+        self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
@@ -465,6 +541,7 @@ class MooncakeKVManager(BaseKVManager):
                 request_id=request_id,
             )
         )
+
         self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def check_status(self, bootstrap_room: int):
@@ -548,6 +625,7 @@ class MooncakeKVSender(BaseKVSender):
         self.bootstrap_server_url = bootstrap_addr
         self.session_id = self.kv_mgr.get_session_id()
         self.request_id = None
+
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
@@ -572,6 +650,7 @@ class MooncakeKVSender(BaseKVSender):
                 aux_index=self.aux_index,
                 request_id=self.request_id,
             )
+
     def set_request_id(self, request_id: str):
         self.request_id = request_id
 
@@ -639,8 +718,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.is_mla_backend
             ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
             self.target_tp_rank = (
-                self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-            ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
+                                      self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
+                                  ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
             self.required_dst_info_num = (
                 local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank
             )
@@ -781,6 +860,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
     def set_request_id(self, request_id: str):
         self.request_id = request_id
+
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
@@ -941,4 +1021,5 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             self.thread.join(timeout=2)
             logger.info("Server thread stopped")
 
-    def poll(self) -> KVPoll: ...
+    def poll(self) -> KVPoll:
+        ...
