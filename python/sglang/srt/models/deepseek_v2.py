@@ -60,7 +60,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import (
+    DEEPEP_NUM_SMS,
+    DeepEPDispatcher,
+)
 from sglang.srt.layers.moe.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
@@ -71,6 +74,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -367,8 +371,8 @@ class DeepseekV2MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        shared_output = None
         forward_mode = forward_batch.forward_mode
-        shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
 
         if (
             forward_mode is not None
@@ -377,6 +381,7 @@ class DeepseekV2MoE(nn.Module):
         ):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
         else:
             router_logits = None
 
@@ -388,6 +393,7 @@ class DeepseekV2MoE(nn.Module):
             topk_idx,
             topk_weights,
             reorder_topk_ids,
+            num_recv_tokens_per_expert,
             seg_indptr,
             masked_m,
             expected_m,
@@ -395,10 +401,13 @@ class DeepseekV2MoE(nn.Module):
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
             reorder_topk_ids=reorder_topk_ids,
             seg_indptr=seg_indptr,
             masked_m=masked_m,
             expected_m=expected_m,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
         )
 
@@ -524,10 +533,15 @@ class DeepseekV2MoE(nn.Module):
     def _forward_tbo_op_mlp(self, state):
         state.expert_output_hidden_states = self.experts(
             hidden_states=state.pop("hidden_states_from_dispatch"),
+            topk_idx=state.topk_idx_from_dispatch,
+            topk_weights=state.topk_weights_from_dispatch,
             reorder_topk_ids=state.pop("reorder_topk_ids_from_dispatch"),
             seg_indptr=state.pop("seg_indptr_from_dispatch"),
             masked_m=state.pop("masked_m_from_dispatch"),
             expected_m=state.pop("expected_m_from_dispatch"),
+            num_recv_tokens_per_expert=state.pop(
+                "num_recv_tokens_per_expert_from_dispatch"
+            ),
             forward_mode=state.forward_batch.forward_mode,
         )
 
@@ -561,6 +575,7 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_idx_from_dispatch,
                 state.topk_weights_from_dispatch,
                 state.reorder_topk_ids_from_dispatch,
+                state.num_recv_tokens_per_expert_from_dispatch,
                 state.seg_indptr_from_dispatch,
                 state.masked_m_from_dispatch,
                 state.expected_m_from_dispatch,
@@ -582,6 +597,10 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_from_combine_without_scaling = hidden_states
 
     def _forward_tbo_op_shared(self, state):
+        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
+            for i in range(3):
+                self.shared_experts(state.hidden_states_after_post_attn_ln)
+
         state.shared_output = self._forward_deepep_shared_output(
             state.forward_batch.forward_mode,
             state.pop("hidden_states_after_post_attn_ln"),
@@ -992,7 +1011,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out, q_pe, k_nope, k_pe, forward_batch = state
 
-        q = torch.cat([q_nope_out, q_pe], dim=-1)
+        # NOTE this line is deleted in PR5638, be careful when git merge!
+        # q = torch.cat([q_nope_out, q_pe], dim=-1)
         k = torch.cat([k_nope, k_pe], dim=-1)
 
         if self.attention_backend == "fa3":
@@ -1040,9 +1060,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 torch.bfloat16,
             )
         else:
+            if (num_repeat := get_int_env_var("SGLANG_HACK_SLOW_ATTN_NUM_REPEAT")) > 0:
+                for i in range(num_repeat):
+                    torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         output, _ = self.o_proj(attn_output)
+
+        if get_bool_env_var("SGLANG_HACK_SLOW_BETWEEN_COMMUNICATION", "false"):
+            for i in range(3):
+                self.o_proj(attn_output)
 
         return output
 
@@ -1486,16 +1514,22 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
                 dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
                 dp_scatter(residual, hidden_states, forward_batch)
-                hidden_states = self.post_attention_layernorm(hidden_states)
+                # TODO extract this bugfix
+                if hidden_states.shape[0] != 0:
+                    hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                # TODO extract this bugfix
+                if hidden_states.shape[0] != 0:
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual
+                    )
+        else:
+            # TODO extract this bugfix
+            if hidden_states.shape[0] != 0:
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
@@ -1973,7 +2007,7 @@ class DeepseekV2Model(nn.Module):
         total_num_sm = torch.cuda.get_device_properties(
             device="cuda"
         ).multi_processor_count
-        extend_mode_communication_num_sm = 20
+        extend_mode_communication_num_sm = DEEPEP_NUM_SMS
         num_sm_context = (
             configure_deep_gemm_num_sms(
                 num_sms=total_num_sm - extend_mode_communication_num_sm
@@ -2006,11 +2040,27 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.determine_n_share_experts_fusion()
+        self.model = DeepseekV2Model(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+            enable_tp=not _enable_moe_dense_fully_dp(),  # TODO: replace it with DP attention
+        )
+        self.logits_processor = LogitsProcessor(config)
+
+    def determine_n_share_experts_fusion(
+        self, architecture: str = "DeepseekV3ForCausalLM"
+    ):
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
         if self.n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (
-                self.config.architectures[0] != "DeepseekV3ForCausalLM"
+                self.config.architectures[0] != architecture
                 or self.config.n_routed_experts != 256
             ):
                 self.n_share_experts_fusion = 0
@@ -2025,7 +2075,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         elif self.n_share_experts_fusion == 0:
             if (
                 torch.cuda.get_device_capability("cuda") >= (9, 0)
-                and self.config.architectures[0] == "DeepseekV3ForCausalLM"
+                and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
             ):
@@ -2034,18 +2084,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 logger.info(
                     "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled."
                 )
-
-        self.model = DeepseekV2Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            enable_tp=not _enable_moe_dense_fully_dp(),  # TODO: replace it with DP attention
-        )
-        self.logits_processor = LogitsProcessor(config)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -2121,13 +2159,22 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                             if (
                                 _is_cuda
-                                and _ENABLE_JIT_DEEPGEMM
                                 and weight_block_size[0] == 128
                                 and weight_block_size[1] == 128
                                 and model_dtype == torch.bfloat16
                             ):
-                                block_scale = weight_scale
-                                use_deep_gemm_bmm = True
+                                if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                                    "SGL_USE_DEEPGEMM_BMM", "false"
+                                ):
+                                    block_scale = weight_scale
+                                    use_deep_gemm_bmm = True
+                                else:
+                                    w = block_quant_dequant(
+                                        weight,
+                                        weight_scale,
+                                        weight_block_size,
+                                        model_dtype,
+                                    )
                             else:
                                 w, scale = block_quant_to_tensor_quant(
                                     weight, weight_scale, weight_block_size
@@ -2218,11 +2265,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 desc=f"Cloning {self.n_share_experts_fusion} "
                 "replicas of the shared expert into MoE",
             ):
-                for num_repeat in range(self.n_share_experts_fusion):
-                    for suffix in suffix_list:
-                        shared_expert_weight_name = (
-                            f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                        )
+                for suffix in suffix_list:
+                    shared_expert_weight_name = (
+                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                    )
+                    for num_repeat in range(self.n_share_experts_fusion):
                         weights_list.append(
                             (
                                 f"model.layers.{moe_layer}."
@@ -2232,7 +2279,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weights_dict[shared_expert_weight_name],
                             )
                         )
-                        names_to_remove += [shared_expert_weight_name]
+                    names_to_remove += [shared_expert_weight_name]
             weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales

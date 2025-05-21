@@ -284,9 +284,9 @@ class CudaGraphRunner:
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
                 "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "2. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
+                "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable cuda graph by --disable-cuda-graph\n"
+                "4. disable cuda graph by --disable-cuda-graph. (Not recommonded. Huge perf loss)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
@@ -564,6 +564,7 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        print(f"hi replay_prepare {raw_bs=} {bs=} {raw_num_token=}")
 
     def replay(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False

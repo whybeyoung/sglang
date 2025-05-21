@@ -455,7 +455,10 @@ class TokenizerManager:
             input_ids = self.tokenizer.encode(input_text)
 
         image_inputs: Dict = await self.mm_processor.process_mm_data_async(
-            obj.image_data, input_text or input_ids, obj, self.max_req_input_len
+            image_data=obj.image_data,
+            input_text=input_text or input_ids,
+            request_obj=obj,
+            max_req_input_len=self.max_req_input_len,
         )
         if image_inputs and "input_ids" in image_inputs:
             input_ids = image_inputs["input_ids"]
@@ -531,6 +534,7 @@ class TokenizerManager:
                 token_ids_logprob,
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
+                bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
@@ -796,18 +800,22 @@ class TokenizerManager:
         return await self._execute_profile(req)
 
     async def _execute_profile(self, req: ProfileReq):
+        print("hi tokenizer_manager execute_profile", flush=True)
         result = (await self.profile_communicator(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
         return result
 
     async def start_expert_distribution_record(self):
+        print("hi tokenizer_manager start_expert_distribution_record", flush=True)
         await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
 
     async def stop_expert_distribution_record(self):
+        print("hi tokenizer_manager stop_expert_distribution_record", flush=True)
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
+        print("hi tokenizer_manager dump_expert_distribution_record", flush=True)
         raw_outputs: List[ExpertDistributionReqOutput] = (
             await self.expert_distribution_communicator(
                 ExpertDistributionReq.DUMP_RECORD
