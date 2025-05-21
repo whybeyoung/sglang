@@ -2214,7 +2214,8 @@ def run_scheduler_process(
             else:
                 scheduler.event_loop_normal_disagg_decode()
 
-    except Exception:
+    except Exception as e:
+        logger.error(e)
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
