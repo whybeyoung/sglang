@@ -28,6 +28,7 @@ import uuid
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
+from multiprocessing import Manager, Lock, Process
 from typing import (
     Any,
     Awaitable,
@@ -46,6 +47,10 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+import time
+from typing import Callable, Any
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -135,7 +140,7 @@ class ReqState:
 
     out_list: List
     finished: bool
-    event: asyncio.Event
+    event: mp.Event
     obj: Any
 
     # For metrics
@@ -147,6 +152,319 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+
+def convert_logprob_style(
+    meta_info: dict,
+    top_logprobs_num: int,
+    token_ids_logprob: List[int],
+    return_text_in_logprobs: bool,
+    recv_obj: BatchStrOut,
+    recv_obj_index: int,
+    tokenizer,
+):
+    meta_info["input_token_logprobs"] = detokenize_logprob_tokens(
+        recv_obj.input_token_logprobs_val[recv_obj_index],
+        recv_obj.input_token_logprobs_idx[recv_obj_index],
+        return_text_in_logprobs,
+        tokenizer=tokenizer,
+    )
+    meta_info["output_token_logprobs"] = detokenize_logprob_tokens(
+        recv_obj.output_token_logprobs_val[recv_obj_index],
+        recv_obj.output_token_logprobs_idx[recv_obj_index],
+        return_text_in_logprobs,
+        tokenizer=tokenizer,
+    )
+
+    if top_logprobs_num > 0:
+        meta_info["input_top_logprobs"] = detokenize_top_logprobs_tokens(
+            recv_obj.input_top_logprobs_val[recv_obj_index],
+            recv_obj.input_top_logprobs_idx[recv_obj_index],
+            return_text_in_logprobs,
+        )
+        meta_info["output_top_logprobs"] = detokenize_top_logprobs_tokens(
+            recv_obj.output_top_logprobs_val[recv_obj_index],
+            recv_obj.output_top_logprobs_idx[recv_obj_index],
+            return_text_in_logprobs,
+        )
+
+    if token_ids_logprob is not None:
+        meta_info["input_token_ids_logprobs"] = detokenize_top_logprobs_tokens(
+            recv_obj.input_token_ids_logprobs_val[recv_obj_index],
+            recv_obj.input_token_ids_logprobs_idx[recv_obj_index],
+            return_text_in_logprobs,
+        )
+        meta_info["output_token_ids_logprobs"] = (
+            detokenize_top_logprobs_tokens(
+                recv_obj.output_token_ids_logprobs_val[recv_obj_index],
+                recv_obj.output_token_ids_logprobs_idx[recv_obj_index],
+                return_text_in_logprobs,
+            )
+        )
+
+def detokenize_top_logprobs_tokens(
+    token_logprobs_val: List[float],
+    token_logprobs_idx: List[int],
+    decode_to_text: bool,
+):
+    # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
+    # We should batch all top-k tokens in all positions.
+    ret = []
+    for i in range(len(token_logprobs_val)):
+        if token_logprobs_val[i]:
+            ret.append(
+                detokenize_logprob_tokens(
+                    token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                )
+            )
+        else:
+            ret.append(None)
+    return ret
+
+def detokenize_logprob_tokens(
+    token_logprobs_val: List[float],
+    token_logprobs_idx: List[int],
+    decode_to_text: bool,
+    tokenizer,
+):
+    if not decode_to_text:
+        return [
+            (logprob, token_id, None)
+            for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
+        ]
+    else:
+        token_texts = tokenizer.batch_decode(token_logprobs_idx)
+        return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+
+def _worker_loop( task_queue, tokenizer_config, rid_to_state, state_lock):
+    if tokenizer_config:
+        tokenizer = get_tokenizer(
+            tokenizer_config["tokenizer_path"],
+            tokenizer_mode=tokenizer_config["tokenizer_mode"],
+            trust_remote_code=tokenizer_config["trust_remote_code"],
+            revision=tokenizer_config["revision"],
+        )
+    else:
+        tokenizer = None
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            print(f"[{mp.current_process().name}] Received None task, exiting")
+            break
+        try:
+            recv_obj, index, rid, stream_output, speculative_algorithm = task
+            _handle_rid_output(index, recv_obj, rid, rid_to_state, stream_output, speculative_algorithm, tokenizer, state_lock)
+        except Exception as e:
+            print(f"[{mp.current_process().name}] Error processing task: {e}")
+
+def _handle_rid_output(i, recv_obj: Union[
+        BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
+    ],rid,rid_to_state: Dict[str, ReqState],
+    stream_output: bool,
+    speculative_algorithm: bool,
+    tokenizer,
+    state_lock: Lock,):
+
+    with state_lock:
+        state = rid_to_state.get(rid, None)
+        if state is None:
+            return
+
+    # Build meta_info and return value
+    meta_info = {
+        "id": rid,
+        "finish_reason": recv_obj.finished_reasons[i],
+        "prompt_tokens": recv_obj.prompt_tokens[i],
+    }
+
+    if getattr(state.obj, "return_logprob", False):
+        convert_logprob_style(
+            meta_info,
+            state.obj.top_logprobs_num,
+            state.obj.token_ids_logprob,
+            state.obj.return_text_in_logprobs,
+            recv_obj,
+            i,
+            tokenizer,
+        )
+
+    if not isinstance(recv_obj, BatchEmbeddingOut):
+        meta_info.update(
+            {
+                "completion_tokens": recv_obj.completion_tokens[i],
+                "cached_tokens": recv_obj.cached_tokens[i],
+            }
+        )
+
+    if getattr(recv_obj, "output_hidden_states", None):
+        meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
+    if isinstance(recv_obj, BatchStrOut):
+        out_dict = {
+            "text": recv_obj.output_strs[i],
+            "meta_info": meta_info,
+        }
+    elif isinstance(recv_obj, BatchTokenIDOut):
+        if stream_output and state.obj.stream:
+            output_token_ids = recv_obj.output_ids[i][
+                state.last_output_offset :
+            ]
+            state.last_output_offset = len(recv_obj.output_ids[i])
+        else:
+            output_token_ids = recv_obj.output_ids[i]
+
+        out_dict = {
+            "output_ids": output_token_ids,
+            "meta_info": meta_info,
+        }
+    elif isinstance(recv_obj, BatchMultimodalOut):
+        raise NotImplementedError()
+    else:
+        assert isinstance(recv_obj, BatchEmbeddingOut)
+        out_dict = {
+            "embedding": recv_obj.embeddings[i],
+            "meta_info": meta_info,
+        }
+
+    # 只在更新状态时加锁
+    with state_lock:
+        # Create a new state with updated values
+        new_state = ReqState(
+            out_list=state.out_list + [out_dict],
+            finished=recv_obj.finished_reasons[i] is not None,
+            event=state.event,
+            obj=state.obj,
+            created_time=state.created_time,
+            finished_time=time.time() if recv_obj.finished_reasons[i] is not None else state.finished_time,
+            first_token_time=state.first_token_time,
+            last_time=state.last_time,
+            last_completion_tokens=state.last_completion_tokens,
+            last_output_offset=state.last_output_offset
+        )
+        # Update the shared dictionary
+        rid_to_state[rid] = new_state
+        state.event.set()
+
+def _handle_batch_output2(
+    recv_obj: Union[
+        BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
+    ],
+    rid_to_state: Dict[str, ReqState],
+    stream_output: bool,
+    speculative_algorithm: bool,
+    tokenizer,
+    state_lock: Lock,
+):
+    logger.info(f"Tokenizer Received batch output: {recv_obj.rids}")
+    for i, rid in enumerate(recv_obj.rids):
+        # 只在获取状态时加锁
+        with state_lock:
+            state = rid_to_state.get(rid, None)
+            if state is None:
+                continue
+
+        # Build meta_info and return value
+        meta_info = {
+            "id": rid,
+            "finish_reason": recv_obj.finished_reasons[i],
+            "prompt_tokens": recv_obj.prompt_tokens[i],
+        }
+
+        if getattr(state.obj, "return_logprob", False):
+            convert_logprob_style(
+                meta_info,
+                state.obj.top_logprobs_num,
+                state.obj.token_ids_logprob,
+                state.obj.return_text_in_logprobs,
+                recv_obj,
+                i,
+                tokenizer,
+            )
+
+        if not isinstance(recv_obj, BatchEmbeddingOut):
+            meta_info.update(
+                {
+                    "completion_tokens": recv_obj.completion_tokens[i],
+                    "cached_tokens": recv_obj.cached_tokens[i],
+                }
+            )
+
+        if getattr(recv_obj, "output_hidden_states", None):
+            meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
+        if isinstance(recv_obj, BatchStrOut):
+            out_dict = {
+                "text": recv_obj.output_strs[i],
+                "meta_info": meta_info,
+            }
+        elif isinstance(recv_obj, BatchTokenIDOut):
+            if stream_output and state.obj.stream:
+                output_token_ids = recv_obj.output_ids[i][
+                    state.last_output_offset :
+                ]
+                state.last_output_offset = len(recv_obj.output_ids[i])
+            else:
+                output_token_ids = recv_obj.output_ids[i]
+
+            out_dict = {
+                "output_ids": output_token_ids,
+                "meta_info": meta_info,
+            }
+        elif isinstance(recv_obj, BatchMultimodalOut):
+            raise NotImplementedError()
+        else:
+            assert isinstance(recv_obj, BatchEmbeddingOut)
+            out_dict = {
+                "embedding": recv_obj.embeddings[i],
+                "meta_info": meta_info,
+            }
+
+        # 只在更新状态时加锁
+        with state_lock:
+            # Create a new state with updated values
+            new_state = ReqState(
+                out_list=state.out_list + [out_dict],
+                finished=recv_obj.finished_reasons[i] is not None,
+                event=state.event,
+                obj=state.obj,
+                created_time=state.created_time,
+                finished_time=time.time() if recv_obj.finished_reasons[i] is not None else state.finished_time,
+                first_token_time=state.first_token_time,
+                last_time=state.last_time,
+                last_completion_tokens=state.last_completion_tokens,
+                last_output_offset=state.last_output_offset
+            )
+
+            # Update the shared dictionary
+            rid_to_state[rid] = new_state
+            state.event.set()
+
+
+class MultiProcessTaskExecutor:
+    def __init__(self, task_queues: List[mp.Queue], num_workers: int = 4, max_queue_size: int = 4096, tokenizer_config: dict = None, rid_to_state=None, state_lock=None):
+        self.task_queues = task_queues
+        self.num_workers = num_workers
+        self.processes = []
+        self.tokenizer_config = tokenizer_config
+        self.rid_to_state = rid_to_state
+        self.state_lock = state_lock
+        self.start()
+
+    def start(self):
+        for i in range(self.num_workers):
+            p = Process(target=_worker_loop, name=f"Worker-{i}", args=(self.task_queues[i], self.tokenizer_config, self.rid_to_state, self.state_lock))
+            p.daemon = True
+            p.start()
+            self.processes.append(p)
+        print(f"[Main] Started {self.num_workers} worker processes.")
+
+
+    def stop(self):
+        for _ in range(self.num_workers):
+            self.task_queue.put(None)
+        for p in self.processes:
+            p.join()
+        print("[Main] All workers stopped.")
 
 
 class TokenizerManager:
@@ -165,10 +483,37 @@ class TokenizerManager:
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
 
+        # Initialize process pool and shared data
+        self.num_workers = min(os.cpu_count() or 4, 8)
+        self.manager = Manager()
+        self.rid_to_state = self.manager.dict()
+        self.state_lock = Lock()  # Add state lock for synchronizing access to rid_to_state
+        # Create tokenizer config dict with only necessary parameters
+        tokenizer_config = {
+            "tokenizer_path": server_args.tokenizer_path,
+            "tokenizer_mode": server_args.tokenizer_mode,
+            "trust_remote_code": server_args.trust_remote_code,
+            "revision": server_args.revision,
+        } if not server_args.skip_tokenizer_init else None
+
+        self.task_queues = [mp.Queue() for _ in range(self.num_workers)]
+        self.process_pool = MultiProcessTaskExecutor(
+            self.task_queues,
+            num_workers=self.num_workers,
+            tokenizer_config=tokenizer_config,
+            rid_to_state=self.rid_to_state,
+            state_lock=self.state_lock,
+        )
+
+        # Create shared data structures
+        self.shared_metrics = self.manager.dict()
+        self.shared_dump_list = self.manager.list()
+        self.shared_dump_lock = Lock()
+
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name, True
+            context, zmq.PULL, port_args.tokenizer_ipc_name, True  # Changed to PULL with connect
         )
         self.send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
@@ -237,7 +582,6 @@ class TokenizerManager:
 
         # Store states
         self.no_create_loop = False
-        self.rid_to_state: Dict[str, ReqState] = {}
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
         self.dump_requests_folder = ""  # By default do not dump
@@ -315,7 +659,7 @@ class TokenizerManager:
                         BatchTokenIDOut,
                         BatchMultimodalOut,
                     ),
-                    self._handle_batch_output,
+                    self.add_task,
                 ),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
@@ -389,6 +733,11 @@ class TokenizerManager:
             self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
             )
+
+    def __del__(self):
+        """Cleanup process pool on deletion"""
+        if hasattr(self, 'process_pool'):
+            self.process_pool.shutdown(wait=True)
 
     async def generate_request(
         self,
@@ -603,8 +952,11 @@ class TokenizerManager:
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
-        self.rid_to_state[obj.rid] = state
+        # Create a shared event using the manager
+        shared_event = self.manager.Event()
+        state = ReqState([], False, shared_event, obj, created_time=created_time)
+        with self.state_lock:
+            self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
     def _send_block_request(self, type: BlockReqType):
@@ -616,24 +968,36 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         """Wait for the response of one request."""
-        state = self.rid_to_state[obj.rid]
+        with self.state_lock:
+            state = self.rid_to_state[obj.rid]
 
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
-            except asyncio.TimeoutError:
-                if request is not None and await request.is_disconnected():
-                    self.abort_request(obj.rid)
-                    raise ValueError(
-                        "Request is disconnected from the client side. "
-                        f"Abort request {obj.rid}"
-                    )
+                # Use a loop with small sleep instead of wait_for
+                while not state.event.is_set():
+                    if request is not None and await request.is_disconnected():
+                        self.abort_request(obj.rid)
+                        raise ValueError(
+                            "Request is disconnected from the client side. "
+                            f"Abort request {obj.rid}"
+                        )
+                    await asyncio.sleep(0.1)  # Small sleep to prevent busy waiting
+            except Exception as e:
+                logger.error(f"Error waiting for response: {e}")
                 continue
 
-            out = state.out_list[-1]
+            # 只在需要访问和修改共享状态时加锁
+            with self.state_lock:
+                state = self.rid_to_state[obj.rid]
+                out = state.out_list[-1]
+                state.out_list = []
+                state.event.clear()  # Clear the event for next iteration
+                is_finished = state.finished
+                if is_finished:
+                    del self.rid_to_state[obj.rid]
 
-            state.out_list = []
-            if state.finished:
+            # 处理日志记录和错误检查（不需要锁）
+            if is_finished:
                 if self.log_requests:
                     max_length, skip_names, out_skip_names = self.log_request_metadata
                     if self.model_config.is_multimodal_gen:
@@ -641,7 +1005,6 @@ class TokenizerManager:
                     else:
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
-                del self.rid_to_state[obj.rid]
 
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
@@ -654,8 +1017,6 @@ class TokenizerManager:
 
                 yield out
                 break
-
-            state.event.clear()
 
             if obj.stream:
                 yield out
@@ -772,7 +1133,8 @@ class TokenizerManager:
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
-        del self.rid_to_state[rid]
+        with self.state_lock:
+            del self.rid_to_state[rid]
         req = AbortReq(rid)
         self.send_to_scheduler.send_pyobj(req)
 
@@ -1141,8 +1503,11 @@ class TokenizerManager:
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            #if isinstance(recv_obj, BatchStrOut):
+            #    logger.info(f"Tokenizer Received BatchStrOut: {recv_obj.rids}")
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+
 
     def _handle_batch_output(
         self,
@@ -1150,11 +1515,12 @@ class TokenizerManager:
             BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
         ],
     ):
+        logger.info(f"Tokenizer Received batch output: {recv_obj.rids}")
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
+                logger.info(f"None state wringgg")
                 continue
-
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -1225,6 +1591,21 @@ class TokenizerManager:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
+
+    def add_task(
+        self,
+        recv_obj: Union[
+            BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
+        ],
+    ):
+
+        for i, rid in enumerate(recv_obj.rids):
+            rid_hash = hash(rid)
+            target_queue = self.task_queues[rid_hash % self.num_workers]
+            task = (recv_obj, i, rid, self.server_args.stream_output, self.server_args.speculative_algorithm)
+            target_queue.put(task)
+
+
 
     def convert_logprob_style(
         self,
