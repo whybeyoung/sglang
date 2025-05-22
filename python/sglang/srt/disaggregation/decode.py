@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import numpy as np
 import torch
 from torch.distributed import ProcessGroup
+import time
 
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -355,6 +356,7 @@ class DecodeTransferQueue:
                 decode_req.req.transferred_output_id = output_id
                 transferred_reqs.append(decode_req)
                 indices_to_remove.add(i)
+                logger.info(f"KV Transfer Success.. {decode_req.req.rid}")
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -462,6 +464,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.output_ids.append(req.transferred_output_id)
                 self.output_ids.append(req.transferred_output_id)
             self.tree_cache.cache_unfinished_req(req)
+            logger.info(f"process_prebuilt_extend.: {req.rid}")
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
 
@@ -482,6 +485,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             recv_reqs = self.recv_requests()
+            logger.info(f"Received {len(recv_reqs)} {'|'.join(r.rid for r in recv_reqs)}" )
             self.process_input_requests(recv_reqs)
             self.model_runner_event_loop_step()
             # polling and allocating kv cache
@@ -624,6 +628,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
+        start_time = time.time()
         if len(self.waiting_queue) == 0:
             return None
 
@@ -642,6 +647,7 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
+                logger.info(f"req added to can run list: {req.rid}")
                 req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)

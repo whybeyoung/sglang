@@ -506,6 +506,12 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen and req.to_abort:
                 continue
 
+            # Add timing for first and second token
+            if len(req.output_ids) == 1:
+                logger.info(f"First token generation time for req {req.rid}")
+            elif len(req.output_ids) == 2:
+                logger.info(f"Second token generation time for req {req.rid}")
+
             if (
                 req.finished()
                 # If stream, follow the given stream_interval
