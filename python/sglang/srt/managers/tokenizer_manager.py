@@ -182,6 +182,13 @@ class TokenizerManager:
             context, zmq.PULL, port_args.tokenizer_worker_output_ipc_name, True
         )
 
+        # todo remove
+        self.tokenizer = get_tokenizer(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
         # Launch tokenizer worker process
         tokenizer_worker_proc = mp.Process(
             target=run_tokenizer_worker_process,
