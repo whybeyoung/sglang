@@ -1375,7 +1375,10 @@ class PortArgs:
     scheduler_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
-
+    # The ipc filename for tokenizer worker to receive inputs from tokenizer (zmq)
+    tokenizer_worker_ipc_name: str
+    # The ipc filename for tokenizer worker to send outputs to tokenizer (zmq)
+    tokenizer_worker_output_ipc_name: str
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
@@ -1401,6 +1404,8 @@ class PortArgs:
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                tokenizer_worker_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                tokenizer_worker_output_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -1431,6 +1436,8 @@ class PortArgs:
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
+                tokenizer_worker_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
+                tokenizer_worker_output_ipc_name=f"tcp://{dist_init_host}:{port_base + 4}",
             )
 
 
