@@ -398,7 +398,7 @@ class TokenizerManager:
         created_time = time.time()
 
         self.auto_create_handle_loop()
-
+        logger.info(f"Create handle loop for generate request: {obj.rid}")
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
@@ -617,10 +617,16 @@ class TokenizerManager:
     ):
         """Wait for the response of one request."""
         state = self.rid_to_state[obj.rid]
-
+        logged = False
+        logged_received = False
         while True:
             try:
+                if not logged:
+                    logger.info(f"Waiting for event for request: {obj.rid}")
+                    logged = True
                 await asyncio.wait_for(state.event.wait(), timeout=4)
+                if not logged_received:
+                    logger.info(f"Event received for request: {obj.rid}")
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
                     self.abort_request(obj.rid)
@@ -629,7 +635,6 @@ class TokenizerManager:
                         f"Abort request {obj.rid}"
                     )
                 continue
-
             out = state.out_list[-1]
 
             state.out_list = []
@@ -1141,8 +1146,11 @@ class TokenizerManager:
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            if isinstance(recv_obj, BatchStrOut):
+                logger.info(f"Tokenizer Received BatchStrOut: {recv_obj.rids}")
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+
 
     def _handle_batch_output(
         self,
@@ -1150,11 +1158,12 @@ class TokenizerManager:
             BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
         ],
     ):
+        logger.info(f"Tokenizer Received batch output: {recv_obj.rids}")
+        start_time = time.time()
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 continue
-
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -1225,6 +1234,7 @@ class TokenizerManager:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
+        logger.info(f"Tokenizer Handle batch output end: {recv_obj.rids}, cost ms {time.time()-start_time}")
 
     def convert_logprob_style(
         self,
