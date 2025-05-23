@@ -1146,11 +1146,14 @@ class TokenizerManager:
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
+            if isinstance(recv_obj, BatchStrOut) or isinstance(recv_obj, BatchTokenIDOut):
+                await self._handle_batch_output(recv_obj)
+            else:
+                self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
 
 
-    def _handle_batch_output(
+    async def _handle_batch_output(
         self,
         recv_obj: Union[
             BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
