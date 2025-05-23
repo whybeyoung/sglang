@@ -190,6 +190,13 @@ class TokenizerManager:
             context, zmq.PULL, port_args.tokenizer_worker_output_ipc_name, True
         )
 
+        # todo remove
+        self.tokenizer = get_tokenizer(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
         # Launch tokenizer worker process
         tokenizer_worker_proc = mp.Process(
             target=run_tokenizer_worker_process,
@@ -677,7 +684,7 @@ class TokenizerManager:
                 #tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
                 await self.send_to_tokenizer_worker.send_pyobj(obj)
                 tokenized_objs = await self.recv_from_tokenizer_worker.recv_pyobj()
-                
+
                 if enable_colocated_batch_gen():
                     self._send_block_request(BlockReqType.BLOCK)
                 for i, tokenized_obj in enumerate(tokenized_objs):
