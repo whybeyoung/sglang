@@ -103,10 +103,13 @@ class DetokenizerManager:
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
+
             recv_obj = self.recv_from_scheduler.recv_pyobj()
+            if isinstance(recv_obj, BatchTokenIDOut):
+                logger.info(f"Detokenizer start detokenize: {recv_obj.rids}")
+
             output = self._request_dispatcher(recv_obj)
-            if isinstance(output, BatchStrOut):
-                logger.info(f"Detokenizer Send BatchStrOut: {output.rids}")
+
             self.send_to_tokenizer.send_pyobj(output)
             if isinstance(output, BatchStrOut):
                 logger.info(f"Detokenizer has Sent BatchStrOut: {output.rids}")
