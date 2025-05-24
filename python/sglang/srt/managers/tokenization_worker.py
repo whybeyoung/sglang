@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Union
 import os
 import zmq
 import zmq.asyncio
-
+import zerorpc
 from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     EmbeddingReqInput,
@@ -92,6 +92,10 @@ class TokenizationWorker:
         self.recv_from_tokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_worker_ipc_name, False
         )
+
+        self.rpc_server = zerorpc.Server(self.tokenizer)
+        self.rpc_server.bind(port_args.tokenizer_worker_server_name)
+
         # GenerateReqInput, EmbeddingReqInput
         self._request_dispatcher = TypeBasedDispatcher(
             [

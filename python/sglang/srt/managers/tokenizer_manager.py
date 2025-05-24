@@ -112,6 +112,8 @@ from sglang.srt.managers.multimodal_processor import (
     get_mm_processor,
     import_processors,
 )
+import zerorpc
+
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -183,12 +185,15 @@ class TokenizerManager:
         )
 
         # todo remove
-        self.tokenizer = get_tokenizer(
-            server_args.tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-        )
+        # self.tokenizer = get_tokenizer(
+        #     server_args.tokenizer_path,
+        #     tokenizer_mode=server_args.tokenizer_mode,
+        #     trust_remote_code=server_args.trust_remote_code,
+        #     revision=server_args.revision,
+        # )
+        self.tokenizer = zerorpc.Client()
+        self.tokenizer.connect(port_args.tokenizer_worker_server_name)
+
         # Launch tokenizer worker process
         tokenizer_worker_proc = mp.Process(
             target=run_tokenizer_worker_process,
