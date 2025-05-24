@@ -27,9 +27,10 @@ logger = logging.getLogger(__name__)
 class TokenizationWorker:
     """A worker class that handles tokenization tasks asynchronously."""
 
-    def __init__(self, server_args: ServerArgs, port_args: PortArgs):
+    def __init__(self, server_args: ServerArgs, port_args: PortArgs, index: int):
         self.server_args = server_args
         self.max_req_input_len = None
+        self.index = index
         # TODO re-apply ModelConfig PR
         self.model_config = ModelConfig(
             server_args.model_path,
@@ -106,7 +107,8 @@ class TokenizationWorker:
 
     def start_rpc_server(self,port_args):
         self.rpc_server = zerorpc.Server(self.tokenizer)
-        self.rpc_server.bind(port_args.tokenizer_worker_server_name)
+        rpc_addr= port_args.modify_addr_by_index(port_args.tokenizer_worker_server_name, self.index)
+        self.rpc_server.bind(rpc_addr)
         self.rpc_server.run()
 
     async def event_loop(self):

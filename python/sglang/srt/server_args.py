@@ -1381,6 +1381,7 @@ class PortArgs:
     tokenizer_worker_output_ipc_name: str
 
     tokenizer_worker_server_name: str
+
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
@@ -1388,7 +1389,17 @@ class PortArgs:
     rpc_ipc_name: str
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def modify_addr_by_index(addr, index: int):
+        if addr.startswith("tcp://"):
+            proto, host ,port = addr.split(":")
+            port = int(port) + index
+            addr = ":".join([proto, host, str(port)])
+            return addr
+        else:
+            return f"{addr}_{index}"
+        
+    @staticmethod
+    def init_new(server_args, dp_rank: Optional[int] = None, tokenizer_worker_index: Optional[int] = 0) -> "PortArgs":
         port = server_args.port + random.randint(100, 1000)
         while True:
             if is_port_available(port):
@@ -1439,9 +1450,9 @@ class PortArgs:
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
-                tokenizer_worker_ipc_name=f"tcp://{dist_init_host}:{port_base + 100}",
-                tokenizer_worker_output_ipc_name=f"tcp://{dist_init_host}:{port_base + 103}",
-                tokenizer_worker_server_name=f"tcp://{dist_init_host}:{port_base + 104}",
+                tokenizer_worker_ipc_name=f"tcp://{dist_init_host}:{port_base + 101}",
+                tokenizer_worker_output_ipc_name=f"tcp://{dist_init_host}:{port_base + 201}",
+                tokenizer_worker_server_name=f"tcp://{dist_init_host}:{port_base + 301 + tokenizer_worker_index}",
 
             )
 

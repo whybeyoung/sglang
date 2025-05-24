@@ -191,18 +191,22 @@ class TokenizerManager:
         #     trust_remote_code=server_args.trust_remote_code,
         #     revision=server_args.revision,
         # )
-        self.tokenizer = zerorpc.Client()
-        self.tokenizer.connect(port_args.tokenizer_worker_server_name)
-
         # Launch tokenizer worker process
-        tokenizer_worker_proc = mp.Process(
-            target=run_tokenizer_worker_process,
-            args=(
-                server_args,
-                port_args,
-            ),
-        )
-        tokenizer_worker_proc.start()
+        self.tokenizer_process = []
+        for i in range(4):  # Create 4 tokenizer worker processes
+            tokenizer_worker_proc = mp.Process(
+                target=run_tokenizer_worker_process,
+                args=(
+                    server_args,
+                    port_args,
+                    i,  # Pass the index
+                ),
+            )
+            tokenizer_worker_proc.start()
+            self.tokenizer_process.append(tokenizer_worker_proc)
+
+        # Replace single client with load balanced client
+        self.tokenizer = LoadBalancedTokenizerClient(port_args, num_workers=4)
 
         # Read model args
         self.model_path = server_args.model_path
@@ -224,8 +228,6 @@ class TokenizerManager:
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
-
-
 
         # Store states
         self.no_create_loop = False
@@ -1387,22 +1389,53 @@ class _Communicator(Generic[T]):
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
 
+
+class LoadBalancedTokenizerClient:
+    """A client class that connects to multiple tokenizer workers with load balancing."""
+    
+    def __init__(self, port_args: PortArgs, num_workers: int = 4):
+        self.clients = []
+        self.current_index = 0
+        self.num_workers = num_workers
+        
+        # Initialize connections to all workers
+        for i in range(num_workers):
+            client = zerorpc.Client()
+            rpc_addr = port_args.modify_addr_by_index(port_args.tokenizer_worker_server_name, i)
+            client.connect(rpc_addr)
+            self.clients.append(client)
+    
+    def _get_next_client(self):
+        """Get the next client using round-robin load balancing."""
+        client = self.clients[self.current_index]
+        self.current_index = (self.current_index + 1) % self.num_workers
+        return client
+    
+    def __getattr__(self, name):
+        """Forward all method calls to the next available client."""
+        def method(*args, **kwargs):
+            client = self._get_next_client()
+            return getattr(client, name)(*args, **kwargs)
+        return method
+
 def run_tokenizer_worker_process(
     server_args: ServerArgs,
     port_args: PortArgs,
+    index: int,  # Add index parameter
 ):
     kill_itself_when_parent_died()
-    setproctitle.setproctitle("sglang::tokenizer_worker")
+    setproctitle.setproctitle(f"sglang::tokenizer_worker_{index}")  # Add index to process title
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 
     try:
-        worker = TokenizationWorker(server_args, port_args)
+        worker = TokenizationWorker(server_args, port_args, index)
+        print(f"TokenizationWorker {index} created")  # Pass index to TokenizationWorker
         # Create and run event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(worker.event_loop())
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"TokenizerWorker hit an exception: {traceback}")
+        logger.error(f"TokenizerWorker {index} hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
