@@ -1415,7 +1415,7 @@ async def v1_chat_completions(
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
                     cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                     if request.logprobs:
-                        logprobs = to_openai_style_logprobs(
+                        logprobs = await asyncio.to_thread(to_openai_style_logprobs,
                             output_token_logprobs=content["meta_info"][
                                 "output_token_logprobs"
                             ][n_prev_token:],
