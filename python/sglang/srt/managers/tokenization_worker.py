@@ -93,8 +93,8 @@ class TokenizationWorker:
             context, zmq.PULL, port_args.tokenizer_worker_ipc_name, False
         )
 
-        self.rpc_server = zerorpc.Server(self.tokenizer)
-        self.rpc_server.bind(port_args.tokenizer_worker_server_name)
+        server_thread = threading.Thread(target=self.start_rpc_server,args=(port_args,), daemon=True)
+        server_thread.start()
 
         # GenerateReqInput, EmbeddingReqInput
         self._request_dispatcher = TypeBasedDispatcher(
@@ -103,6 +103,11 @@ class TokenizationWorker:
                 (EmbeddingReqInput, self.handle_req_input),
             ]
         )
+
+    def start_rpc_server(self,port_args):
+        self.rpc_server = zerorpc.Server(self.tokenizer)
+        self.rpc_server.bind(port_args.tokenizer_worker_server_name)
+        self.rpc_server.run()
 
     async def event_loop(self):
         """The event loop that handles requests"""
