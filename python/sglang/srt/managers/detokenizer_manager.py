@@ -206,7 +206,7 @@ class DetokenizerManager:
                     recv_obj.no_stop_trim[i],
                 )
             )
-
+        logger.info(f"Detokenize_strs: {recv_obj.rids}")
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,

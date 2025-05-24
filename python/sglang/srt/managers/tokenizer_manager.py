@@ -405,6 +405,7 @@ class TokenizerManager:
                 await self.send_to_tokenizer_worker.send_pyobj(obj)
                 #tokenized_obj = await self._tokenize_one_request(obj)
                 tokenized_obj = await self.recv_from_tokenizer_worker.recv_pyobj()
+                logger.info(f"tokenized_obj: {tokenized_obj.rid}")
                 self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, request):
                     yield response
@@ -618,7 +619,7 @@ class TokenizerManager:
                         f"Abort request {obj.rid}"
                     )
                 continue
-
+            logger.info(f"rid: {obj.rid} received for response")
             out = state.out_list[-1]
 
             state.out_list = []
@@ -1081,6 +1082,7 @@ class TokenizerManager:
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            logger.info(f"TokenizeManager Received Strs: {recv_obj.rids}")
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
 
