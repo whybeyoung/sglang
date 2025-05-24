@@ -108,7 +108,7 @@ class TokenizationWorker:
             if isinstance(recv_obj, GenerateReqInput) or isinstance(recv_obj, EmbeddingReqInput):
                 # Create task for async tokenization
                 recv_obj.normalize_batch_and_arguments()
-                
+
                 if recv_obj.batch_size > 1:
                     task = asyncio.create_task(self._batch_tokenize_and_process(recv_obj.batch_size, recv_obj))
                 elif recv_obj.batch_size == 1:
@@ -230,6 +230,7 @@ class TokenizationWorker:
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_room=obj.bootstrap_room,
+                bootstrap_port=obj.bootstrap_port,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,
