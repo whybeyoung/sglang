@@ -1436,8 +1436,8 @@ class PortArgs:
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
-                tokenizer_worker_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
-                tokenizer_worker_output_ipc_name=f"tcp://{dist_init_host}:{port_base + 4}",
+                tokenizer_worker_ipc_name=f"tcp://{dist_init_host}:{port_base + 100}",
+                tokenizer_worker_output_ipc_name=f"tcp://{dist_init_host}:{port_base + 103}",
             )
 
 
