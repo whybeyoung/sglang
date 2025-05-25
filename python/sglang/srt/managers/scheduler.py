@@ -1399,13 +1399,6 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
 
-        # NOTE HACK
-        if self.forward_ct == 5:
-            text = f"[All threads of {os.getpid()=}, {self.tp_rank=}]"
-            for thread in threading.enumerate():
-                text += f" [{thread.name=} {thread.ident=} {thread.native_id=}]"
-            print(text, flush=True)
-
         # Check profiler
         if (
             self.profiler_target_forward_ct
