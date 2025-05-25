@@ -1606,13 +1606,27 @@ class TokenizerManagerProxy:
                             if not future.done():
                                 future.set_result(response)
 
-                            # 如果请求已完成，从映射中移除
-                            if response.get("meta_info", {}).get("finish_reason"):
-                                del self.request_futures[request_id]
+                            # # 如果请求已完成，从映射中移除
+                            # if response.get("meta_info", {}).get("finish_reason"):
+                            #     del self.request_futures[request_id]
 
             except Exception as e:
                 logger.error(f"Error in handle_loop: {e}")
                 continue
+    def create_abort_task(self, obj: GenerateReqInput):
+        # Abort the request if the client is disconnected.
+        async def abort_request():
+            await asyncio.sleep(1)
+            if obj.is_single:
+                self.manager_attr_proxy.abort_request(obj.rid)
+            else:
+                for rid in obj.rid:
+                    self.self.manager_attr_proxy.abort_request(rid)
+
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(abort_request)
+        return background_tasks
+
 
     async def generate_request(self, obj: Union[GenerateReqInput,EmbeddingReqInput]):
         """发送生成请求并等待响应"""
@@ -1738,7 +1752,6 @@ class TokenizerManagerProxy:
         """Dynamically handle property access through ZMQ DEALER."""
         if name == "shape":
             return
-
         return self.manager_attr_proxy.get(name)
 
     def close(self):
