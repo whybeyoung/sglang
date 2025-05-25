@@ -42,6 +42,7 @@ from typing import (
 
 import fastapi
 import uvloop
+import zerorpc
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
@@ -53,8 +54,17 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
+from sglang.srt.utils import (
+    configure_logger,
+    get_zmq_socket,
+    kill_itself_when_parent_died,
+)
+
+import psutil
+import setproctitle
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.managers import expert_distribution
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -116,6 +126,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+import msgpack
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -150,6 +161,7 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        self.loop = None
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
@@ -158,12 +170,15 @@ class TokenizerManager:
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name, True
+        self.recv_router = get_zmq_socket(
+            context, zmq.ROUTER, port_args.tokenizer_ipc_name, True
         )
         self.send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
+
+        server_thread = threading.Thread(target=self.start_rpc_server,args=(port_args,), daemon=True)
+        server_thread.start()
 
         # Read model args
         self.model_path = server_args.model_path
@@ -221,7 +236,10 @@ class TokenizerManager:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-
+        if server_args.chat_template:
+            load_chat_template_for_openai_api(
+                self, server_args.chat_template, server_args.model_path
+            )
         # Store states
         self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -368,6 +386,14 @@ class TokenizerManager:
             self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
             )
+
+    def start_rpc_server(self,port_args):
+        self.rpc_server = zerorpc.Server(self)
+        self.rpc_server.bind(port_args.tokenizer_manager_rpc_name)
+        self.rpc_server.run()
+
+    def get(self, name):
+        return getattr(self, name)
 
     async def generate_request(
         self,
@@ -1021,7 +1047,7 @@ class TokenizerManager:
 
     def auto_create_handle_loop(self):
         if self.no_create_loop:
-            return
+            return self.loop
 
         self.no_create_loop = True
         loop = asyncio.get_event_loop()
@@ -1043,6 +1069,9 @@ class TokenizerManager:
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+        self.loop = loop
+        return loop
+
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -1064,11 +1093,115 @@ class TokenizerManager:
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+        # 定义消息处理器映射
+        handlers = {
+            b'detokenizer': self._result_dispatcher,
+            b'http_server_request': self._handle_http_server_message,
+            b'http_server_rpc': self.handle_get_attr,
+        }
 
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
-            self.last_receive_tstamp = time.time()
+            try:
+                # 接收并解包消息
+                identity, x, msg_bytes = await self.recv_router.recv_multipart()
+
+                # 使用msgpack反序列化消息
+                msg_dict = msgpack.unpackb(msg_bytes)
+
+                # 创建消息处理任务
+                async def process_message(identity, msg_dict):
+                    try:
+                        if identity == b'detokenizer':
+                            _type = msg_dict.pop("__type__")
+                            # 根据消息类型创建实例
+                            if _type == BatchStrOut.__name__:
+                                msg = BatchStrOut(**msg_dict)
+                            elif _type == BatchEmbeddingOut.__name__:
+                                msg = BatchEmbeddingOut(**msg_dict)
+                            elif _type == BatchTokenIDOut.__name__:
+                                msg = BatchTokenIDOut(**msg_dict)
+                            else:
+                                msg = BatchMultimodalOut(**msg_dict)
+
+                            # 处理消息
+                            handlers.get(identity)(msg)
+                            return
+                        elif identity == b"http_server_request":
+                            _type = msg_dict.pop("__type__")
+                            msg = None
+                            if _type== GenerateReqInput.__name__:
+                                msg = GenerateReqInput(**msg_dict)
+                            elif _type == EmbeddingReqInput.__name__:
+                                msg = EmbeddingReqInput(**msg_dict)
+                            # 处理消息并发送响应
+                            async for response in handlers.get(identity)(msg):
+                                await self.recv_router.send_multipart([
+                                    identity,  # 使用原始发送方的 identity
+                                    b'',      # 空帧
+                                    b'http_server_request',  # 路由标识
+                                    msgpack.dumps(response)  # 响应数据
+                                ])
+                        else:
+                            # 处理消息并发送响应
+                            handler = handlers.get(identity)
+                            response = await handler(msg_dict)
+                            await self.recv_router.send_multipart([
+                                identity,  # 使用原始发送方的 identity
+                                b'',      # 空帧
+                                b'http_server_rpc',  # 路由标识
+                                msgpack.dumps(response)  # 响应数据
+                            ])
+
+                        self.last_receive_tstamp = time.time()
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
+                        # 发送错误响应
+                        error_response = {"error": str(e)}
+                        await self.recv_router.send_multipart([
+                            identity,  # 使用原始发送方的 identity
+                            b'',      # 空帧
+                            b'http_server_rpc',  # 路由标识
+                            msgpack.dumps(error_response)  # 错误数据
+                        ])
+
+                # 创建异步任务处理消息
+                asyncio.create_task(process_message(identity, msg_dict))
+
+            except Exception as e:
+                logger.error(f"Error receiving message: {e}")
+                continue
+
+    async def _handle_http_server_message(self, recv_obj):
+        """Handle messages from http server."""
+        # 直接使用字典解包创建GenerateReqInput实例
+        # 调用generate_request处理请求
+        async for response in self.generate_request(recv_obj):
+            yield response
+
+    async def handle_get_attr(self, recv_obj):
+        """Handle getattr requests from TokenizerManagerProxy."""
+        try:
+            # 获取属性值
+            value = getattr(self, recv_obj["property"])
+
+            # 发送响应，保持原始identity
+            await self.recv_router.send_multipart([
+                recv_obj.get("identity", b''),  # 使用原始identity
+                b'',  # 空帧
+                b'http_server_rpc',  # 路由标识
+                msgpack.dumps(value)  # 响应数据
+            ])
+
+        except Exception as e:
+            # 发送错误响应
+            error_response = {"error": str(e)}
+            await self.recv_router.send_multipart([
+                recv_obj.get("identity", b''),  # 使用原始identity
+                b'',  # 空帧
+                b'http_server_rpc',  # 路由标识
+                msgpack.dumps(error_response)  # 错误数据
+            ])
+
 
     def _handle_batch_output(
         self,
@@ -1374,3 +1507,243 @@ class _Communicator(Generic[T]):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
+
+
+def run_tokenizer_manager_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    tokenizer_reader
+):
+    kill_itself_when_parent_died()
+    setproctitle.setproctitle("sglang::tokenizer_manager")
+    configure_logger(server_args)
+    parent_process = psutil.Process().parent()
+
+    try:
+        manager = TokenizerManager(server_args, port_args)
+        data = tokenizer_reader.recv()
+
+        manager.max_req_input_len= data["max_req_input_len"]
+
+        # Create and run event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(manager.handle_loop())
+        manager.no_create_loop = True
+
+
+
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)
+
+
+class TokenizerManagerProxy:
+    """TokenizerManagerProxy is a proxy that proxy call the TokenizerManager."""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+    ):
+        self.server_args = server_args
+
+        self.served_model_name = server_args.served_model_name
+        # TODO re-apply ModelConfig PR
+        self.model_config = ModelConfig(
+            server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
+        )
+
+        # Init inter-process communication
+        self.manager_attr_proxy = zerorpc.Client()
+        self.manager_attr_proxy.connect(port_args.tokenizer_manager_rpc_name)
+
+        context = zmq.asyncio.Context(2)
+        self.generate_request_proxy = get_zmq_socket(
+            context, zmq.DEALER, port_args.tokenizer_ipc_name, False, identity=b'http_server_request'
+        )
+
+        # 存储请求-响应的映射
+        self.request_futures = {}
+        self.loop = None
+        self.handle_loop_task = None
+
+    def start_handle_loop(self):
+        """启动响应处理循环"""
+        if self.handle_loop_task is None:
+            self.loop = asyncio.get_event_loop()
+            self.handle_loop_task = self.loop.create_task(self.handle_loop())
+
+    async def handle_loop(self):
+        """处理来自 TokenizerManager 的响应"""
+        while True:
+            try:
+                # 使用异步方式接收响应
+                response = await self.generate_request_proxy.recv_multipart()
+                _, _, response_bytes = response
+
+                # 解析响应数据
+                response_data = msgpack.unpackb(response_bytes)
+                if type(response_data) is dict:
+                    response_data = [response_data]
+
+                # 获取请求ID
+                if type(response_data) is list:
+                    for response in response_data:
+                        request_id = response.get("meta_info", {}).get("id")
+                        if request_id and request_id in self.request_futures:
+                            # 设置响应结果
+                            future = self.request_futures[request_id]
+                            if not future.done():
+                                future.set_result(response)
+
+                            # 如果请求已完成，从映射中移除
+                            if response.get("meta_info", {}).get("finish_reason"):
+                                del self.request_futures[request_id]
+
+            except Exception as e:
+                logger.error(f"Error in handle_loop: {e}")
+                continue
+
+    async def generate_request(self, obj: Union[GenerateReqInput,EmbeddingReqInput]):
+        """发送生成请求并等待响应"""
+        # 确保 handle_loop 已启动
+        if self.handle_loop_task is None:
+            self.start_handle_loop()
+
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
+        obj.normalize_batch_and_arguments()
+
+        # 创建 Future 对象
+        futures = []
+        if obj.is_single:
+            future = asyncio.Future()
+            self.request_futures[obj.rid] = future
+            futures.append(future)
+        else:
+            for request_id in obj.rid:
+                future = asyncio.Future()
+                self.request_futures[request_id] = future
+                futures.append(future)
+
+        # 发送请求
+        self.generate_request_proxy.send_multipart([
+            b'http_server_request',
+            msgpack.dumps(obj.as_dict())
+        ])
+
+        # 处理响应
+        if obj.is_single:
+            if obj.stream:
+                # 流式响应
+                try:
+                    while True:
+                        response = await futures[0]
+                        yield response
+                        if response.get("meta_info", {}).get("finish_reason"):
+                            # 请求完成，清理资源
+                            del self.request_futures[obj.rid]
+                            break
+                        # 创建新的 Future 用于下一个响应
+                        futures[0] = asyncio.Future()
+                        self.request_futures[obj.rid] = futures[0]
+                except asyncio.CancelledError:
+                    # 请求被取消，清理资源
+                    if obj.rid in self.request_futures:
+                        del self.request_futures[obj.rid]
+                    raise
+                except Exception as e:
+                    # 发生错误，清理资源
+                    if obj.rid in self.request_futures:
+                        del self.request_futures[obj.rid]
+                    raise ValueError(f"Error in stream response: {e}")
+            else:
+                # 非流式响应
+                try:
+                    response = await futures[0]
+                    yield response
+                finally:
+                    # 清理资源
+                    if obj.rid in self.request_futures:
+                        del self.request_futures[obj.rid]
+        else:
+            if obj.stream:
+                # 批量流式响应
+                rid_to_index = {rid: i for i, rid in enumerate(obj.rid)}
+                task_map = {asyncio.create_task(future): future for future in futures}
+
+                try:
+                    while task_map:
+                        done, _ = await asyncio.wait(
+                            task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                        )
+
+                        for task in done:
+                            future = task_map.pop(task)
+                            try:
+                                response = task.result()
+                                response["index"] = rid_to_index[response["meta_info"]["id"]]
+                                yield response
+
+                                if not response.get("meta_info", {}).get("finish_reason"):
+                                    # 创建新的 Future 用于下一个响应
+                                    new_future = asyncio.Future()
+                                    request_id = response["meta_info"]["id"]
+                                    self.request_futures[request_id] = new_future
+                                    new_task = asyncio.create_task(new_future)
+                                    task_map[new_task] = new_future
+                            except Exception as e:
+                                logger.error(f"Error in stream response: {e}")
+                                # 发生错误，清理资源
+                                if request_id in self.request_futures:
+                                    del self.request_futures[request_id]
+                except asyncio.CancelledError:
+                    # 请求被取消，清理所有资源
+                    for request_id in obj.rid:
+                        if request_id in self.request_futures:
+                            del self.request_futures[request_id]
+                    raise
+                except Exception as e:
+                    # 发生错误，清理所有资源
+                    for request_id in obj.rid:
+                        if request_id in self.request_futures:
+                            del self.request_futures[request_id]
+                    raise ValueError(f"Error in batch stream response: {e}")
+            else:
+                # 批量非流式响应
+                try:
+                    responses = await asyncio.gather(*futures)
+                    yield responses
+                finally:
+                    # 清理资源
+                    for request_id in obj.rid:
+                        if request_id in self.request_futures:
+                            del self.request_futures[request_id]
+
+    def __getattr__(self, name):
+        """Dynamically handle property access through ZMQ DEALER."""
+        if name == "shape":
+            return
+
+        return self.manager_attr_proxy.get(name)
+
+    def close(self):
+        """Close the ZMQ socket."""
+        if self.handle_loop_task:
+            self.handle_loop_task.cancel()
+        self.manager_attr_proxy.close()
+        self.generate_request_proxy.close()

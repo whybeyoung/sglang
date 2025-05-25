@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+import dataclasses
 
 # handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -35,8 +36,15 @@ from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
+class AsDictMixin:
+    def as_dict(self) -> dict:
+        result = dataclasses.asdict(self)
+        result["__type__"] = self.__class__.__name__
+        return result
+
+
 @dataclass
-class SessionParams:
+class SessionParams(AsDictMixin):
     id: Optional[str] = None
     rid: Optional[str] = None
     offset: Optional[int] = None
@@ -44,7 +52,7 @@ class SessionParams:
 
 
 @dataclass
-class GenerateReqInput:
+class GenerateReqInput(AsDictMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -414,7 +422,7 @@ class GenerateReqInput:
 
 
 @dataclass
-class TokenizedGenerateReqInput:
+class TokenizedGenerateReqInput(AsDictMixin):
     # The request id
     rid: str
     # The input text
@@ -459,7 +467,7 @@ class TokenizedGenerateReqInput:
 
 
 @dataclass
-class EmbeddingReqInput:
+class EmbeddingReqInput(AsDictMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -551,7 +559,7 @@ class EmbeddingReqInput:
 
 
 @dataclass
-class TokenizedEmbeddingReqInput:
+class TokenizedEmbeddingReqInput(AsDictMixin):
     # The request id
     rid: str
     # The input text
@@ -565,7 +573,7 @@ class TokenizedEmbeddingReqInput:
 
 
 @dataclass
-class BatchTokenIDOut:
+class BatchTokenIDOut(AsDictMixin):
     # The request id
     rids: List[str]
     # The finish reason
@@ -606,7 +614,7 @@ class BatchTokenIDOut:
 
 
 @dataclass
-class BatchMultimodalDecodeReq:
+class BatchMultimodalDecodeReq(AsDictMixin):
     # The request id
     rids: List[str]
     finished_reasons: List[BaseFinishReason]
@@ -618,7 +626,7 @@ class BatchMultimodalDecodeReq:
 
 
 @dataclass
-class BatchStrOut:
+class BatchStrOut(AsDictMixin):
     # The request id
     rids: List[str]
     # The finish reason
@@ -653,7 +661,7 @@ class BatchStrOut:
 
 
 @dataclass
-class BatchMultimodalOut:
+class BatchMultimodalOut(AsDictMixin):
     # The request id
     rids: List[str]
     # The finish reason
@@ -668,7 +676,7 @@ class BatchMultimodalOut:
 
 
 @dataclass
-class BatchEmbeddingOut:
+class BatchEmbeddingOut(AsDictMixin):
     # The request id
     rids: List[str]
     # The finish reason
@@ -681,17 +689,17 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class FlushCacheReqInput:
+class FlushCacheReqInput(AsDictMixin):
     pass
 
 
 @dataclass
-class FlushCacheReqOutput:
+class FlushCacheReqOutput(AsDictMixin):
     success: bool
 
 
 @dataclass
-class UpdateWeightFromDiskReqInput:
+class UpdateWeightFromDiskReqInput(AsDictMixin):
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -701,7 +709,7 @@ class UpdateWeightFromDiskReqInput:
 
 
 @dataclass
-class UpdateWeightFromDiskReqOutput:
+class UpdateWeightFromDiskReqOutput(AsDictMixin):
     success: bool
     message: str
     # Number of paused requests during weight sync.
@@ -709,20 +717,20 @@ class UpdateWeightFromDiskReqOutput:
 
 
 @dataclass
-class UpdateWeightsFromDistributedReqInput:
+class UpdateWeightsFromDistributedReqInput(AsDictMixin):
     name: str
     dtype: str
     shape: List[int]
 
 
 @dataclass
-class UpdateWeightsFromDistributedReqOutput:
+class UpdateWeightsFromDistributedReqOutput(AsDictMixin):
     success: bool
     message: str
 
 
 @dataclass
-class UpdateWeightsFromTensorReqInput:
+class UpdateWeightsFromTensorReqInput(AsDictMixin):
     """Update model weights from tensor input.
 
     - Tensors are serialized for transmission
@@ -737,13 +745,13 @@ class UpdateWeightsFromTensorReqInput:
 
 
 @dataclass
-class UpdateWeightsFromTensorReqOutput:
+class UpdateWeightsFromTensorReqOutput(AsDictMixin):
     success: bool
     message: str
 
 
 @dataclass
-class InitWeightsUpdateGroupReqInput:
+class InitWeightsUpdateGroupReqInput(AsDictMixin):
     # The master address
     master_address: str
     # The master port
@@ -759,81 +767,81 @@ class InitWeightsUpdateGroupReqInput:
 
 
 @dataclass
-class InitWeightsUpdateGroupReqOutput:
+class InitWeightsUpdateGroupReqOutput(AsDictMixin):
     success: bool
     message: str
 
 
 @dataclass
-class GetWeightsByNameReqInput:
+class GetWeightsByNameReqInput(AsDictMixin):
     name: str
     truncate_size: int = 100
 
 
 @dataclass
-class GetWeightsByNameReqOutput:
+class GetWeightsByNameReqOutput(AsDictMixin):
     parameter: list
 
 
 @dataclass
-class ReleaseMemoryOccupationReqInput:
+class ReleaseMemoryOccupationReqInput(AsDictMixin):
     pass
 
 
 @dataclass
-class ReleaseMemoryOccupationReqOutput:
+class ReleaseMemoryOccupationReqOutput(AsDictMixin):
     pass
 
 
 @dataclass
-class ResumeMemoryOccupationReqInput:
+class ResumeMemoryOccupationReqInput(AsDictMixin):
     pass
 
 
 @dataclass
-class ResumeMemoryOccupationReqOutput:
+class ResumeMemoryOccupationReqOutput(AsDictMixin):
     pass
 
 
 @dataclass
-class SlowDownReqInput:
+class SlowDownReqInput(AsDictMixin):
     forward_sleep_time: Optional[float]
 
 
 @dataclass
-class SlowDownReqOutput:
+class SlowDownReqOutput(AsDictMixin):
     pass
 
 
 @dataclass
-class AbortReq:
+class AbortReq(AsDictMixin):
     # The request id
     rid: str
 
 
 @dataclass
-class GetInternalStateReq:
+class GetInternalStateReq(AsDictMixin):
     pass
 
 
 @dataclass
-class GetInternalStateReqOutput:
+class GetInternalStateReqOutput(AsDictMixin):
     internal_state: Dict[Any, Any]
 
 
 @dataclass
-class SetInternalStateReq:
+class SetInternalStateReq(AsDictMixin):
     server_args: Dict[str, Any]
 
 
 @dataclass
-class SetInternalStateReqOutput:
+class SetInternalStateReqOutput(AsDictMixin):
     updated: bool
     server_args: Dict[str, Any]
 
 
 @dataclass
-class ProfileReqInput:
+class ProfileReqInput(AsDictMixin):
     # The output directory
     output_dir: Optional[str] = None
     # If set, it profile as many as this number of steps.
@@ -857,12 +865,12 @@ class ExpertDistributionReq(Enum):
 
 
 @dataclass
-class ExpertDistributionReqOutput:
+class ExpertDistributionReqOutput(AsDictMixin):
     pass
 
 
 @dataclass
-class ProfileReq:
+class ProfileReq(AsDictMixin):
     type: ProfileReqType
     output_dir: Optional[str] = None
     num_steps: Optional[int] = None
@@ -873,13 +881,13 @@ class ProfileReq:
 
 
 @dataclass
-class ProfileReqOutput:
+class ProfileReqOutput(AsDictMixin):
     success: bool
     message: str
 
 
 @dataclass
-class ConfigureLoggingReq:
+class ConfigureLoggingReq(AsDictMixin):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     dump_requests_folder: Optional[str] = None
@@ -887,42 +895,42 @@ class ConfigureLoggingReq:
 
 
 @dataclass
-class OpenSessionReqInput:
+class OpenSessionReqInput(AsDictMixin):
     capacity_of_str_len: int
     session_id: Optional[str] = None
 
 
 @dataclass
-class CloseSessionReqInput:
+class CloseSessionReqInput(AsDictMixin):
     session_id: str
 
 
 @dataclass
-class OpenSessionReqOutput:
+class OpenSessionReqOutput(AsDictMixin):
     session_id: Optional[str]
     success: bool
 
 
 @dataclass
-class HealthCheckOutput:
+class HealthCheckOutput(AsDictMixin):
     pass
 
 
 @dataclass
-class Function:
+class Function(AsDictMixin):
     description: Optional[str] = None
     name: Optional[str] = None
     parameters: Optional[object] = None
 
 
 @dataclass
-class Tool:
+class Tool(AsDictMixin):
     function: Function
     type: Optional[str] = "function"
 
 
 @dataclass
-class ParseFunctionCallReq:
+class ParseFunctionCallReq(AsDictMixin):
     text: str  # The text to parse.
     tools: List[Tool] = field(
         default_factory=list
@@ -933,25 +941,25 @@ class ParseFunctionCallReq:
 
 
 @dataclass
-class SeparateReasoningReqInput:
+class SeparateReasoningReqInput(AsDictMixin):
     text: str  # The text to parse.
     reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
 
 
 @dataclass
-class VertexGenerateReqInput:
+class VertexGenerateReqInput(AsDictMixin):
     instances: List[dict]
     parameters: Optional[dict] = None
 
 
 @dataclass
-class RpcReqInput:
+class RpcReqInput(AsDictMixin):
     method: str
     parameters: Optional[Dict] = None
 
 
 @dataclass
-class RpcReqOutput:
+class RpcReqOutput(AsDictMixin):
     success: bool
     message: str
 
@@ -962,5 +970,5 @@ class BlockReqType(Enum):
 
 
 @dataclass
-class BlockReqInput:
+class BlockReqInput(AsDictMixin):
     type: BlockReqType

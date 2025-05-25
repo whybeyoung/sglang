@@ -26,6 +26,7 @@ import os
 import threading
 import time
 import random
+import msgpack
 import traceback
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional
@@ -46,7 +47,7 @@ import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-
+import zmq
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -69,7 +70,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManagerProxy
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.openai_api.adapter import (
     v1_batches,
@@ -109,7 +110,7 @@ os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: TokenizerManager
+    tokenizer_manager: TokenizerManagerProxy
     scheduler_info: Dict
 
 
@@ -211,9 +212,9 @@ async def health_generate(request: Request) -> Response:
 async def get_model_info():
     """Get the model information."""
     result = {
-        "model_path": _global_state.tokenizer_manager.model_path,
-        "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
-        "is_generation": _global_state.tokenizer_manager.is_generation,
+        "model_path":   _global_state.tokenizer_manager.model_path,
+        "tokenizer_path":  _global_state.tokenizer_manager.server_args.tokenizer_path,
+        "is_generation":  _global_state.tokenizer_manager.is_generation,
     }
     return result
 
@@ -240,11 +241,10 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
-
         async def stream_results() -> AsyncIterator[bytes]:
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
+                    obj
                 ):
                     yield b"data: " + orjson.dumps(
                         out, option=orjson.OPT_NON_STR_KEYS
@@ -256,7 +256,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
             yield b"data: [DONE]\n\n"
-
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
@@ -264,10 +263,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
-                obj, request
-            ).__anext__()
-            return ret
+            response = await _global_state.tokenizer_manager.generate_request(obj).__anext__()
+            return response
         except ValueError as e:
             logger.error(f"Error: {e}")
             return _create_error_response(e)
@@ -300,10 +297,11 @@ async def generate_from_file_request(file: UploadFile, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
-        return ret
+        _global_state.tokenizer_manager.generate_request_proxy.send_multipart([b'', msgpack.dumps(obj.as_dict())])
+        identity, raw_msg =  _global_state.tokenizer_manager.generate_request_proxy.recv_multipart()
+        response = msgpack.loads(raw_msg)
+
+        return response
     except ValueError as e:
         return _create_error_response(e)
 

@@ -45,6 +45,9 @@ from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.tokenizer_manager import run_tokenizer_manager_process
+from sglang.srt.managers.tokenizer_manager import TokenizerManagerProxy
+
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -498,7 +501,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, Dict]:
+) -> Tuple[TokenizerManagerProxy, Dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
@@ -594,13 +597,21 @@ def _launch_subprocesses(
     detoken_proc.start()
 
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(
-        server_args, port_args
+    tokenizer_reader, tokenizer_writer = mp.Pipe(duplex=False)
+
+    tokenizer_proc = mp.Process(
+        target=run_tokenizer_manager_process,
+        args=(
+            server_args,
+            port_args,
+            tokenizer_reader
+        ),
     )
-    if server_args.chat_template:
-        load_chat_template_for_openai_api(
-            tokenizer_manager, server_args.chat_template, server_args.model_path
-        )
+    tokenizer_proc.start()
+    tokenizer_manager = TokenizerManagerProxy(server_args, port_args)
+    #tokenizer_manager = zerorpc.Client()
+    #tokenizer_manager.connect(port_args.tokenizer_manager_proxy_name)
+
 
     if server_args.completion_template:
         load_completion_template_for_openai_api(server_args.completion_template)
@@ -626,5 +637,6 @@ def _launch_subprocesses(
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_writer.send(scheduler_info)
+
     return tokenizer_manager, scheduler_info

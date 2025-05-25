@@ -957,7 +957,7 @@ def pytorch_profile(name, func, *args, data_size=-1):
 
 
 def get_zmq_socket(
-        context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+        context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool, identity:bytes=None
 ):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024 ** 3
@@ -984,6 +984,11 @@ def get_zmq_socket(
     elif socket_type == zmq.PULL:
         set_recv_opt()
     elif socket_type == zmq.DEALER:
+        if identity:
+            socket.setsockopt(zmq.IDENTITY, identity)
+        set_send_opt()
+        set_recv_opt()
+    elif socket_type == zmq.ROUTER:
         set_send_opt()
         set_recv_opt()
     else:

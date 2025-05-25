@@ -24,8 +24,9 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -58,8 +59,8 @@ class RequestFuncInput:
     output_len: int
     model: str
     lora_name: str
+    image_data: str
     extra_request_body: Dict[str, Any]
-    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,23 +70,19 @@ class RequestFuncOutput:
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
-    prompt: str = ""
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
-    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
-        output.prompt = request_func_input.prompt
-        output.metadata = {**(request_func_input.metadata or {})}
         return output
 
 
 def remove_prefix(text: str, prefix: str) -> str:
-    return text[len(prefix):] if text.startswith(prefix) else text
+    return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 def remove_suffix(text: str, suffix: str) -> str:
@@ -355,6 +352,11 @@ async def async_request_sglang_generate(
             "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
+
+        # Add image data if available
+        if request_func_input.image_data:
+            payload["image_data"] = request_func_input.image_data
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -389,7 +391,6 @@ async def async_request_sglang_generate(
                             if data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
-                                rid = data["meta_info"]["id"]
                                 output_len = data["meta_info"]["completion_tokens"]
 
                                 # First token
@@ -403,8 +404,8 @@ async def async_request_sglang_generate(
                                     if num_new_tokens == 0:
                                         continue
                                     adjust_itl = (
-                                                     timestamp - most_recent_timestamp
-                                                 ) / num_new_tokens
+                                        timestamp - most_recent_timestamp
+                                    ) / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
@@ -414,7 +415,6 @@ async def async_request_sglang_generate(
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
-                    output.metadata["rid"] = rid
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -493,11 +493,10 @@ def get_tokenizer(
 
 
 def get_dataset(args, tokenizer):
-    num_prompts = args.num_prompts + args.skip_num_prompts
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
-            num_requests=num_prompts,
+            num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
@@ -508,7 +507,7 @@ def get_dataset(args, tokenizer):
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
-            num_prompts=num_prompts,
+            num_prompts=args.num_prompts,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
@@ -524,19 +523,15 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             args=args,
         )
-    elif args.dataset_name == "chatbot-arena-conversations":
-        input_requests = sample_chatbot_arena_conversations_requests(
-            num_requests=num_prompts,
-            output_len=args.hf_dataset_output_len,
-        )
-    elif args.dataset_name == "wildchat-1m":
-        input_requests = sample_wildchat_1m_requests(
-            num_requests=num_prompts,
-            output_len=args.hf_dataset_output_len,
+    elif args.dataset_name == "mmmu":
+        input_requests = sample_mmmu_requests(
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.random_output_len,
+            random_sample=True,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
-    input_requests = input_requests[args.skip_num_prompts:]
     return input_requests
 
 
@@ -594,7 +589,7 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
         filename = os.path.join("/tmp", url.split("/")[-1])
 
     # Check if the cache file already exists
-    if os.path.exists(filename):
+    if is_file_valid_json(filename):
         return filename
 
     print(f"Downloading from {url} to {filename}")
@@ -622,12 +617,27 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
+def is_file_valid_json(path):
+    if not os.path.isfile(path):
+        return False
+
+    # TODO can fuse into the real file open later
+    try:
+        with open(path) as f:
+            json.load(f)
+        return True
+    except JSONDecodeError as e:
+        print(
+            f"{path} exists but json loading fails ({e=}), thus treat as invalid file"
+        )
+        return False
+
+
 @dataclass
 class DatasetRow:
     prompt: str
     prompt_len: int
     output_len: int
-    metadata: Optional[Dict[str, Any]] = None
 
 
 def sample_mmmu_requests(
@@ -759,10 +769,10 @@ def sample_sharegpt_requests(
     apply_chat_template=False,
 ) -> List[DatasetRow]:
     if fixed_output_len is not None and fixed_output_len < 4:
-        print("Warn: output_len too small")
+        raise ValueError("output_len too small")
 
     # Download sharegpt if necessary
-    if not os.path.isfile(dataset_path) and dataset_path == "":
+    if not is_file_valid_json(dataset_path) and dataset_path == "":
         dataset_path = download_and_cache_file(SHAREGPT_URL)
 
     # Load the dataset.
@@ -818,7 +828,7 @@ def sample_sharegpt_requests(
             len(completion_token_ids) if fixed_output_len is None else fixed_output_len
         )
 
-        if prompt_len < 2 or ((fixed_output_len is None) and (output_len < 2)):
+        if prompt_len < 2 or output_len < 2:
             # Prune too short sequences.
             continue
 
@@ -830,8 +840,8 @@ def sample_sharegpt_requests(
             DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len)
         )
 
-    print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
-    print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
     return filtered_dataset
 
 
@@ -860,7 +870,7 @@ def sample_random_requests(
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
-        if not os.path.isfile(dataset_path):
+        if not is_file_valid_json(dataset_path):
             dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.
@@ -904,14 +914,12 @@ def sample_random_requests(
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            # TODO improve
+            input_content = input_ids
             if return_text:
-                prompt = tokenizer.decode(input_ids)
-            else:
-                prompt = input_ids
+                input_content = tokenizer.decode(input_content)
             input_requests.append(
                 DatasetRow(
-                    prompt=prompt,
+                    prompt=input_content,
                     prompt_len=int(input_lens[i]),
                     output_len=int(output_lens[i]),
                 )
@@ -921,18 +929,15 @@ def sample_random_requests(
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
         input_requests = []
         for i in range(num_prompts):
-            input_ids = [
+            input_content = [
                 (offsets[i] + i + j) % tokenizer.vocab_size
                 for j in range(input_lens[i])
             ]
-            # TODO improve
             if return_text:
-                prompt = tokenizer.decode(input_ids)
-            else:
-                prompt = input_ids
+                input_content = tokenizer.decode(input_content)
             input_requests.append(
                 DatasetRow(
-                    prompt=prompt,
+                    prompt=input_content,
                     prompt_len=int(input_lens[i]),
                     output_len=int(output_lens[i]),
                 )
@@ -1043,82 +1048,6 @@ def sample_generated_shared_prefix_requests(
     return input_requests
 
 
-def sample_chatbot_arena_conversations_requests(
-    num_requests: int,
-    output_len: int,
-):
-    import polars as pl
-
-    return sample_hf_dataset_requests(
-        dataset_name="lmsys/chatbot_arena_conversations",
-        column_id="question_id",
-        column_conversation="conversation_a",
-        expr_timestamp=(pl.col("tstamp") * 1_000_000).cast(pl.Datetime("us")),
-        num_requests=num_requests,
-        output_len=output_len,
-    )
-
-
-def sample_wildchat_1m_requests(
-    num_requests: int,
-    output_len: int,
-):
-    import polars as pl
-
-    return sample_hf_dataset_requests(
-        dataset_name="allenai/WildChat-1M",
-        column_id="conversation_hash",
-        column_conversation="conversation",
-        expr_timestamp=pl.col("timestamp"),
-        num_requests=num_requests,
-        output_len=output_len,
-    )
-
-
-def sample_hf_dataset_requests(
-    dataset_name: str,
-    column_id: str,
-    column_conversation: str,
-    expr_timestamp,
-    num_requests: int,
-    output_len: int,
-):
-    import polars as pl
-    from datasets import load_dataset
-
-    df = load_dataset(dataset_name, split="train").to_polars()
-
-    df = df[:num_requests]
-
-    df = df.select(
-        id=pl.col(column_id),
-        timestamp=expr_timestamp,
-        conversation=pl.col(column_conversation),
-    )
-
-    df = df.with_columns(
-        prompts=pl.col("conversation")
-        .list.eval(pl.element().filter(pl.element().struct.field("role") == "user"))
-        .list.eval(pl.element().struct.field("content")),
-    )
-
-    print(f"sample_hf_dataset_requests {dataset_name=} {df=}")
-
-    return [
-        DatasetRow(
-            prompt=row["prompts"],
-            prompt_len=None,
-            output_len=output_len,
-            metadata=dict(
-                dataset_index=index,
-                dataset_id=row["id"],
-                dataset_timestamp=row["timestamp"].isoformat(),
-            ),
-        )
-        for index, row in enumerate(df.iter_rows(named=True))
-    ]
-
-
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
@@ -1138,7 +1067,7 @@ async def get_request(
 
 
 def calculate_metrics(
-    input_lens: Optional[List[int]],
+    input_requests: List[DatasetRow],
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
@@ -1160,7 +1089,7 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_lens[i] if input_lens is not None else 0
+            total_input += input_requests[i].prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -1190,9 +1119,9 @@ def calculate_metrics(
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         total_throughput=(total_input + sum(output_lens)) / dur_s,
         total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
-                                     / dur_s,
+        / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
-                     * 1000,  # ttfts is empty if streaming is not supported by backend
+        * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
@@ -1216,81 +1145,6 @@ def calculate_metrics(
     return metrics, output_lens
 
 
-def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable:
-    print("Enable multi-round request function")
-
-    def compute_inner_input_prompt(
-        history_user_texts: List[str],
-        history_assistant_texts: List[str],
-        gen_prompt: str,
-    ):
-        assert len(history_user_texts) == len(history_assistant_texts)
-        history_conversations = []
-        for i in range(len(history_assistant_texts)):
-            history_conversations += [
-                {"role": "user", "content": history_user_texts[i]},
-                {"role": "assistant", "content": history_assistant_texts[i]},
-            ]
-
-        full_conversations = [
-            *history_conversations,
-            {"role": "user", "content": gen_prompt},
-        ]
-
-        history_text = (
-            tokenizer.apply_chat_template(
-                history_conversations,
-                add_generation_prompt=False,
-                tokenize=False,
-            ).replace(tokenizer.bos_token, "")
-            if len(history_conversations) > 0
-            else ""
-        )
-        full_text = tokenizer.apply_chat_template(
-            full_conversations,
-            add_generation_prompt=True,
-            tokenize=False,
-        ).replace(tokenizer.bos_token, "")
-        return history_text, full_text
-
-    async def f(
-        request_func_input: RequestFuncInput,
-        pbar: Optional[tqdm] = None,
-    ) -> List[RequestFuncOutput]:
-        prompts: List[str] = request_func_input.prompt
-        outputs = []
-        for round_index in range(len(prompts)):
-            history_text, full_prompt = compute_inner_input_prompt(
-                history_user_texts=prompts[:round_index],
-                history_assistant_texts=[o.generated_text for o in outputs],
-                gen_prompt=prompts[round_index],
-            )
-            inner_input = RequestFuncInput(
-                prompt=full_prompt,
-                model=request_func_input.model,
-                api_url=request_func_input.api_url,
-                prompt_len=request_func_input.prompt_len,
-                output_len=request_func_input.output_len,
-                lora_name=request_func_input.lora_name,
-                extra_request_body=request_func_input.extra_request_body,
-                metadata={**(request_func_input.metadata or {})},
-            )
-            print(
-                f"[{datetime.now().isoformat()}] hi wrap_multi_round_request_func call request start dataset_index={request_func_input.metadata.get('dataset_index')} {round_index=}"
-            )
-            output = await request_func(
-                inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
-            )
-            output.metadata["multi_round_index"] = round_index
-            output.metadata["multi_round_len"] = len(prompts)
-            output.metadata["history_text"] = history_text
-            outputs.append(output)
-            # print(f"hi wrap_multi_round_request_func item {inner_input=} {output=}")
-        return outputs
-
-    return f
-
-
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1304,20 +1158,14 @@ async def benchmark(
     lora_names: List[str],
     extra_request_body: Dict[str, Any],
     profile: bool,
-    enable_expert_distribution_record: bool = False,
-    pd_seperated: bool = False,
+    pd_separated: bool = False,
     flush_cache: bool = False,
-    tokenizer_id: Optional[str] = None,
+    warmup_requests: int = 1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
-
-    is_multi_round = isinstance(input_requests[0].prompt, list)
-    if is_multi_round:
-        assert args.disable_ignore_eos, "multi-round requires disable-ignore-eos"
-        request_func = wrap_multi_round_request_func(request_func, tokenizer=tokenizer)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -1329,10 +1177,8 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
-    if not hasattr(args, "warmup_requests"):
-        args.warmup_requests = 1
     # Warmup
-    print(f"Starting warmup with {args.warmup_requests} sequences...")
+    print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
     test_request = input_requests[0]
@@ -1346,6 +1192,15 @@ async def benchmark(
     else:
         lora_name = None
 
+    if "<image>" in test_prompt:
+        import re
+
+        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt)
+        image_data = image_match.group(1) if image_match else None
+        test_prompt = image_match.group(2) if image_match else test_prompt
+    else:
+        image_data = None
+
     # Create the test input once
     test_input = RequestFuncInput(
         model=model_id,
@@ -1354,24 +1209,21 @@ async def benchmark(
         prompt_len=test_prompt_len,
         output_len=min(test_output_len, 32),
         lora_name=lora_name,
+        image_data=image_data,
         extra_request_body=extra_request_body,
     )
 
     # Run warmup requests
     warmup_tasks = []
-    for _ in range(args.warmup_requests):
+    for _ in range(warmup_requests):
         warmup_tasks.append(
             asyncio.create_task(request_func(request_func_input=test_input))
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
-    if is_multi_round:
-        warmup_outputs = [x for output in warmup_outputs for x in output]
 
     # Check if at least one warmup request succeeded
-    if args.warmup_requests > 0 and not any(
-        output.success for output in warmup_outputs
-    ):
+    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {warmup_outputs[0].error}"
@@ -1387,12 +1239,6 @@ async def benchmark(
 
     time.sleep(1.0)
 
-    if enable_expert_distribution_record:
-        print("Starting expert distribution record...")
-        output = await async_request_profile(
-            api_url=base_url + "/start_expert_distribution_record"
-        )
-        assert output.success
     # Start profiler
     if profile:
         print("Starting profiler...")
@@ -1419,6 +1265,15 @@ async def benchmark(
         else:
             lora_name = None
 
+        if "<image>" in prompt:
+            import re
+
+            image_match = re.search(r"<image>(.*?)</image>(.*)", prompt)
+            image_data = image_match.group(1) if image_match else None
+            prompt = image_match.group(2) if image_match else prompt
+        else:
+            image_data = None
+
         request_func_input = RequestFuncInput(
             model=model_id,
             prompt=prompt,
@@ -1426,8 +1281,8 @@ async def benchmark(
             prompt_len=prompt_len,
             output_len=output_len,
             lora_name=lora_name,
+            image_data=image_data,
             extra_request_body=extra_request_body,
-            metadata=request.metadata,
         )
         tasks.append(
             asyncio.create_task(
@@ -1435,8 +1290,6 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-    if is_multi_round:
-        outputs = [x for output in outputs for x in output]
 
     # Stop profiler
     if profile:
@@ -1444,35 +1297,17 @@ async def benchmark(
         profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
         if profile_output.success:
             print("Profiler stopped")
-    if enable_expert_distribution_record:
-        print("Stopping expert distribution record...")
-        output = await async_request_profile(
-            api_url=base_url + "/dump_expert_distribution_record"
-        )
-        assert output.success
-        output = await async_request_profile(
-            api_url=base_url + "/stop_expert_distribution_record"
-        )
-        assert output.success
 
     if pbar is not None:
         pbar.close()
 
-    if "sglang" in backend:
-        server_info = requests.get(base_url + "/get_server_info")
-        if pd_seperated:
-            accept_length = server_info.json()["decode"][0].get(
-                "avg_spec_accept_length", None
-            )
-        else:
-            accept_length = server_info.json().get("avg_spec_accept_length", None)
-    else:
-        accept_length = None
+
+    accept_length = None
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_lens=None if is_multi_round else [x.prompt_len for x in input_requests],
+        input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -1484,7 +1319,7 @@ async def benchmark(
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
     print(
         "{:<40} {:<10}".format(
-            "Max reqeuest concurrency:",
+            "Max request concurrency:",
             max_concurrency if max_concurrency else "not set",
         )
     )
@@ -1556,7 +1391,6 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
-            "tokenizer_id": tokenizer_id,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -1605,14 +1439,11 @@ async def benchmark(
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
-        "prompts": [output.prompt for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
-        "output_metadata": [output.metadata for output in outputs],
     }
 
     # Append results to a JSONL file
-    Path(output_file_name).parent.mkdir(parents=True, exist_ok=True)
     with open(output_file_name, "a") as file:
         if args.output_details:
             result_for_dump = result | result_details
@@ -1649,6 +1480,9 @@ def run_benchmark(args_: argparse.Namespace):
     # Set default value for warmup_requests if not present
     if not hasattr(args, "warmup_requests"):
         args.warmup_requests = 1
+
+    if not hasattr(args, "output_details"):
+        args.output_details = False
 
     print(f"benchmark_args={args}")
 
@@ -1769,10 +1603,8 @@ def run_benchmark(args_: argparse.Namespace):
             lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
-            enable_expert_distribution_record=args.enable_expert_distribution_record,
-            pd_seperated=args.pd_seperated,
+            pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
-            tokenizer_id=tokenizer_id,
         )
     )
 
@@ -1822,14 +1654,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=[
-            "sharegpt",
-            "random",
-            "random-ids",
-            "generated-shared-prefix",
-            "chatbot-arena-conversations",
-            "wildchat-1m",
-        ],
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1850,12 +1675,6 @@ if __name__ == "__main__":
         type=int,
         default=1000,
         help="Number of prompts to process. Default is 1000.",
-    )
-    parser.add_argument(
-        "--skip-num-prompts",
-        type=int,
-        default=0,
-        help="Number of prompts to skip. Default is 0.",
     )
     parser.add_argument(
         "--sharegpt-output-len",
@@ -1886,33 +1705,27 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="Range of sampled ratio of input/output length, "
-             "used only for random dataset.",
-    )
-    parser.add_argument(
-        "--hf-dataset-output-len",
-        default=1024,
-        type=int,
-        help="Number of output tokens per request, used only for hf dataset.",
+        "used only for random dataset.",
     )
     parser.add_argument(
         "--request-rate",
         type=float,
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
-             "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+        "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
     parser.add_argument(
         "--max-concurrency",
         type=int,
         default=None,
         help="Maximum number of concurrent requests. This can be used "
-             "to help simulate an environment where a higher level component "
-             "is enforcing a maximum number of concurrent requests. While the "
-             "--request-rate argument controls the rate at which requests are "
-             "initiated, this argument will control how many are actually allowed "
-             "to execute at a time. This means that when used in combination, the "
-             "actual request rate may be lower than specified with --request-rate, "
-             "if the server is not processing requests fast enough to keep up.",
+        "to help simulate an environment where a higher level component "
+        "is enforcing a maximum number of concurrent requests. While the "
+        "--request-rate argument controls the rate at which requests are "
+        "initiated, this argument will control how many are actually allowed "
+        "to execute at a time. This means that when used in combination, the "
+        "actual request rate may be lower than specified with --request-rate, "
+        "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
@@ -1944,7 +1757,7 @@ if __name__ == "__main__":
         metavar='{"key1": "value1", "key2": "value2"}',
         type=str,
         help="Append given JSON object to the request payload. You can use this to specify"
-             "additional generate params like sampling params.",
+        "additional generate params like sampling params.",
     )
     parser.add_argument(
         "--apply-chat-template",
@@ -1955,12 +1768,7 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
-    )
-    parser.add_argument(
-        "--enable-expert-distribution-record",
-        action="store_true",
-        help="Enable expert distribution record",
+        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
         "--lora-name",
@@ -1977,7 +1785,7 @@ if __name__ == "__main__":
         help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
     )
     parser.add_argument(
-        "--pd-seperated",
+        "--pd-separated",
         action="store_true",
         help="Benchmark PD disaggregation server",
     )
