@@ -116,7 +116,7 @@ class DetokenizerManager:
             output = self._request_dispatcher(recv_obj)
             self.send_to_tokenizer.send_pyobj(output)
             packed = msgpack.packb(asdict(output), use_bin_type=True)
-            self.send_to_go_tokenizer.send_pyobj(packed)
+            self.send_to_go_tokenizer.send(packed)
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
