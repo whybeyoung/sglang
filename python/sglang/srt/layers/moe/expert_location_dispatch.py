@@ -19,7 +19,7 @@ class ExpertLocationDispatchInfo:
     num_physical_experts: int
 
     @classmethod
-    def init_new(cls, layer_id: int):
+    def init_new(cls, ep_rank: int, layer_id: int):
         ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
         expert_location_metadata = get_global_expert_location_metadata()
 
@@ -29,7 +29,8 @@ class ExpertLocationDispatchInfo:
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
             partial_logical_to_rank_dispatch_physical_map=expert_location_metadata.logical_to_rank_dispatch_physical_map[
-                                                          layer_id, :],
+                ep_rank, layer_id, :
+            ],
             partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
                                                 layer_id, :
                                                 ],
