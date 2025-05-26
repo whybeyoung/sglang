@@ -114,9 +114,13 @@ class DetokenizerManager:
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
-            self.send_to_tokenizer.send_pyobj(output)
+
+            #  send to go tokenizer
             packed = msgpack.packb(asdict(output), use_bin_type=True)
             self.send_to_go_tokenizer.send(packed)
+            self.send_to_tokenizer.send_pyobj(output)
+
+
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):

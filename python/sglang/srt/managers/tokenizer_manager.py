@@ -1092,7 +1092,6 @@ class TokenizerManager:
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            logger.info(f"Received from detokenizer: {recv_obj.rids}")
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
 
