@@ -82,6 +82,11 @@ class DetokenizerManager:
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
+        self.send_to_go_tokenizer = get_zmq_socket(
+            context, zmq.PUSH, port_args.go_tokenizer_ipc_name, False
+        )
+
+
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -109,7 +114,7 @@ class DetokenizerManager:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             self.send_to_tokenizer.send_pyobj(output)
-
+            self.send_to_go_tokenizer.send_pyobj(output)
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
