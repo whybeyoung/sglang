@@ -42,6 +42,9 @@ from sglang.srt.conversation import (
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.disaggregation.utils import DisaggregationMode
+
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
     BatchResponse,
@@ -1428,7 +1431,7 @@ def v1_chat_generate_response(
 
 
 async def v1_chat_completions(
-    tokenizer_manager, raw_request: Request, cache_report=False
+    tokenizer_manager: TokenizerManager, raw_request: Request, cache_report=False
 ):
     try:
         request_json = await raw_request.json()
@@ -1439,7 +1442,7 @@ async def v1_chat_completions(
     adapted_request, request = v1_chat_generate_request(
         all_requests, tokenizer_manager, request_ids=[all_requests[0].rid]
     )
-
+    is_decode = tokenizer_manager.server_args.disaggregation_mode == DisaggregationMode.DECODE.value
     if adapted_request.stream:
         parser_dict = {}
         reasoning_parser_dict = {}
@@ -1456,6 +1459,10 @@ async def v1_chat_completions(
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
                 ):
+                    if tokenizer_manager.server_args.enable_go_zmq_recv and is_decode :
+                        yield f"data: {content}\n\n"
+                        continue
+
                     index = content.get("index", 0)
                     text = content["text"]
 
