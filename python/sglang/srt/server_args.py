@@ -221,6 +221,9 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     pdlb_url: Optional[str] = None
 
+    # enable go zmq receiver
+    enable_go_zmq_recv: bool = False
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -1438,6 +1441,11 @@ class ServerArgs:
             help="Set multimodal attention backend.",
         )
 
+        parser.add_argument(
+            "--enable-go-zmq-recv",
+            action="store_true",
+            help="Disable Default Python Tokenizer And Enable Send to Go Recv",
+        )
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -1513,6 +1521,9 @@ ZMQ_TCP_PORT_DELTA = 233
 class PortArgs:
     # The ipc filename for tokenizer to receive inputs from detokenizer (zmq)
     tokenizer_ipc_name: str
+
+    go_tokenizer_ipc_name: str
+
     # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
     scheduler_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
@@ -1543,6 +1554,7 @@ class PortArgs:
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                go_tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -1573,6 +1585,7 @@ class PortArgs:
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
+                go_tokenizer_ipc_name=f"tcp://{dist_init_host}:10110",
             )
 
 

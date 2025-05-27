@@ -118,6 +118,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.disaggregation.utils import  DisaggregationMode
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -637,9 +638,15 @@ class TokenizerManager:
         """Wait for the response of one request."""
         state = self.rid_to_state[obj.rid]
 
+        # read time out
+        read_time_out = 4
+        is_decode = self.server_args.disaggregation_mode == DisaggregationMode.DECODE.value
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
+                if self.server_args.enable_go_zmq_recv and is_decode:
+                    read_time_out = 10
+                await asyncio.wait_for(state.event.wait(), timeout=read_time_out)
+
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
@@ -648,6 +655,9 @@ class TokenizerManager:
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
                     )
+                if self.server_args.enable_go_zmq_recv and is_decode:
+                    yield "keep_alive"
+
                 continue
 
             out = state.out_list[-1]

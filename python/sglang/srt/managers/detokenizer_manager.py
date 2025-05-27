@@ -23,6 +23,8 @@ from typing import Dict, List, Union
 import psutil
 import setproctitle
 import zmq
+import msgpack
+from dataclasses import  asdict
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -43,6 +45,7 @@ from sglang.utils import (
     find_printable_text,
     get_exception_traceback,
 )
+from sglang.srt.disaggregation.utils import  DisaggregationMode
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,12 @@ class DetokenizerManager:
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
+        self.send_to_go_tokenizer = get_zmq_socket(
+            context, zmq.PUSH, port_args.go_tokenizer_ipc_name, False
+        )
+        self.sever_args = server_args
+        self.is_decode = server_args.disaggregation_mode == DisaggregationMode.DECODE.value
+
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -108,7 +117,12 @@ class DetokenizerManager:
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
-            self.send_to_tokenizer.send_pyobj(output)
+            #  send to go tokenizer
+            packed = msgpack.packb(asdict(output), use_bin_type=True)
+            if self.sever_args.enable_go_zmq_recv and self.is_decode:
+                self.send_to_go_tokenizer.send(packed)
+            else:
+                self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
