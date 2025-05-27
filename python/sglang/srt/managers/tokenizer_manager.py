@@ -643,8 +643,8 @@ class TokenizerManager:
         is_decode = self.server_args.disaggregation_mode == DisaggregationMode.DECODE.value
         while True:
             try:
-                if self.server_args.enable_go_zmq_recv and is_decode:
-                    read_time_out = 10
+                # if self.server_args.enable_go_zmq_recv and is_decode:
+                #     read_time_out = 10
                 await asyncio.wait_for(state.event.wait(), timeout=read_time_out)
 
             except asyncio.TimeoutError:
@@ -655,8 +655,8 @@ class TokenizerManager:
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
                     )
-                if self.server_args.enable_go_zmq_recv and is_decode:
-                    yield "keep_alive"
+                # if self.server_args.enable_go_zmq_recv and is_decode:
+                #     yield "keep_alive"
 
                 continue
 

@@ -117,11 +117,16 @@ class DetokenizerManager:
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
-            #  send to go tokenizer
-            packed = msgpack.packb(asdict(output), use_bin_type=True)
-            if self.sever_args.enable_go_zmq_recv and self.is_decode:
+            # decode 仅送 go receiver
+            if self.sever_args.enable_go_zmq_recv:
+                packed = msgpack.packb(asdict(output), use_bin_type=True)
+                #  send to go tokenizer
                 self.send_to_go_tokenizer.send(packed)
             else:
+                self.send_to_tokenizer.send_pyobj(output)
+
+            # prefill 也会发送回 tm
+            if not self.is_decode:
                 self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(

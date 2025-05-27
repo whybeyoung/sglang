@@ -1459,9 +1459,10 @@ async def v1_chat_completions(
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
                 ):
-                    if tokenizer_manager.server_args.enable_go_zmq_recv and is_decode :
-                        yield f"data: {content}\n\n"
-                        continue
+                    #todo
+                    # if tokenizer_manager.server_args.enable_go_zmq_recv and is_decode :
+                    #     yield f"data: {content}\n\n"
+                    #     continue
 
                     index = content.get("index", 0)
                     text = content["text"]
