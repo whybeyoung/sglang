@@ -815,7 +815,7 @@ def _wait_and_warmup(
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
+        #kill_process_tree(os.getpid())
         return
 
     model_info = res.json()
@@ -889,7 +889,7 @@ def _wait_and_warmup(
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
+        #kill_process_tree(os.getpid())
         return
 
     # Debug print
