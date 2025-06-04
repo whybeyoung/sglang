@@ -77,11 +77,7 @@ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import (
-    DefaultModelLoader,
-    device_loading_context,
-    get_model_loader,
-)
+from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
@@ -208,7 +204,7 @@ class ModelRunner:
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "moe_dense_tp_size": server_args.moe_dense_tp_size,
                 "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
-                "n_share_experts_fusion": server_args.n_share_experts_fusion,
+                "num_fused_shared_experts": server_args.num_fused_shared_experts,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "torchao_config": server_args.torchao_config,
                 "sampling_backend": server_args.sampling_backend,
@@ -922,7 +918,7 @@ class ModelRunner:
 
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs + 1,
+                size=max_num_reqs,
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
