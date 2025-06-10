@@ -460,22 +460,25 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
-            state.topk_weights_local, state.topk_idx_local = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=True,
-                renormalize=self.renormalize,
-                topk_group=self.topk_group,
-                num_expert_group=self.num_expert_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                correction_bias=self.correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-                num_token_non_padded=state.forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                state.topk_weights_local, state.topk_idx_local = select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    top_k=self.top_k,
+                    use_grouped_topk=True,
+                    renormalize=self.renormalize,
+                    topk_group=self.topk_group,
+                    num_expert_group=self.num_expert_group,
+                    num_fused_shared_experts=self.num_fused_shared_experts,
+                    correction_bias=self.correction_bias,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
         else:
             state.topk_idx_local = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -1395,7 +1398,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
+        self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -1495,6 +1500,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+
+        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+            hidden_states = hidden_states.clone()
 
         return hidden_states, residual
 
