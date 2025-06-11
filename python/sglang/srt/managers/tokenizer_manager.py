@@ -405,15 +405,15 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
-         # 获取当前 worker 的 ID
+         # Get the current worker's ID
         worker_id = os.getpid()
-        
-        # 修改 rid，添加 worker_id
+
+        # Modify rid, add worker_id
         if isinstance(obj.rid, list):
-            # 如果是数组，为每个元素添加 worker_id 前缀
+            # If it's an array, add worker_id prefix to each element
             obj.rid = [f"{worker_id}_{rid}" for rid in obj.rid]
         else:
-            # 如果是单个值，在前面添加 worker_id
+            # If it's a single value, add worker_id prefix
             obj.rid = f"{worker_id}_{obj.rid}"
         self.auto_create_handle_loop()
 
