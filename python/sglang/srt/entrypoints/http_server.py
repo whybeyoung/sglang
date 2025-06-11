@@ -123,7 +123,7 @@ def set_global_state(global_state: _GlobalState):
     _global_state = global_state
 
 def serialize_port_args(port_args: PortArgs) -> dict:
-    """将 PortArgs 序列化为可共享的字典"""
+    """Serialize PortArgs into a shareable dictionary"""
     return {
         "tokenizer_ipc_name": port_args.tokenizer_ipc_name,
         "scheduler_input_ipc_name": port_args.scheduler_input_ipc_name,
@@ -133,46 +133,46 @@ def serialize_port_args(port_args: PortArgs) -> dict:
     }
 
 def deserialize_port_args(data: dict) -> PortArgs:
-    """从共享的字典反序列化为 PortArgs"""
+    """Deserialize PortArgs from a shared dictionary"""
     return PortArgs(**data)
 
 def serialize_server_args(server_args: ServerArgs) -> dict:
-    """将 ServerArgs 序列化为可共享的字典"""
+    """Serialize ServerArgs into a shareable dictionary"""
     return dataclasses.asdict(server_args)
 
 def deserialize_server_args(data: dict) -> ServerArgs:
-    """从共享的字典反序列化为 ServerArgs"""
+    """Deserialize ServerArgs from a shared dictionary"""
     return ServerArgs(**data)
 
 def serialize_scheduler_info(scheduler_info: Dict) -> dict:
-    """将 scheduler_info 序列化为可共享的字典"""
+    """Serialize scheduler_info into a shareable dictionary"""
     return scheduler_info
 
 def deserialize_scheduler_info(data: dict) -> Dict:
-    """从共享的字典反序列化为 scheduler_info"""
+    """Deserialize scheduler_info from a shared dictionary"""
     return data
 
 def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
-    """将数据写入共享内存"""
+    """Write data to shared memory"""
     serialized = json.dumps(data).encode('utf-8')
     size = len(serialized)
     try:
-        # 尝试打开已存在的共享内存
+        # Try to open existing shared memory
         shm = shared_memory.SharedMemory(name=name)
-        # 如果大小不够，关闭并重新创建
+        # If size is insufficient, close and recreate
         if shm.size < size:
             shm.close()
             shm.unlink()
             shm = shared_memory.SharedMemory(create=True, size=size, name=name)
     except FileNotFoundError:
-        # 如果不存在，创建新的共享内存
+        # If not present, create new shared memory
         shm = shared_memory.SharedMemory(create=True, size=size, name=name)
-    
+
     shm.buf[:size] = serialized
     return shm
 
 def read_from_shared_memory(name: str) -> dict:
-    """从共享内存读取数据"""
+    """Read data from shared memory"""
     try:
         shm = shared_memory.SharedMemory(name=name)
         data = json.loads(bytes(shm.buf).decode('utf-8'))
@@ -182,37 +182,37 @@ def read_from_shared_memory(name: str) -> dict:
         raise FileNotFoundError(f"Shared memory {name} not found")
 
 def get_main_process_id() -> int:
-    """获取主进程的 ID"""
+    """Get the main process ID"""
     return multiprocessing.current_process()._parent_pid
 
 def serialize_tokenizer_mapping(mapping: Dict[int, str]) -> dict:
-    """将 tokenizer_ipc_name 映射序列化为可共享的字典"""
+    """Serialize tokenizer_ipc_name mapping into a shareable dictionary"""
     return mapping
 
 def deserialize_tokenizer_mapping(data: dict) -> Dict[int, str]:
-    """从共享的字典反序列化为 tokenizer_ipc_name 映射"""
+    """Deserialize tokenizer_ipc_name mapping from a shared dictionary"""
     return data
 
 def create_shared_lock() -> Lock:
-    """创建一个共享的锁"""
+    """Create a shared lock"""
     return Lock()
 
 def update_tokenizer_mapping(worker_id: int, ipc_name: str, shm_name: str, lock_value: Value) -> tuple[shared_memory.SharedMemory, int]:
-    """更新或创建 tokenizer_ipc_name 映射"""
-    with lock_value.get_lock():  # 使用共享锁确保进程间同步
+    """Update or create the tokenizer_ipc_name mapping"""
+    with lock_value.get_lock():  # Use a shared lock to ensure inter-process synchronization
         try:
-            # 尝试读取现有的映射
+            # Try to read the existing mapping
             existing_data = read_from_shared_memory(shm_name)
             mapping = deserialize_tokenizer_mapping(existing_data)
         except FileNotFoundError:
-            # 如果不存在，创建新的映射
+            # If not present, create a new mapping
             mapping = {}
-        
-        # 更新映射
+
+        # Update the mapping
         mapping[worker_id] = ipc_name
         print(f"worker_id:{worker_id}, mapping:{mapping}")
-        
-        # 写入共享内存
+
+        # Write to shared memory
         shm = write_to_shared_memory(
             serialize_tokenizer_mapping(mapping),
             shm_name,
@@ -236,11 +236,11 @@ async def lifespan(fast_api_app: FastAPI):
         pid = os.getpid()
         main_pid = get_main_process_id()
         print(f"current worker_id: {pid}, main processID: {main_pid}")
-        
-        # 从共享内存读取 port_args、server_args 和 scheduler_info
+
+        # Read port_args, server_args, and scheduler_info from shared memory
         max_retries = 5
-        retry_delay = 1  # 秒
-        
+        retry_delay = 1  # seconds
+
         for retry in range(max_retries):
             try:
                 port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
@@ -250,27 +250,27 @@ async def lifespan(fast_api_app: FastAPI):
                 break
             except FileNotFoundError as e:
                 if retry < max_retries - 1:
-                    print(f"等待共享内存就绪，重试 {retry + 1}/{max_retries}")
+                    print(f"Waiting for shared memory to be ready, retry {retry + 1}/{max_retries}")
                     time.sleep(retry_delay)
                 else:
-                    raise Exception(f"无法访问共享内存: {e}")
-        
+                    raise Exception(f"Unable to access shared memory: {e}")
+
         lock_value = Value(ctypes.c_int, lock_data["lock_value"])
-        
+
         port_args = deserialize_port_args(port_args_data)
         server_args = deserialize_server_args(server_args_data)
         scheduler_info = deserialize_scheduler_info(scheduler_info_data)
-        
+
         port_args.tokenizer_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        
-        # 使用共享锁更新 tokenizer_ipc_name 映射
+
+        # Use a shared lock to update the tokenizer_ipc_name mapping
         tokenizer_mapping_shm, mapping_len = update_tokenizer_mapping(
             pid,
             port_args.tokenizer_ipc_name,
             f"tokenizer_mapping_{main_pid}",
             lock_value
         )
-        
+
         # Launch tokenizer process
         tokenizer_manager = TokenizerManager(server_args, port_args)
         if server_args.chat_template:
@@ -286,55 +286,55 @@ async def lifespan(fast_api_app: FastAPI):
                 scheduler_info=scheduler_info,
             )
         )
-        
+
         print(f"mapping_length={mapping_len},worker_num={server_args.worker_num}")
-        # 检查是否所有 worker 都已注册
-        
+        # Check if all workers have registered
+
         if server_args.warmups is not None:
             logger.info("Warmup started")
             await execute_warmups(
                 server_args.warmups.split(","), _global_state.tokenizer_manager
             )
             logger.info("Warmup ended")
-        # wait detokenizer manager register zmq
+        # wait for detokenizer manager to register zmq
         time.sleep(12)
         logger.info("warmup_thread start")
         print(f"warmup_thread start p")
-        
-        # 为每个 worker 创建自己的 warmup 线程
+
+        # Create a warmup thread for each worker
         warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             args=(
                 server_args,
-                None,  # pipe_finish_writer 在 worker 中不需要
+                None,  # pipe_finish_writer not needed in worker
                 _global_state.tokenizer_manager.image_token_id,
-                None,  # launch_callback 在 worker 中不需要
+                None,  # launch_callback not needed in worker
             ),
         )
         print(f"warmup_thread start warmup_thread={warmup_thread}")
         warmup_thread.start()
-        
+
         print(f"worker {pid} started")
     try:
         yield
     finally:
         if server_args.worker_num > 1:
             print(f"worker {pid} ending")
-            # 清理共享内存
+            # Clean up shared memory
             try:
                 if "warmup_thread" in locals() and warmup_thread.is_alive():
                     warmup_thread.join()
-                with lock_value.get_lock():  # 使用共享锁确保清理时的进程间同步
+                with lock_value.get_lock():  # Use a shared lock to ensure inter-process synchronization during cleanup
                     tokenizer_mapping_shm.close()
-                    # 检查是否还有其他 worker 在使用这个映射
+                    # Check if other workers are still using this mapping
                     try:
                         mapping = deserialize_tokenizer_mapping(read_from_shared_memory(f"tokenizer_mapping_{main_pid}"))
-                        if len(mapping) <= 1:  # 如果只有当前 worker 在使用
+                        if len(mapping) <= 1:  # If only the current worker is using it
                             tokenizer_mapping_shm.unlink()
                     except FileNotFoundError:
                         pass
             except Exception as e:
-                print(f"清理共享内存时出错: {e}")
+                print(f"Error when cleaning up shared memory: {e}")
             print(f"worker {pid} ended")
 
 
@@ -965,29 +965,27 @@ def launch_server(
         main_pid = get_main_process_id()
         current_pid = os.getpid()
         logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
-        
-        # 创建共享的锁值
+
+        # Create a shared lock value
         lock_value = Value(ctypes.c_int, 0)
-        
-        # 将 port_args 和 server_args 写入共享内存
+
+        # Write port_args to shared memory
         port_args_shm = write_to_shared_memory(
-            serialize_port_args(port_args), 
+            serialize_port_args(port_args),
             f"port_args_{os.getpid()}"
         )
+        # Write server_args to shared memory
         server_args_shm = write_to_shared_memory(
-            serialize_server_args(server_args), 
+            serialize_server_args(server_args),
             f"server_args_{os.getpid()}"
         )
-        
-        # 将锁值的地址写入共享内存
+        # Write lock value address to shared memory
         lock_shm = write_to_shared_memory(
             {"lock_value": lock_value.value},
             f"mapping_lock_{os.getpid()}"
         )
-        
-        
-        
-        # 将 scheduler_info 写入共享内存
+
+        # Write scheduler_info to shared memory
         scheduler_info_shm = write_to_shared_memory(
             serialize_scheduler_info(scheduler_info),
             f"scheduler_info_{os.getpid()}"
