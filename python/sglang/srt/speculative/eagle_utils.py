@@ -86,7 +86,13 @@ class EagleDraftInput:
             pt += extend_len
 
     @classmethod
-    def create_for_idle(cls, device: torch.device, hidden_size: int, topk: int):
+    def create_for_idle(
+        cls,
+        device: torch.device,
+        hidden_size: int,
+        topk: int,
+        capture_hidden_mode: CaptureHiddenMode,
+    ):
         return cls(
             verified_id=None,
             hidden_states=torch.empty(
@@ -94,6 +100,7 @@ class EagleDraftInput:
             ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            capture_hidden_mode=capture_hidden_mode,
         )
 
     def prepare_extend_after_decode(
@@ -137,6 +144,9 @@ class EagleDraftInput:
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+
+        if paged_kernel_lens_sum is None:
+            paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
         kv_indices = torch.empty(
             paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
@@ -782,10 +792,6 @@ def select_top_k_tokens(
                 0, hidden_states.shape[0], step=topk, device="cuda"
             ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index, :]
-        else:
-            hidden_states = torch.empty(
-                [0, hidden_states.shape[1]], dtype=hidden_states.dtype, device="cuda"
-            )
 
         tree_info = (
             expand_scores,  # shape: (b, topk, topk)

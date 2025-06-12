@@ -298,9 +298,14 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
             # If it is None, it means all requests are finished
-            if self.check_forward_draft_extend_after_decode(batch):
+            need_forward, can_run_draft_extend_cuda_graph = (
+                self.check_forward_draft_extend_after_decode(batch)
+            )
+            if need_forward:
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
-                    self.forward_draft_extend_after_decode(batch)
+                    self.forward_draft_extend_after_decode(
+                        batch, can_run_draft_extend_cuda_graph
+                    )
             return (
                 logits_output,
                 verify_output.verified_id,
@@ -331,7 +336,7 @@ class EAGLEWorker(TpModelWorker):
             and batch.spec_info.verified_id.shape[0] > 0
         )
         if not self.server_args.enable_dp_attention:
-            return local_need_forward
+            return local_need_forward, True
 
         local_info = torch.tensor(
             [
@@ -349,7 +354,8 @@ class EAGLEWorker(TpModelWorker):
             group=self.target_worker.get_tp_group().cpu_group,
         )
         need_forward = global_info[:, :, 0].any().item()
-        return need_forward
+        can_run_draft_extend_cuda_graph = global_info[:, :, 0].all().item()
+        return need_forward, can_run_draft_extend_cuda_graph
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -464,13 +470,16 @@ class EAGLEWorker(TpModelWorker):
                 device=self.device,
                 hidden_size=self.model_config.hidden_size,
                 topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             spec_info = batch.spec_info
 
         # Get forward batch
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.topk
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -594,6 +603,7 @@ class EAGLEWorker(TpModelWorker):
 
         if not batch.forward_mode.is_idle():
             spec_info.prepare_for_verify(batch, self.page_size)
+            batch.return_hidden_states = False
             batch.forward_mode = ForwardMode.TARGET_VERIFY
 
         batch.spec_info = spec_info
@@ -601,6 +611,7 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
         )
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
+        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
@@ -664,6 +675,7 @@ class EAGLEWorker(TpModelWorker):
                 device=self.device,
                 hidden_size=self.model_config.hidden_size,
                 topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             res = EagleVerifyOutput(
                 draft_input=draft_input,
@@ -757,17 +769,20 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # Sometimes we get hidden states produced by CaptureHiddenMode.FULL, so we have to select just the last
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
         )
 
+        batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
         model_worker_batch.spec_num_draft_tokens = 1
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -778,7 +793,9 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, can_run_draft_extend_cuda_graph: bool
+    ):
 
         is_idle = batch.forward_mode.is_idle()
         origin_batch = None
@@ -803,10 +820,14 @@ class EAGLEWorker(TpModelWorker):
                     device=self.device,
                     hidden_size=self.model_config.hidden_size,
                     topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
                 batch.forward_mode = ForwardMode.IDLE
+        batch.return_hidden_states = False
+
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -814,10 +835,10 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:
             forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
-
         # Run
         can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
+            can_run_draft_extend_cuda_graph
+            and self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
         if can_cuda_graph:

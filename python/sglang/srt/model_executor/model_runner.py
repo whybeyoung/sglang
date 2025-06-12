@@ -195,8 +195,8 @@ class ModelRunner:
             {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
             | {
                 # TODO it is indeed not a "server args"
-                "speculative_algorithm": self.spec_algorithm,
                 "use_mla_backend": self.use_mla_backend,
+                "speculative_algorithm": self.spec_algorithm,
             }
         )
 
