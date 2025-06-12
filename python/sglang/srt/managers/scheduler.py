@@ -1158,6 +1158,9 @@ class Scheduler(
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
             f += f"#input throughput (token/s): {self.last_input_throughput:.2f} "
+
+            self.num_prefill_tokens = adder.log_input_tokens
+
         else:
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}"
