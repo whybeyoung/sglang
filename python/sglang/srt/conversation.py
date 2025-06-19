@@ -562,14 +562,11 @@ def generate_chat_conv(
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
-                if num_image_url > 1:
-                    image_token = conv.image_token
-                else:
-                    image_token = (
-                        conv.image_token + "\n"
-                        if conv.name != "qwen2-vl"
-                        else conv.image_token
-                    )
+                image_token = (
+                    conv.image_token + "\n"
+                    if conv.name != "qwen2-vl"
+                    else conv.image_token
+                )
                 add_token_as_needed: bool = (
                     conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
                 )
@@ -680,8 +677,8 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="phi-4-mm",
-        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
-        system_template="<|system|>{system_message}<|end|>",
+        system_message="",
+        system_template="{system_message}",
         roles=("<|user|>", "<|assistant|>"),
         sep_style=SeparatorStyle.NO_COLON_SINGLE,
         sep="<|end|>",
@@ -986,3 +983,9 @@ def match_devstral(model_path: str):
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
+
+
+@register_conv_template_matching_function
+def match_vila(model_path: str):
+    if re.search(r"vila", model_path, re.IGNORECASE):
+        return "chatml"
