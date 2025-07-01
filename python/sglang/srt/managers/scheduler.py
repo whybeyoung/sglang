@@ -71,6 +71,9 @@ from sglang.srt.managers.expert_distribution import (
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    DisableEICReqInput,
+    EICSwitchOutput,
+    EnableEICReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -127,6 +130,10 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.eic_hiradix_cache import (
+    EICHiRadixCache,
+    EICHiRadixCacheBuilder,
+)
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -241,6 +248,11 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
         self.dp_size = server_args.dp_size
+        self.enable_eic_cache = (
+            server_args.enable_eic_cache if self.enable_hierarchical_cache else False
+        )
+
+        # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -501,6 +513,8 @@ class Scheduler(
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
+                (EnableEICReqInput, self.enable_eic_cache_wrapped),
+                (DisableEICReqInput, self.disable_eic_cache_wrapped),
             ]
         )
 
@@ -560,23 +574,35 @@ class Scheduler(
             )
         else:
             if self.enable_hierarchical_cache:
-                self.tree_cache = HiRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=(
-                        self.attn_tp_cpu_group
-                        if self.server_args.enable_dp_attention
-                        else self.tp_cpu_group
-                    ),
-                    page_size=self.page_size,
-                    hicache_ratio=server_args.hicache_ratio,
-                    hicache_size=server_args.hicache_size,
-                    hicache_write_policy=server_args.hicache_write_policy,
+                tp_cache_group = (
+                    self.attn_tp_cpu_group
+                    if server_args.enable_dp_attention
+                    else self.tp_cpu_group
                 )
-                self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
-                )
-
+                if self.enable_eic_cache:
+                    self.tree_cache = EICHiRadixCacheBuilder.build(
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tp_cache_group=tp_cache_group,
+                        page_size=self.page_size,
+                        hicache_ratio=server_args.hicache_ratio,
+                        hicache_size=server_args.hicache_size,
+                        hicache_write_policy=server_args.hicache_write_policy,
+                        server_args=server_args,
+                    )
+                else:
+                    self.tree_cache = HiRadixCache(
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tp_cache_group=self.tp_cpu_group,
+                        page_size=self.page_size,
+                        hicache_ratio=server_args.hicache_ratio,
+                        hicache_size=server_args.hicache_size,
+                        hicache_write_policy=server_args.hicache_write_policy,
+                    )
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.layer_done_counter
+                    )
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
@@ -1256,6 +1282,7 @@ class Scheduler(
         )
 
         num_new_seq = len(can_run_list)
+
         f = (
             f"Prefill batch. "
             f"#new-seq: {num_new_seq}, "
@@ -1263,6 +1290,17 @@ class Scheduler(
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
         )
+
+        if self.enable_hierarchical_cache:
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            f += (
+                f"#write-queue: {num_write_queue_size}, "
+                f"#load-queue: {num_load_queue_size}, "
+                f"#hit_rate: {adder.log_hit_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+                f"#gpu_hit_rate: {adder.log_hit_gpu_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+                f"#eic_hit_rate: {adder.log_hit_eic_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+            )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
@@ -1334,6 +1372,16 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
+
+        if self.enable_hierarchical_cache and not isinstance(
+            self.tree_cache, ChunkCache
+        ):
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            msg += (
+                f"#write-queue: {num_write_queue_size}, "
+                f"#load-queue: {num_load_queue_size}, "
+            )
 
         msg += (
             f"cuda graph: {can_run_cuda_graph}, "
@@ -1511,6 +1559,7 @@ class Scheduler(
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
+            self.enable_eic_cache,
         )
 
         if self.chunked_req is not None:
@@ -1621,7 +1670,6 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
-
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
@@ -2240,6 +2288,70 @@ class Scheduler(
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
+
+    def enable_eic_cache_wrapped(self, recv_req: EnableEICReqInput) -> EICSwitchOutput:
+        if not isinstance(self.tree_cache, EICHiRadixCache):
+            success = self.flush_cache()
+            if not success:
+                # If there are pending requests, we cannot enable EIC cache.
+                return EICSwitchOutput(
+                    success=False,
+                    message="Cannot enable EIC cache while there are pending requests. Please flush the cache first.'",
+                )
+
+            self.enable_eic_cache = True
+            self.enable_hierarchical_cache = True
+            self.server_args.enable_hierarchical_cache = True
+            self.server_args.enable_eic_cache = True
+            self.init_memory_pool_and_cache()
+
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+            message = "EIC cache enabled successfully."
+        else:
+            message = "EIC cache is already enabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
+
+    def disable_eic_cache_wrapped(
+        self, recv_req: DisableEICReqInput
+    ) -> EICSwitchOutput:
+        if isinstance(self.tree_cache, EICHiRadixCache):
+            success = self.flush_cache()
+            if not success:
+                # If there are pending requests, we cannot disable EIC cache.
+                return EICSwitchOutput(
+                    success=False,
+                    message="Cannot disable EIC cache while there are pending requests. Please flush the cache first.'",
+                )
+
+            self.enable_eic_cache = False
+            self.enable_hierarchical_cache = False
+            self.server_args.enable_hierarchical_cache = False
+            self.server_args.enable_eic_cache = False
+            self.init_memory_pool_and_cache()
+
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+            message = "EIC cache disabled successfully."
+        else:
+            message = "EIC cache is already enabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         tags = recv_req.tags

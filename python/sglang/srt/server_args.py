@@ -208,6 +208,8 @@ class ServerArgs:
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
     enable_hierarchical_cache: bool = False
+    enable_eic_cache: bool = False
+    disable_eic_shared: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
@@ -549,6 +551,9 @@ class ServerArgs:
 
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
+
+        if self.enable_eic_cache and not self.enable_hierarchical_cache:
+            self.enable_hierarchical_cache = True
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
@@ -1532,6 +1537,18 @@ class ServerArgs:
             "--debug-tensor-dump-prefill-only",
             action="store_true",
             help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
+        )
+
+        parser.add_argument(
+            "--enable-eic-cache",
+            action="store_true",
+            help="Enable EIC cache",
+        )
+
+        parser.add_argument(
+            "--disable-eic-shared",
+            action="store_true",
+            help="Disable EIC shared cache, which is used to share the cache between multiple servers.",
         )
 
         # Disaggregation

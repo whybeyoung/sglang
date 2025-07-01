@@ -994,3 +994,19 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class EnableEICReqInput:
+    pass
+
+
+@dataclass
+class DisableEICReqInput:
+    pass
+
+
+@dataclass
+class EICSwitchOutput:
+    success: bool
+    message: str
