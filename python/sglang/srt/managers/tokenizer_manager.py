@@ -63,10 +63,6 @@ from sglang.srt.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
-from sglang.srt.managers.detokenizer_manager import (
-    deserialize_tokenizer_mapping,
-    read_from_shared_memory,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
