@@ -63,6 +63,10 @@ from sglang.srt.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.managers.detokenizer_manager import (
+    deserialize_tokenizer_mapping,
+    read_from_shared_memory,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -190,6 +194,7 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
         is_main: Optional[bool] = True,
+        is_main: Optional[bool] = True,
     ):
         # Parse args
         self.server_args = server_args
@@ -240,6 +245,8 @@ class TokenizerManager:
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
 
         self.worker_id = os.getpid()
         # Read model args
@@ -286,6 +293,12 @@ class TokenizerManager:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
+
+        # Initialize loaded loRA adapters with the initial lora paths in the server_args.
+        # This list will be updated when new LoRA adapters are loaded or unloaded dynamically.
+        self.loaded_lora_adapters: Dict[str, str] = dict(
+            self.server_args.lora_paths or {}
+        )
 
         # Store states
         self.no_create_loop = False
@@ -371,6 +384,7 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size, server_args
         )
         self.health_check_communitcator = _Communicator(
+            self.send_to_scheduler, 1, server_args
             self.send_to_scheduler, 1, server_args
         )
         self.get_internal_state_communicator = _Communicator(
@@ -512,6 +526,7 @@ class TokenizerManager:
             # If it's a single value, add worker_id prefix
             obj.rid = f"{self.worker_id}_{obj.rid}"
 
+
         if isinstance(obj, GenerateReqInput):
             return_hidden_states = obj.return_hidden_states
             has_return_hidden_states = return_hidden_states == True or (
@@ -651,6 +666,8 @@ class TokenizerManager:
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
+            if self.server_args.lora_paths and obj.lora_path:
+                self._validate_lora_adapters(obj)
 
     def _validate_input_ids_in_vocab(
         self, input_ids: List[int], vocab_size: int
@@ -763,6 +780,21 @@ class TokenizerManager:
                 raise ValueError(
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
+
+    def _validate_lora_adapters(self, obj: GenerateReqInput):
+        """Validate that the requested LoRA adapters are loaded."""
+        requested_adapters = (
+            set(obj.lora_path) if isinstance(obj.lora_path, list) else {obj.lora_path}
+        )
+        loaded_adapters = (
+            self.loaded_lora_adapters.keys() if self.loaded_lora_adapters else set()
+        )
+        unloaded_adapters = requested_adapters - loaded_adapters
+        if unloaded_adapters:
+            raise ValueError(
+                f"The following requested LoRA adapters are not loaded: {unloaded_adapters}\n"
+                f"Loaded adapters: {loaded_adapters}."
+            )
 
     def _send_one_request(
         self,
@@ -1090,6 +1122,7 @@ class TokenizerManager:
 
         async with self.model_update_lock.writer_lock:
             result = (await self.update_lora_adapter_communicator(obj))[0]
+            self.loaded_lora_adapters = result.loaded_adapters
             return result
 
     async def unload_lora_adapter(
@@ -1111,6 +1144,7 @@ class TokenizerManager:
 
         async with self.model_update_lock.writer_lock:
             result = (await self.update_lora_adapter_communicator(obj))[0]
+            self.loaded_lora_adapters = result.loaded_adapters
             return result
 
     async def get_weights_by_name(
@@ -1397,6 +1431,7 @@ class TokenizerManager:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             # In multi-worker mode, distribute results to corresponding workers
             if self.server_args.worker_num > 1 and self.is_main:
+            if self.server_args.worker_num > 1 and self.is_main:
                 await self._distribute_result_to_workers(recv_obj)
             else:
                 # In single worker mode, process directly
@@ -1414,7 +1449,9 @@ class TokenizerManager:
             try:
                 # Read tokenizer mapping information
                 tokenizer_mapping_data = read_from_shared_memory(
+                    
                     f"tokenizer_mapping_{main_pid}"
+                
                 )
                 ipc_mapping = deserialize_tokenizer_mapping(tokenizer_mapping_data)
                 print(f"Main TokenizerManager loaded tokenizer mapping: {ipc_mapping}")
@@ -1423,9 +1460,11 @@ class TokenizerManager:
                 if len(ipc_mapping) >= self.server_args.worker_num:
                     # Initialize tokenizer_mapping if not exists
                     if not hasattr(self, "tokenizer_mapping"):
+                    if not hasattr(self, "tokenizer_mapping"):
                         self.tokenizer_mapping = {}
 
                     # Create ZMQ context if needed
+                    if not hasattr(self, "_zmq_context"):
                     if not hasattr(self, "_zmq_context"):
                         self._zmq_context = zmq.Context()
 
@@ -1434,20 +1473,28 @@ class TokenizerManager:
                         worker_id_int = int(worker_id)
                         if worker_id_int not in self.tokenizer_mapping:
                             socket = get_zmq_socket(
+                                
                                 self._zmq_context, zmq.PUSH, ipc_name, False
+                            
                             )
                             self.tokenizer_mapping[worker_id_int] = socket
                             print(
+                                
                                 f"Created ZMQ socket for worker {worker_id} with ipc_name {ipc_name}"
+                            
                             )
                         else:
                             print(
+                                
                                 f"ZMQ socket for worker {worker_id} already exists, skipping creation"
+                            
                             )
                     break  # Successfully loaded all workers, exit retry loop
                 else:
                     print(
+                        
                         f"Waiting for all workers to register... Current: {len(ipc_mapping)}/{self.server_args.worker_num}"
+                    
                     )
                     if retry < max_retries - 1:
                         time.sleep(retry_interval)
@@ -1460,16 +1507,21 @@ class TokenizerManager:
             except Exception as e:
                 if retry < max_retries - 1:
                     print(
+                        
                         f"Failed to load tokenizer mapping, retrying in {retry_interval} seconds: {e}"
+                    
                     )
                     time.sleep(retry_interval)
                 else:
                     raise RuntimeError(
+                        
                         f"Failed to load tokenizer mapping after {max_retries} retries: {e}"
+                    
                     )
 
     async def _distribute_result_to_workers(self, recv_obj):
         """Distribute result to corresponding workers based on rid"""
+        if not hasattr(self, "tokenizer_mapping") or not self.tokenizer_mapping:
         if not hasattr(self, "tokenizer_mapping") or not self.tokenizer_mapping:
             print("Tokenizer mapping not available, reloading...")
             self._load_tokenizer_mapping()
@@ -1477,7 +1529,9 @@ class TokenizerManager:
         # Extract worker_id from rid
         if isinstance(recv_obj.rids, list):
             worker_ids = [int(rid.split("_")[0]) for rid in recv_obj.rids]
+            worker_ids = [int(rid.split("_")[0]) for rid in recv_obj.rids]
         elif isinstance(recv_obj.rids, str):
+            worker_ids = [int(recv_obj.rids.split("_")[0])]
             worker_ids = [int(recv_obj.rids.split("_")[0])]
         else:
             raise RuntimeError(f"recv_obj.rids is not list")
@@ -2217,6 +2271,11 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
+            if (
+                self._server_args
+                and self._server_args.worker_num > 1
+                and obj.rids is None
+            ):
             if (
                 self._server_args
                 and self._server_args.worker_num > 1
