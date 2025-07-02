@@ -19,7 +19,6 @@ import dataclasses
 import json
 import logging
 import math
-import multiprocessing
 import os
 import pickle
 import signal
@@ -48,6 +47,7 @@ import torch
 import uvloop
 import zmq
 import zmq.asyncio
+from multiprocessing import shared_memory
 from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
@@ -62,10 +62,6 @@ from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-)
-from sglang.srt.managers.detokenizer_manager import (
-    read_from_shared_memory,
-    deserialize_tokenizer_mapping,
 )
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -133,6 +129,19 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger = logging.getLogger(__name__)
 
 
+def read_from_shared_memory(name: str) -> bytes:
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+        data = bytes(shm.buf)
+        shm.close()
+        return data
+    except Exception:
+        return b''
+
+def deserialize_tokenizer_mapping(data: bytes) -> dict:
+    if not data:
+        return {}
+    return eval(data.decode())
 
 @dataclasses.dataclass
 class ReqState:
@@ -1462,69 +1471,92 @@ class TokenizerManager:
 
         # Distribute result to each worker
         for i, worker_id in enumerate(worker_ids):
-            if not isinstance(recv_obj,(BatchTokenIDOut,BatchEmbeddingOut)):
-                if worker_id not in self.tokenizer_mapping:
-                    # Worker not found in mapping, reload and retry
-                    print(f"Worker {worker_id} not found in mapping, reloading...")
-                    self._load_tokenizer_mapping()    
-                if worker_id in self.tokenizer_mapping:
-                    # Send to worker
-                    self.tokenizer_mapping[worker_id].send_pyobj(recv_obj)
-                else:
-                    raise RuntimeError(
-                        f"Socket not found for worker_id={worker_id}. "
-                        f"Available worker_ids: {list(self.tokenizer_mapping.keys())}"
-                    )
+            if worker_id not in self.tokenizer_mapping:
+                # Worker not found in mapping, reload and retry
+                print(f"Worker {worker_id} not found in mapping, reloading...")
+                self._load_tokenizer_mapping()    
+            if worker_id not in self.tokenizer_mapping:
+                raise RuntimeError(
+                    f"socket not found for worker_id: {worker_id}"
+                )
             else:
-                # if skip tokenizer init = true，this part will be run
-                if worker_id not in self.tokenizer_mapping:
-                    raise RuntimeError(
-                        f"socket not found for worker_id: {worker_id}"
+                if isinstance(recv_obj, BatchTokenIDOut):
+                    new_recv_obj = BatchTokenIDOut(
+                        rids=[recv_obj.rids[i]],
+                        finished_reasons=[recv_obj.finished_reasons[i]] if len(recv_obj.finished_reasons)>i else None,
+                        decoded_texts=[recv_obj.decoded_texts[i]] if len(recv_obj.decoded_texts)>i else None,
+                        decode_ids=[recv_obj.decode_ids[i]] if len(recv_obj.decode_ids)>i else None,
+                        read_offsets=[recv_obj.read_offsets[i]] if len(recv_obj.read_offsets)>i else None,
+                        output_ids=[recv_obj.output_ids[i]] if recv_obj.output_ids and len(recv_obj.output_ids) > i else None,
+                        skip_special_tokens=[recv_obj.skip_special_tokens[i]] if len(recv_obj.skip_special_tokens) > i else None,
+                        spaces_between_special_tokens=[recv_obj.spaces_between_special_tokens[i]] if len(recv_obj.spaces_between_special_tokens) > i else None,
+                        no_stop_trim=[recv_obj.no_stop_trim[i]] if len(recv_obj.no_stop_trim) > i else None,
+                        prompt_tokens=[recv_obj.prompt_tokens[i]] if len(recv_obj.prompt_tokens) > i else None,
+                        completion_tokens=[recv_obj.completion_tokens[i]] if len(recv_obj.completion_tokens) > i else None,
+                        cached_tokens=[recv_obj.cached_tokens[i]] if len(recv_obj.cached_tokens) > i else None,
+                        spec_verify_ct=[recv_obj.spec_verify_ct[i]] if len(recv_obj.spec_verify_ct) > i else None,
+                        input_token_logprobs_val=[recv_obj.input_token_logprobs_val[i]] if recv_obj.input_token_logprobs_val else None,
+                        input_token_logprobs_idx=[recv_obj.input_token_logprobs_idx[i]] if recv_obj.input_token_logprobs_idx else None,
+                        output_token_logprobs_val=[recv_obj.output_token_logprobs_val[i]] if recv_obj.output_token_logprobs_val else None,
+                        output_token_logprobs_idx=[recv_obj.output_token_logprobs_idx[i]] if recv_obj.output_token_logprobs_idx else None,
+                        input_top_logprobs_val=[recv_obj.input_top_logprobs_val[i]] if recv_obj.input_top_logprobs_val else None,
+                        input_top_logprobs_idx=[recv_obj.input_top_logprobs_idx[i]] if recv_obj.input_top_logprobs_idx else None,
+                        output_top_logprobs_val=[recv_obj.output_top_logprobs_val[i]] if recv_obj.output_top_logprobs_val else None,
+                        output_top_logprobs_idx=[recv_obj.output_top_logprobs_idx[i]] if recv_obj.output_top_logprobs_idx else None,
+                        input_token_ids_logprobs_val=[recv_obj.input_token_ids_logprobs_val[i]] if recv_obj.input_token_ids_logprobs_val else None,
+                        input_token_ids_logprobs_idx=[recv_obj.input_token_ids_logprobs_idx[i]] if recv_obj.input_token_ids_logprobs_idx else None,
+                        output_token_ids_logprobs_val=[recv_obj.output_token_ids_logprobs_val[i]] if recv_obj.output_token_ids_logprobs_val else None,
+                        output_token_ids_logprobs_idx=[recv_obj.output_token_ids_logprobs_idx[i]] if recv_obj.output_token_ids_logprobs_idx else None,
+                        output_hidden_states=[recv_obj.output_hidden_states[i]] if recv_obj.output_hidden_states else None 
+                    )
+                elif isinstance(recv_obj, BatchEmbeddingOut):
+                    new_recv_obj= BatchEmbeddingOut(
+                        rids=[recv_obj.rids.split('_')[0]],
+                        finished_reasons=[recv_obj.finished_reasons[i]],
+                        embeddings=[recv_obj.embeddings[i]],
+                        prompt_tokens=[recv_obj.prompt_tokens[i]],
+                        cached_tokens=[recv_obj.cached_tokens[i]]
+                    )
+                elif isinstance(recv_obj, BatchStrOut):
+                    new_recv_obj = BatchStrOut(
+                        rids=[recv_obj.rids[i]],
+                        finished_reasons=[recv_obj.finished_reasons[i]] if len(recv_obj.finished_reasons)>i else None,
+                        output_strs=[recv_obj.output_strs[i]] if len(recv_obj.output_strs)>i else None,
+                        output_ids=[recv_obj.output_ids[i]] if recv_obj.output_ids and len(recv_obj.output_ids) > i else None,
+                        prompt_tokens=[recv_obj.prompt_tokens[i]] if len(recv_obj.prompt_tokens) > i else None,
+                        completion_tokens=[recv_obj.completion_tokens[i]] if len(recv_obj.completion_tokens) > i else None,
+                        cached_tokens=[recv_obj.cached_tokens[i]] if len(recv_obj.cached_tokens) > i else None,
+                        spec_verify_ct=[recv_obj.spec_verify_ct[i]] if len(recv_obj.spec_verify_ct) > i else None,
+                        input_token_logprobs_val=[recv_obj.input_token_logprobs_val[i]] if recv_obj.input_token_logprobs_val else None,
+                        input_token_logprobs_idx=[recv_obj.input_token_logprobs_idx[i]] if recv_obj.input_token_logprobs_idx else None,
+                        output_token_logprobs_val=[recv_obj.output_token_logprobs_val[i]] if recv_obj.output_token_logprobs_val else None,
+                        output_token_logprobs_idx=[recv_obj.output_token_logprobs_idx[i]] if recv_obj.output_token_logprobs_idx else None,
+                        input_top_logprobs_val=[recv_obj.input_top_logprobs_val[i]] if recv_obj.input_top_logprobs_val else None,
+                        input_top_logprobs_idx=[recv_obj.input_top_logprobs_idx[i]] if recv_obj.input_top_logprobs_idx else None,
+                        output_top_logprobs_val=[recv_obj.output_top_logprobs_val[i]] if recv_obj.output_top_logprobs_val else None,
+                        output_top_logprobs_idx=[recv_obj.output_top_logprobs_idx[i]] if recv_obj.output_top_logprobs_idx else None,
+                        input_token_ids_logprobs_val=[recv_obj.input_token_ids_logprobs_val[i]] if recv_obj.input_token_ids_logprobs_val else None,
+                        input_token_ids_logprobs_idx=[recv_obj.input_token_ids_logprobs_idx[i]] if recv_obj.input_token_ids_logprobs_idx else None,
+                        output_token_ids_logprobs_val=[recv_obj.output_token_ids_logprobs_val[i]] if recv_obj.output_token_ids_logprobs_val else None,
+                        output_token_ids_logprobs_idx=[recv_obj.output_token_ids_logprobs_idx[i]] if recv_obj.output_token_ids_logprobs_idx else None,
+                        output_hidden_states=[recv_obj.output_hidden_states[i]] if recv_obj.output_hidden_states else None
+                    )
+                elif isinstance(recv_obj, BatchMultimodalOut):
+                    new_recv_obj = BatchMultimodalOut(
+                        rids=[recv_obj.rids[i]],
+                        finished_reasons=[recv_obj.finished_reasons[i]],
+                        prompt_tokens=[recv_obj.prompt_tokens[i]],
+                        completion_tokens=[recv_obj.completion_tokens[i]],
+                        cached_tokens=[recv_obj.cached_tokens[i]]
                     )
                 else:
-                    if isinstance(recv_obj, BatchTokenIDOut):
-                        new_recv_obj = BatchTokenIDOut(
-                            [recv_obj.rids[i]],
-                            [recv_obj.finished_reasons[i]] if len(recv_obj.finished_reasons)>i else None,
-                            [recv_obj.decoded_texts[i]] if len(recv_obj.decoded_texts)>i else None,
-                            [recv_obj.decode_ids[i]] if len(recv_obj.decode_ids)>i else None,
-                            [recv_obj.read_offsets[i]] if len(recv_obj.read_offsets)>i else None,
-                            [recv_obj.output_ids[i]] if recv_obj.output_ids and len(recv_obj.output_ids) > i else None,
-                            [recv_obj.skip_special_tokens[i]] if len(recv_obj.skip_special_tokens) > i else None,
-                            [recv_obj.spaces_between_special_tokens[i]] if len(recv_obj.spaces_between_special_tokens) > i else None,
-                            [recv_obj.no_stop_trim[i]] if len(recv_obj.no_stop_trim) > i else None,
-                            [recv_obj.prompt_tokens[i]] if len(recv_obj.prompt_tokens) > i else None,
-                            [recv_obj.completion_tokens[i]] if len(recv_obj.completion_tokens) > i else None,
-                            [recv_obj.cached_tokens[i]] if len(recv_obj.cached_tokens) > i else None,
-                            [recv_obj.spec_verify_ct[i]] if len(recv_obj.spec_verify_ct) > i else None,
-                            [recv_obj.input_token_logprobs_val[i]] if recv_obj.input_token_logprobs_val else None,
-                            [recv_obj.input_token_logprobs_idx[i]] if recv_obj.input_token_logprobs_idx else None,
-                            [recv_obj.output_token_logprobs_val[i]] if recv_obj.output_token_logprobs_val else None,
-                            [recv_obj.output_token_logprobs_idx[i]] if recv_obj.output_token_logprobs_idx else None,
-                            [recv_obj.input_top_logprobs_val[i]] if recv_obj.input_top_logprobs_val else None,
-                            [recv_obj.input_top_logprobs_idx[i]] if recv_obj.input_top_logprobs_idx else None,
-                            [recv_obj.output_top_logprobs_val[i]] if recv_obj.output_top_logprobs_val else None,
-                            [recv_obj.output_top_logprobs_idx[i]] if recv_obj.output_top_logprobs_idx else None,
-                            [recv_obj.input_token_ids_logprobs_val[i]] if recv_obj.input_token_ids_logprobs_val else None,
-                            [recv_obj.input_token_ids_logprobs_idx[i]] if recv_obj.input_token_ids_logprobs_idx else None,
-                            [recv_obj.output_token_ids_logprobs_val[i]] if recv_obj.output_token_ids_logprobs_val else None,
-                            [recv_obj.output_token_ids_logprobs_idx[i]] if recv_obj.output_token_ids_logprobs_idx else None,
-                            [recv_obj.output_hidden_states[i]] if recv_obj.output_hidden_states else None 
-                        )
-                    else:
-                        new_recv_obj= BatchEmbeddingOut(
-                            [recv_obj.rids[i]],
-                            [recv_obj.finished_reasons[i]] if len(recv_obj.finished_reasons) > i else None,
-                            [recv_obj.embeddings[i]] if len(recv_obj.embeddings) > i else None,
-                            [recv_obj.prompt_tokens[i]] if len(recv_obj.prompt_tokens) > i else None,
-                            [recv_obj.cached_tokens[i]] if len(recv_obj.cached_tokens) > i else None,
-                        )
-                    try:
-                        self.tokenizer_mapping[worker_id].send_pyobj(new_recv_obj)
-                    except zmq.ZMQError as e:
-                        raise RuntimeError(
-                            f"Failed to send result to worker {worker_id}: {e}"
-                        ) from e
+                    new_recv_obj = recv_obj
+                try:
+                    self.tokenizer_mapping[worker_id].send_pyobj(new_recv_obj)
+                except zmq.ZMQError as e:
+                    raise RuntimeError(
+                        f"Failed to send result to worker {worker_id}: {e}"
+                    ) from e
 
     def _handle_batch_output(
         self,
