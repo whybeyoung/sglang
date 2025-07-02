@@ -245,7 +245,6 @@ class TokenizerManager:
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
 
-
         self.worker_id = os.getpid()
         # Read model args
         self.model_path = server_args.model_path
@@ -1443,7 +1442,7 @@ class TokenizerManager:
         for retry in range(max_retries):
             try:
                 # Read tokenizer mapping information
-                tokenizer_mapping_data = read_from_shared_memory(  
+                tokenizer_mapping_data = read_from_shared_memory(
                     f"tokenizer_mapping_{main_pid}"
                 )
                 ipc_mapping = deserialize_tokenizer_mapping(tokenizer_mapping_data)
@@ -1463,11 +1462,11 @@ class TokenizerManager:
                     for worker_id, ipc_name in ipc_mapping.items():
                         worker_id_int = int(worker_id)
                         if worker_id_int not in self.tokenizer_mapping:
-                            socket = get_zmq_socket( 
+                            socket = get_zmq_socket(
                                 self._zmq_context, zmq.PUSH, ipc_name, False
                             )
                             self.tokenizer_mapping[worker_id_int] = socket
-                            print( 
+                            print(
                                 f"Created ZMQ socket for worker {worker_id} with ipc_name {ipc_name}"
                             )
                         else:
@@ -2247,11 +2246,6 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            if (
-                self._server_args
-                and self._server_args.worker_num > 1
-                and obj.rids is None
-            ):
             if (
                 self._server_args
                 and self._server_args.worker_num > 1
