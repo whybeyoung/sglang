@@ -122,12 +122,7 @@ class DetokenizerManager:
                 packed = msgpack.packb(asdict(output), use_bin_type=True)
                 #  send to go tokenizer
                 self.send_to_go_tokenizer.send(packed)
-            else:
-                self.send_to_tokenizer.send_pyobj(output)
-
-            # prefill 也会发送回 tm
-            if not self.is_decode:
-                self.send_to_tokenizer.send_pyobj(output)
+            self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
