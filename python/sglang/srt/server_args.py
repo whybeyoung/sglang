@@ -585,7 +585,10 @@ class ServerArgs:
             help="The port of the HTTP server.",
         )
         parser.add_argument(
-            "--worker-num", type=int, default=ServerArgs.worker_num, help="The worker num of the server."
+            "--worker-num",
+            type=int,
+            default=ServerArgs.worker_num,
+            help="The worker num of the server.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -1723,7 +1726,7 @@ class PortArgs:
     metrics_ipc_name: str
 
     # The ipc filename for Tokenizer and worker tokenizer
-    tokenizer_worker_ipc_name:Optional[str]
+    tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
@@ -1745,7 +1748,7 @@ class PortArgs:
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                tokenizer_worker_ipc_name=None
+                tokenizer_worker_ipc_name=None,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -1776,10 +1779,12 @@ class PortArgs:
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
-                tokenizer_worker_ipc_name=None
+                tokenizer_worker_ipc_name=None,
             )
         if server_args.worker_num > 1:
-            port_args.tokenizer_worker_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            port_args.tokenizer_worker_ipc_name = (
+                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            )
         return port_args
 
 

@@ -18,19 +18,20 @@ This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
+import ctypes
 import dataclasses
 import json
 import logging
 import multiprocessing as multiprocessing
 import os
+import sys
 import tempfile
 import threading
 import time
 from http import HTTPStatus
+from multiprocessing import Lock, Manager, Value, shared_memory
 from typing import AsyncIterator, Callable, Dict, Optional
-from multiprocessing import shared_memory, Lock, Value, Manager
-import ctypes
-import sys
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -126,6 +127,7 @@ def set_global_state(global_state: _GlobalState):
     global _global_state
     _global_state = global_state
 
+
 def serialize_port_args(port_args: PortArgs) -> dict:
     """Serialize PortArgs into a shareable dictionary"""
     return {
@@ -134,33 +136,39 @@ def serialize_port_args(port_args: PortArgs) -> dict:
         "detokenizer_ipc_name": port_args.detokenizer_ipc_name,
         "nccl_port": port_args.nccl_port,
         "rpc_ipc_name": port_args.rpc_ipc_name,
-        "metrics_ipc_name":port_args.metrics_ipc_name,
-        "tokenizer_worker_ipc_name":port_args.tokenizer_worker_ipc_name
+        "metrics_ipc_name": port_args.metrics_ipc_name,
+        "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
     }
+
 
 def deserialize_port_args(data: dict) -> PortArgs:
     """Deserialize PortArgs from a shared dictionary"""
     return PortArgs(**data)
 
+
 def serialize_server_args(server_args: ServerArgs) -> dict:
     """Serialize ServerArgs into a shareable dictionary"""
     return dataclasses.asdict(server_args)
+
 
 def deserialize_server_args(data: dict) -> ServerArgs:
     """Deserialize ServerArgs from a shared dictionary"""
     return ServerArgs(**data)
 
+
 def serialize_scheduler_info(scheduler_info: Dict) -> dict:
     """Serialize scheduler_info into a shareable dictionary"""
     return scheduler_info
+
 
 def deserialize_scheduler_info(data: dict) -> Dict:
     """Deserialize scheduler_info from a shared dictionary"""
     return data
 
+
 def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
     """Write data to shared memory"""
-    serialized = json.dumps(data).encode('utf-8')
+    serialized = json.dumps(data).encode("utf-8")
     size = len(serialized)
     try:
         # Try to open existing shared memory
@@ -177,33 +185,41 @@ def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
     shm.buf[:size] = serialized
     return shm
 
+
 def read_from_shared_memory(name: str) -> dict:
     """Read data from shared memory"""
     try:
         shm = shared_memory.SharedMemory(name=name)
-        data = json.loads(bytes(shm.buf).decode('utf-8'))
+        data = json.loads(bytes(shm.buf).decode("utf-8"))
         shm.close()
         return data
     except FileNotFoundError:
         raise FileNotFoundError(f"Shared memory {name} not found")
 
+
 def get_main_process_id() -> int:
     """Get the main process ID"""
     return multiprocessing.current_process()._parent_pid
+
 
 def serialize_tokenizer_mapping(mapping: Dict[int, str]) -> dict:
     """Serialize tokenizer_ipc_name mapping into a shareable dictionary"""
     return mapping
 
+
 def deserialize_tokenizer_mapping(data: dict) -> Dict[int, str]:
     """Deserialize tokenizer_ipc_name mapping from a shared dictionary"""
     return data
+
 
 def create_shared_lock() -> Lock:
     """Create a shared lock"""
     return Lock()
 
-def update_tokenizer_mapping(worker_id: int, ipc_name: str, shm_name: str, lock_value: Value) -> tuple[shared_memory.SharedMemory, int]:
+
+def update_tokenizer_mapping(
+    worker_id: int, ipc_name: str, shm_name: str, lock_value: Value
+) -> tuple[shared_memory.SharedMemory, int]:
     """Update or create the tokenizer_ipc_name mapping"""
     with lock_value.get_lock():  # Use a shared lock to ensure inter-process synchronization
         try:
@@ -224,6 +240,7 @@ def update_tokenizer_mapping(worker_id: int, ipc_name: str, shm_name: str, lock_
             shm_name,
         )
         return shm, len(mapping)
+
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
@@ -270,13 +287,17 @@ async def lifespan(fast_api_app: FastAPI):
             try:
                 port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
                 server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
-                scheduler_info_data = read_from_shared_memory(f"scheduler_info_{main_pid}")
+                scheduler_info_data = read_from_shared_memory(
+                    f"scheduler_info_{main_pid}"
+                )
                 lock_data = read_from_shared_memory(f"mapping_lock_{main_pid}")
                 # template_manager_data = read_from_shared_memory(f"tempalte_manager_{main_pid}")
                 break
             except FileNotFoundError as e:
                 if retry < max_retries - 1:
-                    print(f"Waiting for shared memory to be ready, retry {retry + 1}/{max_retries}")
+                    print(
+                        f"Waiting for shared memory to be ready, retry {retry + 1}/{max_retries}"
+                    )
                     time.sleep(retry_delay)
                 else:
                     raise Exception(f"Unable to access shared memory: {e}")
@@ -287,24 +308,26 @@ async def lifespan(fast_api_app: FastAPI):
         server_args = deserialize_server_args(server_args_data)
         scheduler_info = deserialize_scheduler_info(scheduler_info_data)
 
-        port_args.tokenizer_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        port_args.tokenizer_ipc_name = (
+            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        )
 
         # Use a shared lock to update the tokenizer_ipc_name mapping
         tokenizer_mapping_shm, mapping_len = update_tokenizer_mapping(
             pid,
             port_args.tokenizer_ipc_name,
             f"tokenizer_mapping_{main_pid}",
-            lock_value
+            lock_value,
         )
 
         # Launch tokenizer process
         tokenizer_manager = TokenizerManager(server_args, port_args, False)
         template_manager = TemplateManager()
         template_manager.initialize_templates(
-                tokenizer_manager=tokenizer_manager,
-                model_path=server_args.model_path,
-                chat_template=server_args.chat_template,
-                completion_template=server_args.completion_template,
+            tokenizer_manager=tokenizer_manager,
+            model_path=server_args.model_path,
+            chat_template=server_args.chat_template,
+            completion_template=server_args.completion_template,
         )
 
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
@@ -349,7 +372,7 @@ async def lifespan(fast_api_app: FastAPI):
         print(f"warmup_thread start")
 
         # Create a warmup thread for each worker
-        #if mapping_len == server_args.worker_num:
+        # if mapping_len == server_args.worker_num:
         warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             args=(
@@ -376,7 +399,9 @@ async def lifespan(fast_api_app: FastAPI):
                     tokenizer_mapping_shm.close()
                     # Check if other workers are still using this mapping
                     try:
-                        mapping = deserialize_tokenizer_mapping(read_from_shared_memory(f"tokenizer_mapping_{main_pid}"))
+                        mapping = deserialize_tokenizer_mapping(
+                            read_from_shared_memory(f"tokenizer_mapping_{main_pid}")
+                        )
                         if len(mapping) <= 1:  # If only the current worker is using it
                             tokenizer_mapping_shm.unlink()
                     except FileNotFoundError:
@@ -1102,7 +1127,9 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     port_args = PortArgs.init_new(server_args)
-    tokenizer_manager,template_manager, scheduler_info = _launch_subprocesses(server_args=server_args, port_args=port_args)
+    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+        server_args=server_args, port_args=port_args
+    )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -1110,7 +1137,7 @@ def launch_server(
             scheduler_info=scheduler_info,
         )
     )
-    if server_args.worker_num > 1 :
+    if server_args.worker_num > 1:
         # get main process ID
         main_pid = get_main_process_id()
         current_pid = os.getpid()
@@ -1121,26 +1148,21 @@ def launch_server(
 
         # Write port_args to shared memory
         port_args_shm = write_to_shared_memory(
-            serialize_port_args(port_args),
-            f"port_args_{os.getpid()}"
+            serialize_port_args(port_args), f"port_args_{os.getpid()}"
         )
         # Write server_args to shared memory
         server_args_shm = write_to_shared_memory(
-            serialize_server_args(server_args),
-            f"server_args_{os.getpid()}"
+            serialize_server_args(server_args), f"server_args_{os.getpid()}"
         )
         # Write lock value address to shared memory
         lock_shm = write_to_shared_memory(
-            {"lock_value": lock_value.value},
-            f"mapping_lock_{os.getpid()}"
+            {"lock_value": lock_value.value}, f"mapping_lock_{os.getpid()}"
         )
 
         # Write scheduler_info to shared memory
         scheduler_info_shm = write_to_shared_memory(
-            serialize_scheduler_info(scheduler_info),
-            f"scheduler_info_{os.getpid()}"
+            serialize_scheduler_info(scheduler_info), f"scheduler_info_{os.getpid()}"
         )
-
 
         port_args_shm.close()
         server_args_shm.close()
@@ -1188,14 +1210,14 @@ def launch_server(
         # Listen for HTTP requests
         if server_args.worker_num > 1:
             uvicorn.run(
-            "sglang.srt.entrypoints.http_server:app",
-            host=server_args.host,
-            port=server_args.port,
-            log_level=server_args.log_level_http or server_args.log_level,
-            timeout_keep_alive=5,
-            loop="uvloop",
-            workers=server_args.worker_num,
-        )
+                "sglang.srt.entrypoints.http_server:app",
+                host=server_args.host,
+                port=server_args.port,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+                workers=server_args.worker_num,
+            )
         else:
             uvicorn.run(
                 app,

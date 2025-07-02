@@ -24,7 +24,6 @@ import psutil
 import setproctitle
 import zmq
 
-
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
@@ -109,8 +108,6 @@ class DetokenizerManager:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             self.send_to_tokenizer.send_pyobj(output)
-
-
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
