@@ -212,8 +212,7 @@ class TokenizerManager:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        if server_args.worker_num > 1:
-            if self.is_main:
+        if server_args.worker_num > 1 and self.is_main:
                 # Start handle_loop simultaneously
                 self._loop = asyncio.new_event_loop()
                 self._thread = threading.Thread(target=self._run_loop, daemon=True)
