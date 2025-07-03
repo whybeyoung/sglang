@@ -15,12 +15,9 @@
 
 import dataclasses
 import logging
-import multiprocessing
 import os
 import signal
-import time
 from collections import OrderedDict
-from multiprocessing import shared_memory
 from typing import Dict, List, Union
 
 import psutil
@@ -56,8 +53,6 @@ logger = logging.getLogger(__name__)
 DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
 
 
-
-
 @dataclasses.dataclass
 class DecodeStatus:
     """Store the status of incremental decoding."""
@@ -86,6 +81,7 @@ class DetokenizerManager:
         self.send_to_tokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
+
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -98,7 +94,7 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.is_dummy = server_args.load_format == "dummy"
-        self.worker_num = server_args.worker_num
+
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
