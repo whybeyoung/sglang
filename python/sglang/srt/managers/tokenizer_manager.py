@@ -227,8 +227,11 @@ class TokenizerManager:
                     self.router_worker_obj(), self._loop
                 )
                 # Start handle_loop simultaneously
+                self._loop_recv = asyncio.new_event_loop()
+                self._thread_recv = threading.Thread(target=self._loop_recv.run_forever, daemon=True)
+                self._thread_recv.start()
                 self._handle_task = asyncio.run_coroutine_threadsafe(
-                    print_exception_wrapper(self.handle_loop), self._loop
+                    print_exception_wrapper(self.handle_loop), self._loop_recv
                 )
 
             else:
