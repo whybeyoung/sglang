@@ -453,11 +453,6 @@ class TokenizerManager:
     def _run_loop(self):
         self._loop.run_forever()
 
-    async def router_worker_obj(self):
-        while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
-            await self.send_to_scheduler.send_pyobj(recv_obj)
-
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
