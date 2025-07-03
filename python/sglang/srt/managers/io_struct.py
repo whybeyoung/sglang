@@ -741,6 +741,8 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     # The format to load the weights
     load_format: Optional[str] = None
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
     rids: Optional[Union[List[str], str]] = None
 
 
@@ -758,7 +760,14 @@ class UpdateWeightsFromDistributedReqInput:
     name: str
     dtype: str
     shape: List[int]
+    # The group name
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
     rids: Optional[Union[List[str], str]] = None
+
 
 
 @dataclass
@@ -781,6 +790,8 @@ class UpdateWeightsFromTensorReqInput:
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
     rids: Optional[Union[List[str], str]] = None
 
 
@@ -868,7 +879,9 @@ class SlowDownReqOutput:
 @dataclass
 class AbortReq:
     # The request id
-    rid: str
+    rid: str = ""
+    # Whether to abort all requests
+    abort_all: bool = False
     rids: Optional[Union[List[str], str]] = None
 
 

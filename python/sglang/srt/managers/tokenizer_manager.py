@@ -308,12 +308,13 @@ class TokenizerManager:
         # Start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
+            if self.is_main:
+                kv_bootstrap_server_class = get_kv_class(
+                    self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
+                )
+                self.bootstrap_server = kv_bootstrap_server_class(
+                    self.server_args.disaggregation_bootstrap_port
+                )
 
         # For load balancing
         self.current_load = 0
@@ -448,26 +449,6 @@ class TokenizerManager:
                 (HealthCheckOutput, lambda x: None),
             ]
         )
-
-        # For pd disaggregtion
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        # Start kv boostrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
-
-        self.current_load = 0
-        self.current_load_lock = asyncio.Lock()
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -932,10 +913,10 @@ class TokenizerManager:
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
-    def abort_request(self, rid: str):
-        if rid not in self.rid_to_state:
+    def abort_request(self, rid: str = "", abort_all: bool = False):
+        if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid)
+        req = AbortReq(rid, abort_all)
         self.send_to_scheduler.send_pyobj(req)
 
         if self.enable_metrics:
@@ -1000,6 +981,9 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
         if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
@@ -1055,6 +1039,9 @@ class TokenizerManager:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
@@ -1070,6 +1057,9 @@ class TokenizerManager:
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -1426,7 +1416,9 @@ class TokenizerManager:
                     f"tokenizer_mapping_{main_pid}"
                 )
                 ipc_mapping = deserialize_tokenizer_mapping(tokenizer_mapping_data)
-                print(f"Main TokenizerManager loaded tokenizer mapping: {ipc_mapping}")
+                logger.info(
+                    f"Main TokenizerManager loaded tokenizer mapping: {ipc_mapping}"
+                )
 
                 # Check if worker count matches
                 if len(ipc_mapping) >= self.server_args.worker_num:
@@ -1446,16 +1438,16 @@ class TokenizerManager:
                                 self._zmq_context, zmq.PUSH, ipc_name, False
                             )
                             self.tokenizer_mapping[worker_id_int] = socket
-                            print(
+                            logger.info(
                                 f"Created ZMQ socket for worker {worker_id} with ipc_name {ipc_name}"
                             )
                         else:
-                            print(
+                            logger.info(
                                 f"ZMQ socket for worker {worker_id} already exists, skipping creation"
                             )
                     break  # Successfully loaded all workers, exit retry loop
                 else:
-                    print(
+                    logger.info(
                         f"Waiting for all workers to register... Current: {len(ipc_mapping)}/{self.server_args.worker_num}"
                     )
                     if retry < max_retries - 1:
@@ -1468,7 +1460,7 @@ class TokenizerManager:
                         )
             except Exception as e:
                 if retry < max_retries - 1:
-                    print(
+                    logger.info(
                         f"Failed to load tokenizer mapping, retrying in {retry_interval} seconds: {e}"
                     )
                     time.sleep(retry_interval)
@@ -1480,7 +1472,7 @@ class TokenizerManager:
     async def _distribute_result_to_workers(self, recv_obj):
         """Distribute result to corresponding workers based on rid"""
         if not hasattr(self, "tokenizer_mapping") or not self.tokenizer_mapping:
-            print("Tokenizer mapping not available, reloading...")
+            logger.info("Tokenizer mapping not available, reloading...")
             self._load_tokenizer_mapping()
 
         # Extract worker_id from rid
@@ -1495,7 +1487,9 @@ class TokenizerManager:
         for i, worker_id in enumerate(worker_ids):
             if worker_id not in self.tokenizer_mapping:
                 # Worker not found in mapping, reload and retry
-                print(f"Worker {worker_id} not found in mapping, reloading...")
+                logger.info(
+                        f"Worker {worker_id} not found in mapping, reloading..."
+                    )
                 self._load_tokenizer_mapping()
             if worker_id not in self.tokenizer_mapping:
                 raise RuntimeError(f"socket not found for worker_id: {worker_id}")
@@ -2058,7 +2052,23 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
-        self.rid_to_state.pop(recv_obj.rid, None)
+        state = self.rid_to_state[recv_obj.rid]
+        state.finished = True
+        state.out_list.append(
+            {
+                "text": "",
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {
+                        "type": "abort",
+                        "message": "Abort before prefill",
+                    },
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                },
+            }
+        )
+        state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
