@@ -214,35 +214,17 @@ class TokenizerManager:
         )
         if server_args.worker_num > 1:
             if self.is_main:
-                self.send_to_scheduler = get_zmq_socket(
-                    context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-                )
-                self.receive_from_worker = get_zmq_socket(
-                    context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
-                )
+                # Start handle_loop simultaneously
                 self._loop = asyncio.new_event_loop()
                 self._thread = threading.Thread(target=self._run_loop, daemon=True)
                 self._thread.start()
                 self._task = asyncio.run_coroutine_threadsafe(
-                    self.router_worker_obj(), self._loop
-                )
-                # Start handle_loop simultaneously
-                self._loop_recv = asyncio.new_event_loop()
-                self._thread_recv = threading.Thread(target=self._loop_recv.run_forever, daemon=True)
-                self._thread_recv.start()
-                self._handle_task = asyncio.run_coroutine_threadsafe(
-                    print_exception_wrapper(self.handle_loop), self._loop_recv
+                    print_exception_wrapper(self.handle_loop), self._loop
                 )
 
-            else:
-                # actual send to main receiver_from_worker
-                self.send_to_scheduler = get_zmq_socket(
-                    context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
-                )
-        else:
-            self.send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-            )
+        self.send_to_scheduler = get_zmq_socket(
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, False
+        )
 
         self.worker_id = os.getpid()
         # Read model args
