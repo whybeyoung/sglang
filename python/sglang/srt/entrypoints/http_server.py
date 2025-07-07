@@ -138,6 +138,7 @@ def serialize_port_args(port_args: PortArgs) -> dict:
         "rpc_ipc_name": port_args.rpc_ipc_name,
         "metrics_ipc_name": port_args.metrics_ipc_name,
         "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
+        "go_tokenizer_ipc_name": port_args.go_tokenizer_ipc_name,
     }
 
 
