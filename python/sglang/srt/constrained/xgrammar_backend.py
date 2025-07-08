@@ -65,7 +65,7 @@ class XGrammarGrammar(BaseGrammarObject):
             accepted = self.matcher.accept_token(token)
             if not accepted:
                 # log for debugging
-                raise ValueError(
+                logger.info(
                     f"Tokens not accepted: {token}\n"
                     f"Accepted tokens: {self.accepted_tokens}\n"
                     f"Key string: {self.key_string}"
