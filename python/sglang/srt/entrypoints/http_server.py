@@ -98,7 +98,7 @@ from sglang.srt.utils import (
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
-    set_uvicorn_logging_configs,
+    set_uvicorn_logging_configs, ServerStatus,
 )
 from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
@@ -220,8 +220,12 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 @app.get("/health")
 async def health() -> Response:
-    """Check the health of the http server."""
-    return Response(status_code=200)
+    """Check the status of the http server."""
+    code = HTTPStatus.SERVICE_UNAVAILABLE.value
+    if _global_state.tokenizer_manager.server_status == ServerStatus.Up:
+        code = HTTPStatus.OK.value
+    return Response(status_code=code, content= json.dumps({"status": _global_state.tokenizer_manager.server_status.value}))
+
 
 
 @app.get("/health_generate")
@@ -405,7 +409,7 @@ async def flush_cache():
     ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
@@ -836,10 +840,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
             ]
             break
     image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+                     instance.get("image_data")
+                     for instance in vertex_req.instances
+                     if instance.get("image_data") is not None
+                 ] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
@@ -981,7 +985,8 @@ def _execute_server_warmup(
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         #kill_process_tree(os.getpid())
-        return
+        _global_state.tokenizer_manager.server_status = ServerStatus.Crashed
+        return success
 
     model_info = res.json()
 
@@ -1021,7 +1026,11 @@ def _execute_server_warmup(
                 headers=headers,
                 timeout=600,
             )
-            assert res.status_code == 200, f"{res}"
+            if res.status_code == 200:
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            else:
+                _global_state.tokenizer_manager.server_status = ServerStatus.Crashed
+            print(f"{res}")
         else:
             logger.info(f"Start of prefill warmup ...")
             json_data = {
@@ -1034,11 +1043,14 @@ def _execute_server_warmup(
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    i * (2 ** 63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)
                 ],
                 "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
             }
+            if server_args.disaggregation_mode == "decode" and server_args.enable_go_zmq_recv:
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -1046,16 +1058,16 @@ def _execute_server_warmup(
                 timeout=1800,  # because of deep gemm precache is very long if not precache.
             )
             logger.info(
-                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
+                f"End of warmup with status {res.status_code}, resp: {res.json()}"
             )
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        #kill_process_tree(os.getpid())
-        return
+        return False
 
     # Debug print
     # logger.info(f"warmup request returns: {res.json()=}")

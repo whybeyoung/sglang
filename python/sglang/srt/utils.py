@@ -90,6 +90,15 @@ logger = logging.getLogger(__name__)
 show_time_cost = False
 time_infos = {}
 
+#########################
+# Constants & Enums
+#########################
+class ServerStatus(Enum):
+    Up = "Up"
+    Starting = "Starting"
+    UnHealthy = "UnHealthy"
+    Crashed = "Crashed"
+
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 

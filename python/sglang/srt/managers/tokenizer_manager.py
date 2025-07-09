@@ -49,6 +49,7 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.utils import ServerStatus
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
@@ -174,6 +175,8 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        # Server Status
+        self.server_status = ServerStatus.Starting
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
