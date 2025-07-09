@@ -218,7 +218,7 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 ##### Native API endpoints #####
 
 
-@app.get("/status")
+@app.get("/health")
 async def health() -> Response:
     """Check the status of the http server."""
     code = HTTPStatus.SERVICE_UNAVAILABLE.value
@@ -226,11 +226,6 @@ async def health() -> Response:
         code = HTTPStatus.OK.value
     return Response(status_code=code, content= json.dumps({"status": _global_state.tokenizer_manager.server_status.value}))
 
-
-@app.get("/health")
-async def health() -> Response:
-    """Check the health of the http server."""
-    return Response(status_code=200)
 
 
 @app.get("/health_generate")
