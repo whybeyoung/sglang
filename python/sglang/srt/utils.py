@@ -108,7 +108,7 @@ HIP_FP8_E4M3_FNUZ_MAX = 224.0
 _warned_bool_env_var_keys = set()
 
 def report_health(status: ServerStatus, host: str,  http_port: int, msg: str=""):
-    requests.post(f"http://{host}:{http_port}/health", json={"status": status})
+    requests.post(f"http://{host}:{http_port}/health", json={"status": status.value, "msg": msg})
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
