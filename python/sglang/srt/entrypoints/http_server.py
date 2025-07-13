@@ -1053,7 +1053,6 @@ def _execute_server_warmup(
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        _global_state.tokenizer_manager.server_status = ServerStatus.Crashed
 
         # kill_process_tree(os.getpid())
         return
