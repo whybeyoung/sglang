@@ -85,7 +85,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    VertexGenerateReqInput,
+    VertexGenerateReqInput, ReportHealthInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -226,7 +226,14 @@ async def health() -> Response:
         code = HTTPStatus.OK.value
     return Response(status_code=code, content= json.dumps({"status": _global_state.tokenizer_manager.server_status.value}))
 
-
+@app.post("/health")
+async def health_update(obj:ReportHealthInput, request: Request) -> Response:
+    """Update the Status of the http server."""
+    server_status = obj.status
+    _global_state.tokenizer_manager.server_status = server_status
+    if server_status != ServerStatus.Up:
+        return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, content = obj.msg)
+    return Response(server_status=HTTPStatus.OK.value)
 
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:

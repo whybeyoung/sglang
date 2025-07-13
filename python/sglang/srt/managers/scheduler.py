@@ -157,7 +157,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
     set_random_seed,
-    suppress_other_loggers,
+    suppress_other_loggers, report_health, ServerStatus,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -2752,3 +2752,4 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+        report_health(ServerStatus.Crashed, server_args.host, ServerArgs.port)
