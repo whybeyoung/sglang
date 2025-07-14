@@ -207,6 +207,8 @@ class TokenizerManager:
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
+        self._updating = False
+        self._cond = asyncio.Condition()
 
         if self.model_config.is_multimodal:
             import_processors()
@@ -287,6 +289,20 @@ class TokenizerManager:
             self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
             )
+            is_create_store = (
+                self.server_args.node_rank == 0
+                and self.server_args.disaggregation_transfer_backend == "ascend"
+            )
+            if is_create_store:
+                try:
+                    from mf_adapter import create_config_store
+
+                    ascend_url = os.getenv("ASCEND_MF_STORE_URL")
+                    create_config_store(ascend_url)
+                except Exception as e:
+                    error_message = f"Failed create mf store, invalid ascend_url."
+                    error_message += f" With exception {e}"
+                    raise error_message
 
         # For load balancing
         self.current_load = 0
@@ -425,6 +441,9 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
@@ -589,7 +608,7 @@ class TokenizerManager:
             sampling_kwargs = obj.sampling_params
         sampling_params = SamplingParams(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
-        sampling_params.verify()
+        sampling_params.verify(self.model_config.vocab_size)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -873,6 +892,7 @@ class TokenizerManager:
     async def start_profile(
         self,
         output_dir: Optional[str] = None,
+        start_step: Optional[int] = None,
         num_steps: Optional[int] = None,
         activities: Optional[List[str]] = None,
         with_stack: Optional[bool] = None,
@@ -885,6 +905,7 @@ class TokenizerManager:
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
+            start_step=start_step,
             num_steps=num_steps,
             activities=activities,
             with_stack=with_stack,
@@ -916,6 +937,16 @@ class TokenizerManager:
     async def dump_expert_distribution_record(self):
         self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+
+    async def pause_generation(self):
+        async with self._cond:
+            self._updating = True
+            self.abort_request(abort_all=True)
+
+    async def continue_generation(self):
+        async with self._cond:
+            self._updating = False
+            self._cond.notify_all()
 
     async def update_weights_from_disk(
         self,
@@ -1163,6 +1194,7 @@ class TokenizerManager:
                     [
                         "text",
                         "output_ids",
+                        "embedding",
                     ]
                 )
             elif self.log_requests_level == 1:
@@ -1181,6 +1213,7 @@ class TokenizerManager:
                     [
                         "text",
                         "output_ids",
+                        "embedding",
                     ]
                 )
             elif self.log_requests_level == 2:
