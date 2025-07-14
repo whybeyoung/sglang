@@ -660,6 +660,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             logger.warning(
                 f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
+            report_health(ServerStatus.Crashed, server_args.host, ServerArgs.port)
 
     signal.signal(signal.SIGCHLD, sigchld_handler)
 
