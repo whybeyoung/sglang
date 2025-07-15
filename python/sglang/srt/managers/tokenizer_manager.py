@@ -895,7 +895,8 @@ class TokenizerManager:
 
         if self.enable_metrics:
             self.metrics_collector.observe_one_aborted_request()
-
+        # add for clean rid_to_state
+        del self.rid_to_state[rid]
     async def start_profile(
         self,
         output_dir: Optional[str] = None,
