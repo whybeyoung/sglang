@@ -241,7 +241,7 @@ async def health_update(obj:ReportHealthInput, request: Request) -> Response:
             return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, content = obj.msg)
     except:
         pass
-    return Response(server_status=HTTPStatus.OK.value)
+    return Response(status_code=HTTPStatus.OK.value)
 
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
