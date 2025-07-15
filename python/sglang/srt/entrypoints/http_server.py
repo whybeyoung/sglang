@@ -234,10 +234,13 @@ async def health() -> Response:
 @app.post("/health")
 async def health_update(obj:ReportHealthInput, request: Request) -> Response:
     """Update the Status of the http server."""
-    server_status = obj.status
-    _global_state.tokenizer_manager.server_status = server_status
-    if server_status != ServerStatus.Up:
-        return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, content = obj.msg)
+    try:
+        server_status = ServerStatus(obj.status)
+        _global_state.tokenizer_manager.server_status = server_status
+        if server_status != ServerStatus.Up:
+            return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, content = obj.msg)
+    except:
+        pass
     return Response(server_status=HTTPStatus.OK.value)
 
 @app.get("/health_generate")
