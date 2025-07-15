@@ -435,6 +435,13 @@ class TokenizerManager:
             ]
         )
 
+    def get_background_tasks_stats(self):
+        """获取后台任务统计信息"""
+        return {
+            "active_asyncio_tasks": len(self.asyncio_tasks),
+            "active_requests": len(self.rid_to_state),
+            "finished_requests": sum(1 for state in self.rid_to_state.values() if state.finished)
+        }
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],

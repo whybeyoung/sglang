@@ -217,6 +217,11 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 ##### Native API endpoints #####
 
+@app.get("/task_stats")
+async def get_task_stats():
+    """Get the task"""
+    stats = _global_state.tokenizer_manager.get_background_tasks_stats()
+    return Response(status_code=200, content=json.dumps(stats))
 
 @app.get("/health")
 async def health() -> Response:
