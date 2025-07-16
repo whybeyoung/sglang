@@ -896,7 +896,8 @@ class TokenizerManager:
         if self.enable_metrics:
             self.metrics_collector.observe_one_aborted_request()
         # add for clean rid_to_state
-        del self.rid_to_state[rid]
+        if self.server_args.disaggregation_mode == "decode" and self.server_args.enable_go_zmq_recv:
+            del self.rid_to_state[rid]
     async def start_profile(
         self,
         output_dir: Optional[str] = None,
