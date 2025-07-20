@@ -2407,6 +2407,7 @@ class Scheduler(
         )
 
     def abort_request(self, recv_req: AbortReq):
+        logger.debug(f"Recving Abort request. {recv_req.rid=}")
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -2448,6 +2449,8 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_abort = True
+            elif recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                logger.debug(f"Abort running request. But Finished {req.rid=}")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
