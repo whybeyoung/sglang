@@ -2413,7 +2413,7 @@ class Scheduler(
         for i, req in enumerate(self.waiting_queue):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
-
+        logger.debug(f"waiting queue request. {[r.rid for r in self.waiting_queue]}")
         # Sort in reverse order to avoid index issues when deleting
         for i in reversed(to_del):
             # Abort method 1: directly pop from the queue
@@ -2439,6 +2439,8 @@ class Scheduler(
             reqs = self.running_batch.reqs
         else:
             reqs = self.running_batch.reqs + self.cur_batch.reqs
+
+        logger.debug(f"running request. {[r.rid for r in reqs]}")
 
         for req in reqs:
             if not req.finished() and (
