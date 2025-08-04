@@ -97,6 +97,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    MultiTokenizerRegisterReq,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -246,7 +247,6 @@ class Scheduler(
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
-
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -520,6 +520,7 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
             ]
         )
 
@@ -1053,6 +1054,8 @@ class Scheduler(
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
                 else:
+                    if recv_req.rids is not None:
+                        output.rids = recv_req.rids
                     self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
@@ -2393,6 +2396,10 @@ class Scheduler(
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
 
+    def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return recv_req
+    
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:
@@ -2548,6 +2555,8 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
+
+
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:

@@ -775,12 +775,13 @@ class BatchEmbeddingOut:
 
 @dataclass
 class FlushCacheReqInput:
-    pass
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class FlushCacheReqOutput:
     success: bool
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -791,6 +792,7 @@ class UpdateWeightFromDiskReqInput:
     load_format: Optional[str] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -799,6 +801,7 @@ class UpdateWeightFromDiskReqOutput:
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: Optional[int] = 0
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -812,12 +815,15 @@ class UpdateWeightsFromDistributedReqInput:
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    rids: Optional[Union[List[str], str]] = None
+
 
 
 @dataclass
 class UpdateWeightsFromDistributedReqOutput:
     success: bool
     message: str
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -835,12 +841,14 @@ class UpdateWeightsFromTensorReqInput:
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class UpdateWeightsFromTensorReqOutput:
     success: bool
     message: str
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -857,23 +865,27 @@ class InitWeightsUpdateGroupReqInput:
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class InitWeightsUpdateGroupReqOutput:
     success: bool
     message: str
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class GetWeightsByNameReqInput:
     name: str
     truncate_size: int = 100
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class GetWeightsByNameReqOutput:
     parameter: list
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -881,11 +893,12 @@ class ReleaseMemoryOccupationReqInput:
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class ReleaseMemoryOccupationReqOutput:
-    pass
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -893,21 +906,23 @@ class ResumeMemoryOccupationReqInput:
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class ResumeMemoryOccupationReqOutput:
-    pass
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class SlowDownReqInput:
     forward_sleep_time: Optional[float]
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class SlowDownReqOutput:
-    pass
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -916,29 +931,37 @@ class AbortReq:
     rid: str = ""
     # Whether to abort all requests
     abort_all: bool = False
-    # The finished reason data
+
+    rids: Optional[Union[List[str], str]] = None
+
     finished_reason: Optional[Dict[str, Any]] = None
 
 
+    def __post_init__(self):
+        self.rids = self.rid
+
 @dataclass
 class GetInternalStateReq:
-    pass
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class GetInternalStateReqOutput:
     internal_state: Dict[Any, Any]
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class SetInternalStateReq:
     server_args: Dict[str, Any]
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class SetInternalStateReqOutput:
     updated: bool
     server_args: Dict[str, Any]
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -954,6 +977,7 @@ class ProfileReqInput:
     profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    rids: Optional[Union[List[str], str]] = None
 
 
 class ProfileReqType(Enum):
@@ -972,12 +996,14 @@ class ProfileReq:
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class ProfileReqOutput:
     success: bool
     message: str
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -986,27 +1012,32 @@ class ConfigureLoggingReq:
     log_requests_level: Optional[int] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class OpenSessionReqInput:
     capacity_of_str_len: int
     session_id: Optional[str] = None
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class CloseSessionReqInput:
     session_id: str
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class OpenSessionReqOutput:
     session_id: Optional[str]
     success: bool
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class HealthCheckOutput:
+    rids: Optional[Union[List[str], str]] = None
     pass
 
 
@@ -1018,7 +1049,7 @@ class ExpertDistributionReq(Enum):
 
 @dataclass
 class ExpertDistributionReqOutput:
-    pass
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -1043,18 +1074,21 @@ class ParseFunctionCallReq:
     tool_call_parser: Optional[str] = (
         None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
     )
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class SeparateReasoningReqInput:
     text: str  # The text to parse.
     reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
 class VertexGenerateReqInput:
     instances: List[dict]
     parameters: Optional[dict] = None
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -1075,6 +1109,9 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+
+    rids: Optional[Union[List[str], str]] = None
+
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
 
@@ -1090,6 +1127,9 @@ class LoadLoRAAdapterReqInput:
 class UnloadLoRAAdapterReqInput:
     # The name of lora module to unload.
     lora_name: str
+
+    rids: Optional[Union[List[str], str]] = None
+
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
 
@@ -1105,9 +1145,15 @@ class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
-
+    rids: Optional[Union[List[str], str]] = None
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+
+
+@dataclass
+class MultiTokenizerRegisterReq:
+    rids: Optional[Union[List[str], str]] = None
+    ipc_name: Optional[str] = None
 
 
 class BlockReqType(Enum):
@@ -1118,3 +1164,4 @@ class BlockReqType(Enum):
 @dataclass
 class BlockReqInput:
     type: BlockReqType
+
