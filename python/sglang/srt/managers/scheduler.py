@@ -158,6 +158,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -1067,7 +1068,7 @@ class Scheduler(
             and self.server_args.load_balance_method == "minimum_tokens"
         ):
             self.recv_dp_balance_id_this_term.append(recv_req.dp_balance_id)
-
+        print(f"[{datetime.datetime.now()}, shdule recv request: {recv_req.rid}]")
         # Create a new request
         if (
             recv_req.session_params is None
@@ -2399,7 +2400,7 @@ class Scheduler(
     def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
         self.send_to_detokenizer.send_pyobj(recv_req)
         return recv_req
-    
+
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:

@@ -23,6 +23,8 @@ from typing import Dict, List, Union
 import psutil
 import setproctitle
 import zmq
+import datetime
+
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -111,6 +113,7 @@ class DetokenizerManager:
             try:
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
                 output = self._request_dispatcher(recv_obj)
+                print(f"[{datetime.datetime.now()} send to tokenizer {recv_obj.rids}]")
                 if self.tokenizer_worker_num <= 1:
                     self.send_to_tokenizer.send_pyobj(output)
                 else:
@@ -119,10 +122,10 @@ class DetokenizerManager:
                         worker_ids = get_workerids_from_rids(recv_obj.rids)
                     else:
                         raise RuntimeError(f"tokenizer_worker_num > 1, recv_obj.rids must be list")
-                    
+
                     if not hasattr(self, "tokenizer_mapping"):
                         self.tokenizer_mapping = {}
-                    
+
                     # Create ZMQ context if needed
                     if not hasattr(self, "_zmq_context"):
                         self._zmq_context = zmq.Context()
@@ -142,7 +145,7 @@ class DetokenizerManager:
                         else:
                             if isinstance(recv_obj, MultiTokenizerRegisterReq):
                                 continue
-                        
+
                         # Create a new output object based on the type
                         if isinstance(output, BatchEmbeddingOut):
                             new_output = BatchEmbeddingOut(

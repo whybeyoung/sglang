@@ -27,7 +27,7 @@ import os
 import sys
 import tempfile
 import threading
-import time
+import time,datetime
 from http import HTTPStatus
 from multiprocessing import Lock, Manager, Value, shared_memory
 from typing import AsyncIterator, Callable, Dict, Optional
@@ -267,7 +267,7 @@ async def lifespan(fast_api_app: FastAPI):
             completion_template=server_args.completion_template,
         )
         # register multi tokenizer
-        tokenizer_manager.register_to_main_tokenizer_manager()  
+        tokenizer_manager.register_to_main_tokenizer_manager()
 
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
         set_global_state(
@@ -294,7 +294,7 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager
         )
 
-        
+
 
         if server_args.warmups is not None:
             logger.info("Warmup started")
@@ -972,6 +972,7 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    print(f"[{datetime.datetime.now()}] Frontend recv rid: {request.rid}")
     return await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )

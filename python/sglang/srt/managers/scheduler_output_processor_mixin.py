@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+import datetime
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -670,7 +671,7 @@ class SchedulerOutputProcessorMixin:
         if rids:
             if self.model_config.is_multimodal_gen:
                 return
-
+            print(f"[{datetime.datetime.now()}, send to detokenizer {rids}]")
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
                     rids,
