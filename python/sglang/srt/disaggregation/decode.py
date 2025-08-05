@@ -243,6 +243,7 @@ class DecodePreallocQueue:
                 bootstrap_room=req.bootstrap_room,
                 data_parallel_rank=req.data_parallel_rank,
             )
+            kv_receiver.set_request_id(req.rid)
 
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)

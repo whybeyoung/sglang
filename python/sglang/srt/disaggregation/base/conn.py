@@ -92,6 +92,8 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def set_request_id(self, rid):
+        self.rid = rid
 
 class BaseKVReceiver(ABC):
 
@@ -124,6 +126,8 @@ class BaseKVReceiver(ABC):
         """
         ...
 
+    def set_request_id(self, rid):
+        self.rid = rid
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod

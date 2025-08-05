@@ -13,7 +13,7 @@ import time
 from collections import defaultdict
 from functools import cache
 from typing import Dict, List, Optional, Tuple, Union
-
+import datetime
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -1264,6 +1264,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         return sock, lock
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+        print(f"[{datetime.datetime.now()}], Init dec {self.rid}")
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
@@ -1286,11 +1287,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
+                print(f"[{datetime.datetime.now()}], Poll Completed {self.rid}, status: {status}")
                 self.conclude_state = status
             elif status == KVPoll.WaitingForInput:
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
+                    print(f"[{datetime.datetime.now()}], Poll Wait input {self.rid}, status: {status}")
+
                     if elapsed >= self.kv_mgr.waiting_timeout:
                         logger.warning_once(
                             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
