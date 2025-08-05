@@ -1225,6 +1225,7 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
+        print(f"[{datetime.datetime.now()}, _add_request_to_queue: {req.rid}]")
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)

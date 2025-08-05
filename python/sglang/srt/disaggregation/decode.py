@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import require_mlp_sync
-
+import datetime
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -588,6 +588,8 @@ class DecodeTransferQueue:
                 continue
             elif poll == KVPoll.Success:
 
+                print(f"[{datetime.datetime.now()}], decode transfered: {decode_req.req.rid}")
+
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
@@ -709,6 +711,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
+            print(f"[{datetime.datetime.now()}, decode scheduler: { [r.rid for r in recv_reqs ] }]")
+
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
             last_batch_in_queue = False
