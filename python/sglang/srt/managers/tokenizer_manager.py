@@ -475,7 +475,7 @@ class TokenizerManager:
         created_time = time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
-
+        print(f"[{datetime.now()}, generate_request: {obj.rid}]")
         async with self._is_updating_cond:
             await self._is_updating_cond.wait_for(lambda: not self._is_updating)
 
@@ -1500,6 +1500,7 @@ class TokenizerManager:
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
+            print(f"[{datetime.now()}] recvf from dtokenizer {recv_obj.rids}")
             self.last_receive_tstamp = time.time()
 
     def _handle_batch_output(

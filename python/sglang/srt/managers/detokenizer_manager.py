@@ -43,7 +43,7 @@ from sglang.utils import (
     find_printable_text,
     get_exception_traceback,
 )
-
+import datetime
 logger = logging.getLogger(__name__)
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
@@ -109,6 +109,7 @@ class DetokenizerManager:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             self.send_to_tokenizer.send_pyobj(output)
+            print(f"[{datetime.datetime.now()}] Sent to tokenizer: {recv_obj.rids}")
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
