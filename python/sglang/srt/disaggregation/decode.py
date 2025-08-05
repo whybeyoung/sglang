@@ -711,7 +711,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
-            print(f"[{datetime.datetime.now()}, decode scheduler: { [r.rid for r in recv_reqs ] }]")
+            print(f"[{datetime.datetime.now()}, decode scheduler: { [r.rid for r in recv_reqs if hasattr(r,'rid')] }]")
 
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
