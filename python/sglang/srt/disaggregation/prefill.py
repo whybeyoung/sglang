@@ -150,7 +150,6 @@ class PrefillBootstrapQueue:
         else:
             kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
 
-        kv_sender_class.set_request_id(req.rid)
         dest_tp_ranks = [self.tp_rank]
 
         req.disagg_kv_sender = kv_sender_class(
@@ -160,6 +159,7 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
         )
+        req.disagg_kv_sender.set_request_id(req.rid)
         self._process_req(req)
         self.queue.append(req)
 
