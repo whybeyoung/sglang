@@ -2513,6 +2513,7 @@ class _Communicator(Generic[T]):
                     elif isinstance(obj.rids, list):
                         obj.rids = [f"{os.getpid()}_{rid}" for rid in obj.rids]
             self._sender.send_pyobj(obj)
+            print(f"tokenizer manager _Communicator __call__ obj:{obj}")
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -2538,9 +2539,12 @@ class _Communicator(Generic[T]):
             # If rids is a list, remove prefix from each element
             elif hasattr(recv_obj, "rids") and isinstance(recv_obj.rids, list):
                 recv_obj.rids = [get_origin_rid(rid) for rid in recv_obj.rids]
-
+        if self._result_values is None and isinstance(recv_obj, MultiTokenizerRegisterReq):
+            logger.warning("_result_values is None in handle_recv, ingore")
+            return
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
+            print(f"tokenizer manager handle_recv _result_event set")
             self._result_event.set()
 
 

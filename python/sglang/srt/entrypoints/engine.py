@@ -782,15 +782,30 @@ def _launch_subprocesses(
             )
         return None, None, None
 
-    # Launch detokenizer process
-    detoken_proc = mp.Process(
-        target=run_detokenizer_process,
-        args=(
-            server_args,
-            port_args,
-        ),
-    )
-    detoken_proc.start()
+    # Launch detokenizer processes
+    detoken_procs = []
+    for i in range(server_args.detokenizer_worker_num):
+        # Create a new port_args for each detokenizer worker
+        worker_port_args = PortArgs(
+            tokenizer_ipc_name=port_args.tokenizer_ipc_name,
+            scheduler_input_ipc_name=port_args.scheduler_input_ipc_name,
+            detokenizer_ipc_name= port_args.detokenizer_worker_ipc_name_list[i],
+            nccl_port=port_args.nccl_port,
+            rpc_ipc_name=port_args.rpc_ipc_name,
+            metrics_ipc_name=port_args.metrics_ipc_name,
+            tokenizer_worker_ipc_name=port_args.tokenizer_worker_ipc_name,
+            detokenizer_worker_ipc_name_list=[],
+        )
+        
+        detoken_proc = mp.Process(
+            target=run_detokenizer_process,
+            args=(
+                server_args,
+                worker_port_args,
+            ),
+        )
+        detoken_proc.start()
+        detoken_procs.append(detoken_proc)
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)

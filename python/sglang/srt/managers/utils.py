@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import multiprocessing as mp
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -140,3 +141,20 @@ class DPBalanceMeta:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._manager = None
+
+class RandomNumberGenerator:
+    def __init__(self, start=1, end=10):
+        self.start = start
+        self.end = end
+        self.sequence = list(range(start, end + 1))
+        random.shuffle(self.sequence)
+        self.index = 0 
+
+    def get_next(self):
+        if self.index >= len(self.sequence):
+            random.shuffle(self.sequence)
+            self.index = 0
+        
+        number = self.sequence[self.index]
+        self.index += 1
+        return number
