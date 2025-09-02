@@ -61,6 +61,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.utils import get_nth_detokenizer_worker_ipc_name
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -789,7 +790,7 @@ def _launch_subprocesses(
         worker_port_args = PortArgs(
             tokenizer_ipc_name=port_args.tokenizer_ipc_name,
             scheduler_input_ipc_name=port_args.scheduler_input_ipc_name,
-            detokenizer_ipc_name=util.get_nth_detokenizer_worker_ipc_name(port_args.detokenizer_ipc_name,i),
+            detokenizer_ipc_name= get_nth_detokenizer_worker_ipc_name(port_args.detokenizer_ipc_name,i),
             nccl_port=port_args.nccl_port,
             rpc_ipc_name=port_args.rpc_ipc_name,
             metrics_ipc_name=port_args.metrics_ipc_name,

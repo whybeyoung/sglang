@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-import hashlib
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -699,9 +698,7 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
                 if self.server_args.detokenizer_worker_num > 1:
-                    hash_obj = hashlib.md5(rid.encode('utf-8'))
-                    hash_int = int(hash_obj.hexdigest(), 16)  # 将16进制哈希转换为整数
-                    idx = hash_int % self.server_args.detokenizer_worker_num
+                    idx = abs(hash(req.rid)) % self.server_args.detokenizer_worker_num
                     print(f"stream_output_generation: send_to_detokenizer[{idx}]")
                     self.send_to_detokenizer[idx].send_pyobj(
                         BatchTokenIDOut(
@@ -741,11 +738,11 @@ class SchedulerOutputProcessorMixin:
                 req.log_time_stats()
 
         # Send to detokenizer
-        if self.server_args.detokenizer_worker_num = 1 and rids:
+        if self.server_args.detokenizer_worker_num == 1 and rids:
             if self.model_config.is_multimodal_gen:
                 return
 
-            self.send_to_detokenizer.send_pyobj(
+            self.send_to_detokenizer[0].send_pyobj(
                 BatchTokenIDOut(
                     rids,
                     finished_reasons,
@@ -797,17 +794,15 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
                 if self.server_args.detokenizer_worker_num > 1:
-                    hash_obj = hashlib.md5(req.rid.encode('utf-8'))
-                    hash_int = int(hash_obj.hexdigest(), 16)  # 将16进制哈希转换为整数
-                    idx = hash_int % self.server_args.detokenizer_worker_num
+                    idx = abs(hash(req.rid)) % self.server_args.detokenizer_worker_num
                     print(f"stream_output_embedding: send_to_detokenizer[{idx}]")
                     self.send_to_detokenizer[idx].send_pyobj(
                         BatchEmbeddingOut(
                             rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
                         )
                     )
-        if self.server_args.detokenizer_worker_num = 1:
-            self.send_to_detokenizer.send_pyobj(
+        if self.server_args.detokenizer_worker_num == 1:
+            self.send_to_detokenizer[0].send_pyobj(
                 BatchEmbeddingOut(
                     rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
                 )

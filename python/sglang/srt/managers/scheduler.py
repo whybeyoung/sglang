@@ -128,7 +128,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
+from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length, get_nth_detokenizer_worker_ipc_name
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
@@ -273,8 +273,9 @@ class Scheduler(
                 self.send_to_detokenizer = []
                 for i in range(self.server_args.detokenizer_worker_num):
                     self.send_to_detokenizer.append(get_zmq_socket(
-                        context, zmq.PUSH, util.get_nth_detokenizer_worker_ipc_name(port_args.detokenizer_ipc_name,i), False
+                        context, zmq.PUSH, get_nth_detokenizer_worker_ipc_name(port_args.detokenizer_ipc_name,i), False
                     ))
+                print(f"send_to_tokenizer:{self.send_to_detokenizer}")
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
