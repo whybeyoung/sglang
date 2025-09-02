@@ -19,6 +19,7 @@ import os
 import signal
 from collections import OrderedDict
 from typing import Dict, List, Union
+import datetime
 
 import psutil
 import setproctitle
@@ -112,6 +113,7 @@ class DetokenizerManager:
             try:
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
                 output = self._request_dispatcher(recv_obj)
+                print(f"{datetime.datetime.now()}, recv from scheduler: {recv_obj.rids}")
                 if self.tokenizer_worker_num <= 1:
                     self.send_to_tokenizer.send_pyobj(output)
                 else:

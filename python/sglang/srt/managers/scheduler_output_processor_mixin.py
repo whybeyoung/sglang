@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+import datetime
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -669,7 +670,7 @@ class SchedulerOutputProcessorMixin:
         if rids:
             if self.model_config.is_multimodal_gen:
                 return
-
+            print(f"{datetime.datetime.now()}, send to dtm: {rids}")
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
                     rids,
