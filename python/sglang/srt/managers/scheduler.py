@@ -246,6 +246,7 @@ class Scheduler(
             )
         )
 
+
         # Init model config
         self.model_config = ModelConfig.from_server_args(server_args)
 
@@ -270,9 +271,11 @@ class Scheduler(
                 )
             else:
                 # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
+                self.send_to_detokenizer = []
+                for i in range(self.server_args.detokenizer_worker_num):
+                    self.send_to_detokenizer.append(get_zmq_socket(
+                        context, zmq.PUSH, port_args.detokenizer_worker_ipc_name_list[i], False
+                    ))
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -2415,7 +2418,8 @@ class Scheduler(
         return result
 
     def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
-        self.send_to_detokenizer.send_pyobj(recv_req)
+        for i in range(self.server_args.detokenizer_worker_num):
+            self.send_to_detokenizer[i].send_pyobj(recv_req)
         return recv_req
 
     def slow_down(self, recv_req: SlowDownReqInput):

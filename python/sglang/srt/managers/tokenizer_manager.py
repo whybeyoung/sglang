@@ -175,7 +175,7 @@ class ReqState:
 
 
 _global_tokenizer_worker_num = 1
-
+_global_tokenizer_worker_id = 0
 
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
@@ -185,6 +185,7 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
         is_main: Optional[bool] = True,
+        tokenizer_worker_id: int =0,
     ):
         # Parse args
         self.server_args = server_args
@@ -199,7 +200,9 @@ class TokenizerManager:
         self.crash_dump_folder = server_args.crash_dump_folder
 
         self.is_main = is_main
-        self.worker_id = os.getpid()
+        self.worker_id = tokenizer_worker_id
+        global _global_tokenizer_worker_id
+        _global_tokenizer_worker_id = tokenizer_worker_id
 
         # Read model args
         self.model_path = server_args.model_path
@@ -2496,6 +2499,7 @@ class _Communicator(Generic[T]):
 
     async def __call__(self, obj):
         global _global_tokenizer_worker_num
+        global _global_tokenizer_worker_id
         ready_event = asyncio.Event()
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
@@ -2506,13 +2510,14 @@ class _Communicator(Generic[T]):
         if obj:
             if _global_tokenizer_worker_num > 1:
                 if obj.rids is None:
-                    obj.rids = f"{os.getpid()}_{uuid.uuid4().hex}_Communicator"
+                    obj.rids = f"{_global_tokenizer_worker_id}_{uuid.uuid4().hex}_Communicator"
                 else:
                     if isinstance(obj.rids, str):
-                        obj.rids = f"{os.getpid()}_{obj.rids}"
+                        obj.rids = f"{_global_tokenizer_worker_id}_{obj.rids}"
                     elif isinstance(obj.rids, list):
-                        obj.rids = [f"{os.getpid()}_{rid}" for rid in obj.rids]
+                        obj.rids = [f"{_global_tokenizer_worker_id}_{rid}" for rid in obj.rids]
             self._sender.send_pyobj(obj)
+            print(f"tokenizer manager _Communicator __call__ obj:{obj}")
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -2538,9 +2543,12 @@ class _Communicator(Generic[T]):
             # If rids is a list, remove prefix from each element
             elif hasattr(recv_obj, "rids") and isinstance(recv_obj.rids, list):
                 recv_obj.rids = [get_origin_rid(rid) for rid in recv_obj.rids]
-
+        if self._result_values is None and isinstance(recv_obj, MultiTokenizerRegisterReq):
+            logger.warning("_result_values is None in handle_recv, ingore")
+            return
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
+            print(f"tokenizer manager handle_recv _result_event set")
             self._result_event.set()
 
 

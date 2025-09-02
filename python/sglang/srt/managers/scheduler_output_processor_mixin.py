@@ -9,7 +9,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
-
+from sglang.srt.utils import (
+    get_workerids_from_rids
+)
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
@@ -467,16 +469,31 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
-        if self.is_generation:
-            self.stream_output_generation(reqs, return_logprob, skip_req)
-        else:  # embedding or reward model
-            self.stream_output_embedding(reqs)
+        if self.server_args.detokenizer_worker_num > 1:
+            workeridReqsMap = {}
+            for req in reqs:
+                worker_id = get_workerids_from_rids(req.rid)[0]
+                if worker_id not in workeridReqsMap:
+                    workeridReqsMap[worker_id]=[]
+                workeridReqsMap[worker_id].append(req)
+            for workid, reqs in workeridReqsMap.items():
+                detokenizer_index = workid % self.server_args.detokenizer_worker_num
+                if self.is_generation:
+                    self.stream_output_generation(reqs, return_logprob, skip_req, detokenizer_index)
+                else:  # embedding or reward model
+                    self.stream_output_embedding(reqs,detokenizer_index)
+        else:
+            if self.is_generation:
+                self.stream_output_generation(reqs, return_logprob, skip_req)
+            else:  # embedding or reward model
+                self.stream_output_embedding(reqs)
 
     def stream_output_generation(
         self: Scheduler,
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        detokenizer_index:int=0,
     ):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
@@ -670,7 +687,7 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen:
                 return
 
-            self.send_to_detokenizer.send_pyobj(
+            self.send_to_detokenizer[detokenizer_index].send_pyobj(
                 BatchTokenIDOut(
                     rids,
                     finished_reasons,
@@ -701,7 +718,7 @@ class SchedulerOutputProcessorMixin:
                 )
             )
 
-    def stream_output_embedding(self: Scheduler, reqs: List[Req]):
+    def stream_output_embedding(self: Scheduler, reqs: List[Req], detokenizer_index:int=0):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 
@@ -715,7 +732,7 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
-        self.send_to_detokenizer.send_pyobj(
+        self.send_to_detokenizer[detokenizer_index].send_pyobj(
             BatchEmbeddingOut(
                 rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
             )

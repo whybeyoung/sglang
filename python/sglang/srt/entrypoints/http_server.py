@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import fcntl
 import json
 import logging
 import multiprocessing as multiprocessing
@@ -39,6 +40,7 @@ from typing import AsyncGenerator
 import numpy as np
 import orjson
 import requests
+from pathlib import Path
 import uvicorn
 import uvloop
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -142,6 +144,7 @@ def serialize_port_args(port_args: PortArgs) -> dict:
         "rpc_ipc_name": port_args.rpc_ipc_name,
         "metrics_ipc_name": port_args.metrics_ipc_name,
         "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
+        "detokenizer_worker_ipc_name_list":port_args.detokenizer_worker_ipc_name_list,
     }
 
 
@@ -234,7 +237,47 @@ def write_data_for_multi_tokenizer(
 
     return port_args_shm, server_args_shm, scheduler_info_shm
 
+# share var file
+COUNTER_FILE = "shared_counter.json"
+# lock file
+LOCK_FILE = "counter_lock.lock"
+def init_shared_resources():
+    # remove old file if exists
+    if os.path.exists(COUNTER_FILE):
+        os.remove(COUNTER_FILE)
+        print(f"remove old file: {COUNTER_FILE}")
+    
+    # 2. create counter_file with default value 0
+    with open(COUNTER_FILE, "w") as f:
+        json.dump({"value": 0}, f)
+    print(f"create new counter file: {COUNTER_FILE}")
+    
+    if not os.path.exists(LOCK_FILE):
+        Path(LOCK_FILE).touch()
+    
+    
 
+def get_lock():
+    lock_file = open(LOCK_FILE, "w")
+    fcntl.flock(lock_file, fcntl.LOCK_EX) 
+    return lock_file
+
+def release_lock(lock_file):
+    fcntl.flock(lock_file, fcntl.LOCK_UN)
+    lock_file.close()
+
+def get_current_tokenzier_worker_id():
+    lock_file = get_lock()
+    try:
+        with open(COUNTER_FILE, "r") as f:
+            data = json.load(f)
+            current = data["value"]       
+        data["value"] = current + 1
+        with open(COUNTER_FILE, "w") as f:
+            json.dump(data, f)           
+    finally:
+        release_lock(lock_file)
+        return current
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
     pid = os.getpid()
@@ -254,7 +297,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args, False)
+    tokenizer_worker_id = get_current_tokenzier_worker_id()
+    logger.info(f"current tokenizer_worker_id: {tokenizer_worker_id}")
+    tokenizer_manager = TokenizerManager(server_args, port_args, False,tokenizer_worker_id)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -273,6 +318,7 @@ async def init_multi_tokenizer() -> ServerArgs:
             scheduler_info=scheduler_info,
         )
     )
+    
     return server_args
 
 
@@ -1255,6 +1301,7 @@ def launch_server(
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args, port_args=port_args
         )
+        init_shared_resources()
     else:
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,

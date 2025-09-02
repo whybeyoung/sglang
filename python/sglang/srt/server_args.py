@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
+    get_free_port,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     tokenizer_worker_num: int = 1
+    detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -733,6 +735,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tokenizer_worker_num,
             help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--detokenizer-worker-num",
+            type=int,
+            default=ServerArgs.detokenizer_worker_num,
+            help="The worker num of the detokenizer manager.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -2081,6 +2089,7 @@ class ServerArgs:
 
         # Check multi tokenizer
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
@@ -2324,6 +2333,8 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc filename for Detokenizer worker tokenizer
+    detokenizer_worker_ipc_name_list: List[str]
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         if server_args.nccl_port is None:
@@ -2338,8 +2349,11 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
+        detokenizer_worker_ipc_name_list =[]
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
+            for _ in range(server_args.detokenizer_worker_num):
+                detokenizer_worker_ipc_name_list.append(f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}")
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -2348,6 +2362,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=None,
+                detokenizer_worker_ipc_name_list=detokenizer_worker_ipc_name_list,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2368,12 +2383,15 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_ipc_name = port_base + 3
+            for i in range(server_args.detokenizer_worker_num):
+                detokenzier_worker_port = port_base + 4 +i
+                detokenizer_worker_ipc_name_list.append(f"tcp://{dist_init_host}:{detokenzier_worker_port}")
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
-                scheduler_input_port = port_base + 4
+                scheduler_input_port = port_base + 4 + server_args.detokenizer_worker_num
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+                scheduler_input_port = port_base + 4 + server_args.detokenizer_worker_num + 1 + dp_rank 
+            
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
@@ -2382,6 +2400,7 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=None,
+                detokenizer_worker_ipc_name_list=detokenizer_worker_ipc_name_list
             )
 
 
