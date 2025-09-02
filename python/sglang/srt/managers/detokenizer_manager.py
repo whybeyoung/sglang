@@ -83,6 +83,7 @@ class DetokenizerManager:
         self.send_to_tokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
+        self.port_args = port_args  # Store port_args for later use
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -96,6 +97,7 @@ class DetokenizerManager:
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.is_dummy = server_args.load_format == "dummy"
         self.tokenizer_worker_num = server_args.tokenizer_worker_num
+        self.detokenizer_worker_num = getattr(server_args, 'detokenizer_worker_num', 1)
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
@@ -112,6 +114,9 @@ class DetokenizerManager:
             try:
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
                 output = self._request_dispatcher(recv_obj)
+                
+                # For multiple detokenizer workers, each worker sends directly to tokenizer
+                # The load balancing is handled at the scheduler level
                 if self.tokenizer_worker_num <= 1:
                     self.send_to_tokenizer.send_pyobj(output)
                 else:

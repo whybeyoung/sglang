@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import hashlib
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -526,7 +527,47 @@ class SchedulerOutputProcessorMixin:
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
             if self.model_config.is_multimodal_gen and req.to_abort:
                 continue
+            if self.server_args.detokenizer_worker_num > 1:
+                rids = []
+                finished_reasons: List[BaseFinishReason] = []
 
+                decoded_texts = []
+                decode_ids_list = []
+                read_offsets = []
+                output_ids = []
+
+                skip_special_tokens = []
+                spaces_between_special_tokens = []
+                no_stop_trim = []
+                prompt_tokens = []
+                completion_tokens = []
+                cached_tokens = []
+                spec_verify_ct = []
+                output_hidden_states = None
+
+                if return_logprob:
+                    input_token_logprobs_val = []
+                    input_token_logprobs_idx = []
+                    output_token_logprobs_val = []
+                    output_token_logprobs_idx = []
+                    input_top_logprobs_val = []
+                    input_top_logprobs_idx = []
+                    output_top_logprobs_val = []
+                    output_top_logprobs_idx = []
+                    input_token_ids_logprobs_val = []
+                    input_token_ids_logprobs_idx = []
+                    output_token_ids_logprobs_val = []
+                    output_token_ids_logprobs_idx = []
+                else:
+                    input_token_logprobs_val = input_token_logprobs_idx = (
+                        output_token_logprobs_val
+                    ) = output_token_logprobs_idx = input_top_logprobs_val = (
+                        input_top_logprobs_idx
+                    ) = output_top_logprobs_val = output_top_logprobs_idx = (
+                        input_token_ids_logprobs_val
+                    ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
+                        output_token_ids_logprobs_idx
+                    ) = None
             if req.finished():
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
@@ -657,7 +698,41 @@ class SchedulerOutputProcessorMixin:
                     if output_hidden_states is None:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
-
+                if self.server_args.detokenizer_worker_num > 1:
+                    hash_obj = hashlib.md5(rid.encode('utf-8'))
+                    hash_int = int(hash_obj.hexdigest(), 16)  # 将16进制哈希转换为整数
+                    idx = hash_int % self.server_args.detokenizer_worker_num
+                    print(f"stream_output_generation: send_to_detokenizer[{idx}]")
+                    self.send_to_detokenizer[idx].send_pyobj(
+                        BatchTokenIDOut(
+                            rids,
+                            finished_reasons,
+                            decoded_texts,
+                            decode_ids_list,
+                            read_offsets,
+                            output_ids,
+                            skip_special_tokens,
+                            spaces_between_special_tokens,
+                            no_stop_trim,
+                            prompt_tokens,
+                            completion_tokens,
+                            cached_tokens,
+                            spec_verify_ct,
+                            input_token_logprobs_val,
+                            input_token_logprobs_idx,
+                            output_token_logprobs_val,
+                            output_token_logprobs_idx,
+                            input_top_logprobs_val,
+                            input_top_logprobs_idx,
+                            output_top_logprobs_val,
+                            output_top_logprobs_idx,
+                            input_token_ids_logprobs_val,
+                            input_token_ids_logprobs_idx,
+                            output_token_ids_logprobs_val,
+                            output_token_ids_logprobs_idx,
+                            output_hidden_states,
+                        )
+                    )
             if (
                 req.finished()
                 and self.tp_rank == 0
@@ -666,7 +741,7 @@ class SchedulerOutputProcessorMixin:
                 req.log_time_stats()
 
         # Send to detokenizer
-        if rids:
+        if self.server_args.detokenizer_worker_num = 1 and rids:
             if self.model_config.is_multimodal_gen:
                 return
 
@@ -710,13 +785,30 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         for req in reqs:
             if req.finished():
+                if self.server_args.detokenizer_worker_num > 1:
+                    rids = []
+                    finished_reasons: List[BaseFinishReason] = []
+                    embeddings = []
+                    prompt_tokens = []
+                    cached_tokens = []
                 rids.append(req.rid)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
-        self.send_to_detokenizer.send_pyobj(
-            BatchEmbeddingOut(
-                rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
+                if self.server_args.detokenizer_worker_num > 1:
+                    hash_obj = hashlib.md5(req.rid.encode('utf-8'))
+                    hash_int = int(hash_obj.hexdigest(), 16)  # 将16进制哈希转换为整数
+                    idx = hash_int % self.server_args.detokenizer_worker_num
+                    print(f"stream_output_embedding: send_to_detokenizer[{idx}]")
+                    self.send_to_detokenizer[idx].send_pyobj(
+                        BatchEmbeddingOut(
+                            rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
+                        )
+                    )
+        if self.server_args.detokenizer_worker_num = 1:
+            self.send_to_detokenizer.send_pyobj(
+                BatchEmbeddingOut(
+                    rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
+                )
             )
-        )
