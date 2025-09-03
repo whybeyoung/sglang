@@ -275,7 +275,6 @@ class Scheduler(
                     self.send_to_detokenizer.append(get_zmq_socket(
                         context, zmq.PUSH, port_args.detokenizer_worker_ipc_name_list[i], False
                     ))
-                print(f"send_to_tokenizer:{self.send_to_detokenizer}")
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(

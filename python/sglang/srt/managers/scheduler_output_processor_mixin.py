@@ -699,7 +699,6 @@ class SchedulerOutputProcessorMixin:
                     output_hidden_states.append(req.hidden_states)
                 if self.server_args.detokenizer_worker_num > 1:
                     idx = abs(hash(req.rid)) % self.server_args.detokenizer_worker_num
-                    print(f"stream_output_generation: send_to_detokenizer[{idx}]")
                     self.send_to_detokenizer[idx].send_pyobj(
                         BatchTokenIDOut(
                             rids,
