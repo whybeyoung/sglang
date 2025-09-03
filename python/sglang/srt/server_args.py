@@ -2383,14 +2383,15 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_ipc_name = port_base + 3
+            for i in range(server_args.detokenizer_worker_num):
+                detokenzier_worker_port = port_base + 4 +i
+                detokenizer_worker_ipc_name_list.append(f"tcp://{dist_init_host}:{detokenzier_worker_port}")
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
-                scheduler_input_port = port_base + 4
+                scheduler_input_port = port_base + 4 + server_args.detokenizer_worker_num
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-            for _ in range(server_args.detokenizer_worker_num):
-                detokenzier_worker_port = get_free_port()
-                detokenizer_worker_ipc_name_list.append(f"tcp://{dist_init_host}:{detokenzier_worker_port}")
+                scheduler_input_port = port_base + 4 + server_args.detokenizer_worker_num + 1 + dp_rank 
+            
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",

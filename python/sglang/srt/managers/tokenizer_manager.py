@@ -1591,6 +1591,7 @@ class TokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            print(f"tokenizer manager handle_loop recv_obj:{recv_obj}")
             # In multi-worker mode, distribute results to corresponding workers
             if self.server_args.tokenizer_worker_num > 1 and self.is_main:
                 await self._distribute_result_to_workers(recv_obj)
