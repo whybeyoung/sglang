@@ -140,6 +140,3 @@ class DPBalanceMeta:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._manager = None
-
-def get_nth_detokenizer_worker_ipc_name(detokenizer_ipc_name:str, worker_num: int) -> str:
-    return detokenizer_ipc_name+f"_{worker_num}"

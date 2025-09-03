@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
+    get_free_port,
 )
 
 logger = logging.getLogger(__name__)
@@ -2332,6 +2333,8 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc filename for Detokenizer worker tokenizer
+    detokenizer_worker_ipc_name_list: List[str]
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         if server_args.nccl_port is None:
@@ -2346,8 +2349,11 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
+        detokenizer_worker_ipc_name_list =[]
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
+            for _ in range(server_args.detokenizer_worker_num):
+                detokenizer_worker_ipc_name_list.append(f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}")
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -2356,6 +2362,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=None,
+                detokenizer_worker_ipc_name_list=detokenizer_worker_ipc_name_list,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2381,7 +2388,9 @@ class PortArgs:
                 scheduler_input_port = port_base + 4
             else:
                 scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+            for _ in range(server_args.detokenizer_worker_num):
+                detokenzier_worker_port = get_free_port()
+                detokenizer_worker_ipc_name_list.append(f"tcp://{dist_init_host}:{detokenzier_worker_port}")
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
@@ -2390,6 +2399,7 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=None,
+                detokenizer_worker_ipc_name_list=detokenizer_worker_ipc_name_list
             )
 
 

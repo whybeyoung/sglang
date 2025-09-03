@@ -2539,8 +2539,8 @@ class _Communicator(Generic[T]):
             elif hasattr(recv_obj, "rids") and isinstance(recv_obj.rids, list):
                 recv_obj.rids = [get_origin_rid(rid) for rid in recv_obj.rids]
         if self._result_values is None and isinstance(recv_obj, MultiTokenizerRegisterReq):
-            logger.warning("_result_values is None in handle_recv, initializing it")
-            self._result_values = []
+            logger.warning("_result_values is None in handle_recv, ingore")
+            return
         print(f"handle_recv:{self._result_values},{recv_obj}")
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
