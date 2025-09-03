@@ -1591,7 +1591,6 @@ class TokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            print(f"tokenizer manager handle_loop recv_obj:{recv_obj}")
             # In multi-worker mode, distribute results to corresponding workers
             if self.server_args.tokenizer_worker_num > 1 and self.is_main:
                 await self._distribute_result_to_workers(recv_obj)
@@ -2514,6 +2513,7 @@ class _Communicator(Generic[T]):
                     elif isinstance(obj.rids, list):
                         obj.rids = [f"{os.getpid()}_{rid}" for rid in obj.rids]
             self._sender.send_pyobj(obj)
+            print(f"tokenizer manager _Communicator __call__ obj:{obj}")
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -2542,9 +2542,9 @@ class _Communicator(Generic[T]):
         if self._result_values is None and isinstance(recv_obj, MultiTokenizerRegisterReq):
             logger.warning("_result_values is None in handle_recv, ingore")
             return
-        print(f"handle_recv:{self._result_values},{recv_obj}")
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
+            print(f"tokenizer manager handle_recv _result_event set")
             self._result_event.set()
 
 
