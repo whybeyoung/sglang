@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import time
-import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import torch
+import torch.nn.functional as F
+import uuid
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import (
-    ClassifyData,
     ClassifyRequest,
     ClassifyResponse,
-    ClassifyUsage,
     ErrorResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -32,6 +32,10 @@ class OpenAIServingClassify(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self.id2label = self._get_id2label_mapping()
+        self.model_name = self.tokenizer_manager.served_model_name
+        if not self.id2label:
+            raise ValueError("id2label mapping is missing")
 
     def _request_id_prefix(self) -> str:
         return "classify-"
@@ -41,48 +45,53 @@ class OpenAIServingClassify(OpenAIServingBase):
         request: ClassifyRequest,
         raw_request: Request = None,
     ) -> tuple[EmbeddingReqInput, ClassifyRequest]:
-        """Convert classification request to internal embedding format"""
-        # Convert to internal request format
-        embedding_req = EmbeddingReqInput(
-            text=request.input,
+        """Convert OpenAI embedding request to internal format"""
+        prompt = request.input
+
+        if isinstance(prompt, str):
+            # Single string input
+            prompt_kwargs = {"text": prompt}
+        elif isinstance(prompt, list):
+            if len(prompt) > 0 and isinstance(prompt[0], str):
+                prompt_kwargs = {"text": prompt}
+            else:
+                # List of integers (token IDs) or empty list
+                prompt_kwargs = {"input_ids": prompt}
+        else:
+            # Other types (should not happen but handle gracefully)
+            prompt_kwargs = {"input_ids": prompt}
+
+        adapted_request = EmbeddingReqInput(
+            **prompt_kwargs,
             rid=request.rid,
             priority=request.priority,
         )
-        return embedding_req, request
+
+        return adapted_request, request
 
     def _validate_request(self, request: ClassifyRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
-        if not request.input or not request.input.strip():
-            return "Input cannot be empty or whitespace only"
         return None
 
     def _get_id2label_mapping(self) -> Optional[Dict[int, str]]:
         """Get id2label mapping from model config."""
         try:
-            # Try to get id2label from tokenizer_manager's model config
-            if hasattr(self.tokenizer_manager, 'model_config') and self.tokenizer_manager.model_config:
-                config = self.tokenizer_manager.model_config
-                
-                # Check for id2label in config
-                if hasattr(config, 'id2label') and config.id2label:
-                    return config.id2label
-                
-                # Check for num_labels and create default mapping if needed
-                if hasattr(config, 'num_labels') and config.num_labels:
-                    num_labels = config.num_labels
-                    # Create default mapping: {0: "LABEL_0", 1: "LABEL_1", ...}
-                    return {i: f"LABEL_{i}" for i in range(num_labels)}
-            
-            # Try to get from model_config directly if available
-            if hasattr(self.tokenizer_manager, 'model_config') and hasattr(self.tokenizer_manager.model_config, 'id2label'):
-                return self.tokenizer_manager.model_config.id2label
-                
+            hf_config = self.tokenizer_manager.model_config.hf_config
+            # Check for id2label in hf_config
+            if hasattr(hf_config, 'label2id') and hf_config.label2id:
+                return {value: key for key, value in hf_config.label2id.items()}
+            # Check for num_labels and create default mapping if needed
+            if hasattr(hf_config, 'num_labels') and hf_config.num_labels:
+                num_labels = hf_config.num_labels
+                # Create default mapping: {0: "LABEL_0", 1: "LABEL_1", ...}
+                return {i: f"LABEL_{i}" for i in range(num_labels)}
+
         except Exception as e:
             # Log the error but don't fail the request
             import logging
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to get id2label mapping: {e}")
-        
+
         return None
 
     async def _handle_non_streaming_request(
@@ -93,98 +102,72 @@ class OpenAIServingClassify(OpenAIServingBase):
     ) -> Union[ClassifyResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming classification request."""
         # Generate request ID
-        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
-        created_time = int(time.time())
 
         try:
-            # Process the request using the existing classify endpoint
-            # This uses the same backend as the /classify endpoint
-            result = await self.tokenizer_manager.generate_request(
+            ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ).__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
 
-            # Extract classification results from the response
-            if hasattr(result, "data") and result.data:
-                # Get id2label mapping from model config
-                id2label = self._get_id2label_mapping()
-                
-                # Parse the classification results
-                classify_data = []
-                for i, item in enumerate(result.data):
-                    if hasattr(item, "scores") and item.scores:
-                        # Convert scores to probabilities using softmax
-                        import torch
-                        import torch.nn.functional as F
-                        
-                        scores = torch.tensor(item.scores, dtype=torch.float32)
-                        probs = F.softmax(scores, dim=0).tolist()
-                        
-                        # Get the predicted class (highest probability)
-                        predicted_class = torch.argmax(scores).item()
-                        
-                        # Use id2label mapping if available, otherwise fallback to Class_X
-                        if id2label and predicted_class in id2label:
-                            label = id2label[predicted_class]
-                        else:
-                            label = f"Class_{predicted_class}"
-                        
-                        classify_data.append(
-                            ClassifyData(
-                                index=i,
-                                label=label,
-                                probs=probs,
-                                num_classes=len(probs),
-                            )
-                        )
-                    else:
-                        # Fallback: create a single class with probability 1.0
-                        classify_data.append(
-                            ClassifyData(
-                                index=i,
-                                label="Default",
-                                probs=[1.0],
-                                num_classes=1,
-                            )
-                        )
+        if not isinstance(ret, list):
+            ret = [ret]
 
-                # Create usage information
-                usage = ClassifyUsage(
-                    prompt_tokens=getattr(result, "prompt_tokens", 0),
-                    total_tokens=getattr(result, "total_tokens", 0),
-                    completion_tokens=0,
-                    prompt_tokens_details=None,
-                )
+        response = self._build_classify_response(ret)
+        return response
 
-                # Create response
-                response = ClassifyResponse(
-                    id=request_id,
-                    object="list",
-                    created=created_time,
-                    model=request.model,
-                    data=classify_data,
-                    usage=usage,
-                )
+    def _build_classify_response(self, ret: List[Dict[str, Any]]) -> ClassifyResponse:
+        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+        created_time = int(time.time())
+        classify_objects = []
+        prompt_tokens = 0
+        total_latency = 0.0
 
-                return ORJSONResponse(content=response.model_dump())
+        for i, item in enumerate(ret):
+            embedding = item.get("embedding", [])
+            meta_info = item.get("meta_info", {})
 
+            prompt_tokens += meta_info.get("prompt_tokens", 0)
+            total_latency += meta_info.get("e2e_latency", 0.0)
+
+            if embedding:
+                try:
+                    embedding_tensor = torch.tensor(embedding, dtype=torch.float32)
+                    probs = F.softmax(embedding_tensor, dim=0).tolist()
+
+                    predicted_class = torch.argmax(embedding_tensor).item()
+
+                    label = self.id2label[predicted_class]
+
+
+                except Exception as e:
+                    print(f"Error processing embedding for item {i}: {e}")
+                    probs = [1.0]
+                    label = "Default"
             else:
-                # No classification data available, return error
-                return ORJSONResponse(
-                    content=ErrorResponse(
-                        message="Classification model not available or failed to process",
-                        type="server_error",
-                        code=500,
-                    ).model_dump(),
-                    status_code=500,
-                )
+                probs = [1.0]
+                label = "Default"
 
-        except Exception as e:
-            return ORJSONResponse(
-                content=ErrorResponse(
-                    message=f"Classification failed: {str(e)}",
-                    type="server_error",
-                    code=500,
-                ).model_dump(),
-                status_code=500,
-            )
+            classify_obj = {
+                "index": i,
+                "label": label,
+                "probs": probs,
+                "num_classes": len(probs)
+            }
+            classify_objects.append(classify_obj)
 
+        response = {
+            "id": request_id,
+            "object": "list",
+            "created": created_time,
+            "model": self.model_name,
+            "data": classify_objects,
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens,
+                "completion_tokens": 0,
+                "prompt_tokens_details": None
+            }
+        }
+
+        return ClassifyResponse(**response)

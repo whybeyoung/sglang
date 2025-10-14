@@ -761,10 +761,14 @@ class EmbeddingObject(BaseModel):
     object: str = "embedding"
 
 
+ClassifyInput = Union[
+    str, List[str]
+]
+
 class ClassifyRequest(BaseModel):
     # vLLM-compatible classification request
     model: str = DEFAULT_MODEL_NAME
-    input: str
+    input: ClassifyInput
     user: Optional[str] = None
 
     # The request id.
@@ -794,6 +798,7 @@ class ClassifyResponse(BaseModel):
     model: str
     data: List[ClassifyData]
     usage: ClassifyUsage
+
 
 
 class EmbeddingResponse(BaseModel):
