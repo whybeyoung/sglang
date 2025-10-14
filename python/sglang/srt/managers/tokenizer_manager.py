@@ -380,7 +380,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # Modify rid, add worker_id
             if isinstance(obj.rid, list):
                 # If it's an array, add worker_id prefix to each element
-                obj.rid = [f"{self.worker_id}_{rid}" for rid in obj.rid]
+                obj.rid = [f"{self.worker_id}_{rid}" fomormorr rid in obj.rid]
             else:
                 # If it's a single value, add worker_id prefix
                 obj.rid = f"{self.worker_id}_{obj.rid}"

@@ -121,6 +121,14 @@ pub trait RouterTrait: Send + Sync + Debug {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Route classification requests (vLLM-compatible /v1/classify)
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
