@@ -59,11 +59,11 @@ from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
+    AttentionInputs,
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
     support_attn_input_tp_scattered,
-    tp_all_gather_qkv_latent,
     use_attn_input_tp_scattered,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1322,7 +1322,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+            attn_inputs=state.pop("hidden_states_after_comm_pre_attn"),
             forward_batch=state.forward_batch,
             zero_allocator=state.zero_allocator,
         )
@@ -1335,13 +1335,13 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
         s = self.forward_prepare(
             positions=positions,
-            hidden_states=hidden_states,
+            attn_inputs=attn_inputs,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
@@ -1350,7 +1350,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_prepare(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
@@ -1358,33 +1358,34 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
-        if isinstance(hidden_states, tuple):
+        hidden_states_local = attn_inputs.hidden_states_local
+        if isinstance(hidden_states_local, tuple):
             if (
                 not forward_batch.attn_input_tp_scattered
-                and hidden_states[0].shape[0] == 0
+                and hidden_states_local[0].shape[0] == 0
             ):
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
-                return hidden_states[0]
+                return hidden_states_local[0]
         else:
             if (
                 not forward_batch.attn_input_tp_scattered
-                and hidden_states.shape[0] == 0
+                and hidden_states_local.shape[0] == 0
             ):
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
-                return hidden_states, None, forward_batch, None
+                return hidden_states_local, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, attn_inputs, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, attn_inputs, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             inner_state = self.forward_normal_one_shot_prepare(
@@ -1393,7 +1394,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif attn_forward_method == AttnForwardMethod.MLA:
             if not self.is_mla_preprocess_enabled:
                 inner_state = self.forward_absorb_prepare(
-                    positions, hidden_states, forward_batch, zero_allocator
+                    positions, attn_inputs, forward_batch, zero_allocator
                 )
             else:
                 # TODO(iforgetmyname): to be separated as a standalone func
@@ -1411,20 +1412,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.qk_rope_head_dim,
                     )
                 inner_state = self.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
+                    positions, attn_inputs.hidden_states, forward_batch, zero_allocator
                 )
                 inner_state = (*inner_state, None)  # add a position for topk_indices
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
             inner_state = self.forward_npu_sparse_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, attn_inputs, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, attn_inputs, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
             inner_state = self.forward_absorb_fused_mla_rope_cpu_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, attn_inputs, forward_batch, zero_allocator
             )
         else:
             raise NotImplementedError
@@ -1454,11 +1455,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             raise NotImplementedError
 
-    def apply_fused_qkv_a_proj_with_mqa(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
+    def prepare_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
+        assert self.q_lora_rank is not None
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] <= 16
@@ -1469,30 +1469,23 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         else:
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-
-        if forward_batch.attn_input_tp_scattered:
-            qkv_latent = tp_all_gather_qkv_latent(
-                qkv_latent,
-                forward_batch,
-            )
         return qkv_latent
 
     def forward_normal_prepare(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
         if self.q_lora_rank is not None:
-            q, latent_cache = self.apply_fused_qkv_a_proj_with_mqa(
-                hidden_states, forward_batch
-            ).split(
+            q, latent_cache = attn_inputs.qkv_latent.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
+            hidden_states = attn_inputs.hidden_states
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
@@ -1544,7 +1537,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_prepare(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
@@ -1552,9 +1545,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_lora = None
         if self.q_lora_rank is not None:
-            q, latent_cache = self.apply_fused_qkv_a_proj_with_mqa(
-                hidden_states, forward_batch
-            ).split(
+            q, latent_cache = attn_inputs.qkv_latent.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
@@ -1588,6 +1579,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = k_nope.unsqueeze(1)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
+            hidden_states = attn_inputs.hidden_states
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
@@ -1662,7 +1654,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         topk_indices = None
         if q_lora is not None:
             topk_indices = self.indexer(
-                x=hidden_states,
+                x=attn_inputs.hidden_states,
                 q_lora=q_lora,
                 positions=positions,
                 forward_batch=forward_batch,
@@ -1822,7 +1814,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_npu_sparse_prepare(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
@@ -1852,28 +1844,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 zero_allocator,
                 positions,
             ) = self.mla_preprocess.forward(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, attn_inputs.hidden_states, forward_batch, zero_allocator
             )
 
-            fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            q, _ = fused_qkv_a_proj_out.split(
+            q, _ = attn_inputs.qkv_latent.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q_lora = self.q_a_layernorm(q)
         else:
             from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-            if (
-                (not isinstance(hidden_states, tuple))
-                and hidden_states.shape[0] <= 16
-                and self.use_min_latency_fused_a_gemm
-            ):
-                fused_qkv_a_proj_out = dsv3_fused_a_gemm(
-                    hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
-                )
-            else:
-                fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            q, latent_cache = fused_qkv_a_proj_out.split(
+            q, latent_cache = attn_inputs.qkv_latent.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
@@ -1969,7 +1950,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # TODO: multi-stream indexer
         topk_indices = self.indexer(
-            hidden_states, q_lora, positions, forward_batch, self.layer_id
+            attn_inputs.hidden_states, q_lora, positions, forward_batch, self.layer_id
         )
 
         return (
@@ -2037,28 +2018,30 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_fused_mla_rope_prepare(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         )
-        q_len = hidden_states.shape[0]
-        q_input = hidden_states.new_empty(
-            q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
-        )
         if self.q_lora_rank is not None:
-            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
+            q, latent_cache = attn_inputs.qkv_latent.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
+            hidden_states = attn_inputs.hidden_states
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+
+        q_len = q.shape[0]
+        q_input = q.new_empty(
+            q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
+        )
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         if _is_hip:
@@ -2151,7 +2134,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_fused_mla_rope_cpu_prepare(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
@@ -2161,7 +2144,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_input, k_input, v_input = (
             torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
-                hidden_states,
+                attn_inputs.hidden_states,
                 self.fused_qkv_a_proj_with_mqa.weight,
                 self.q_b_proj.weight,
                 self.w_kc,
@@ -2357,7 +2340,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_normal_chunked_kv_prepare(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
@@ -2369,7 +2352,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # First do normal mha forward to get output for extended part
         return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
+            positions, attn_inputs, forward_batch, zero_allocator
         )
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
@@ -2604,6 +2587,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_last_layer=(
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
@@ -2632,7 +2616,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else ""
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
+        attn_inputs, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
@@ -2641,7 +2625,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states = self.self_attn(
             positions=positions,
-            hidden_states=hidden_states,
+            attn_inputs=attn_inputs,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
