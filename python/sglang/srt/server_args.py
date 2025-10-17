@@ -31,6 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -1011,8 +1012,19 @@ class ServerArgs:
 
             if not is_npu():
                 self.enable_dp_attention = True
-                self.dp_size = self.tp_size
-                logger.warning("DP attention is enabled for DeepSeek NSA.")
+                is_context_parallel = get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA")
+                if is_context_parallel:
+                    self.dp_size = 1
+                    self.moe_dense_tp_size = 1
+                    assert (
+                        self.tp_size == 8
+                    ), "Current context parallel only support Single machine(tp_size == 8)"
+
+                    logger.warning(
+                        "Start context parallel opt for deeeseekv3.2-DSA, Setting dp_size == 1 and moe_dense_tp_size == 1."
+                    )
+                else:
+                    self.dp_size = self.tp_size
 
                 self.page_size = 64
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
@@ -1284,7 +1296,7 @@ class ServerArgs:
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
-            self.enable_dp_attention = False
+            # self.enable_dp_attention = False
             self.enable_dp_lm_head = False
 
         if self.enable_dp_attention:
