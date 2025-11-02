@@ -84,13 +84,11 @@ func (r *GrpcRouter) RouteChat(
 		zap.Stringp("model_id", modelID),
 	)
 
-	// Store request in shared components or input for pipeline stages
-	// TODO: Add request to input if needed by stages
-
 	// Create request input
 	input := &pipeline.RequestInput{
 		RequestType: pipeline.RequestTypeChat,
 		ModelID:     modelID,
+		Request:     request, // Store request for parameter extraction
 	}
 
 	// Execute pipeline
@@ -144,6 +142,7 @@ func (r *GrpcRouter) RouteGenerate(
 	input := &pipeline.RequestInput{
 		RequestType: pipeline.RequestTypeGenerate,
 		ModelID:     modelID,
+		Request:     request, // Store request for parameter extraction
 	}
 
 	// Execute pipeline

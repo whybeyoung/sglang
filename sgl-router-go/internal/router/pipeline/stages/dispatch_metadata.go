@@ -51,11 +51,35 @@ func (s *DispatchMetadataStage) Execute(ctx *pipeline.RequestContext) (interface
 		isStreaming = protoReq.Stream
 	}
 
+	// Extract weight_version from selected worker
+	// In Rust: worker.get_model_info() or from metadata
+	var weightVersion *string
+	if ctx.State.Workers != nil {
+		var selectedWorker pipeline.Worker
+		if ctx.State.Workers.IsDual {
+			// Use prefill worker for weight version (similar to Rust)
+			selectedWorker = ctx.State.Workers.Dual.Prefill
+		} else {
+			selectedWorker = ctx.State.Workers.Single
+		}
+
+		if selectedWorker != nil {
+			// TODO: Get weight_version from worker via gRPC GetModelInfo call
+			// For now, try to get from Labels in metadata
+			metadata := selectedWorker.Metadata()
+			if metadata != nil && metadata.Labels != nil {
+				if wv, ok := metadata.Labels["weight_version"]; ok {
+					weightVersion = &wv
+				}
+			}
+		}
+	}
+
 	ctx.State.Dispatch = &pipeline.DispatchMetadata{
 		RequestID:     requestID,
 		Model:         modelID,
 		Created:       time.Now().Unix(),
-		WeightVersion: nil, // TODO: Extract from worker metadata
+		WeightVersion: weightVersion,
 		IsStreaming:   isStreaming,
 	}
 

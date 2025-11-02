@@ -41,6 +41,10 @@ type RequestContext struct {
 type RequestInput struct {
 	RequestType RequestType
 	ModelID     *string
+	// Store the actual request object for parameter extraction
+	// For Chat: *protocols.ChatCompletionRequest
+	// For Generate: *protocols.GenerateRequest
+	Request interface{} // Store actual request for parameter extraction
 	// Note: In Rust, headers are stored here. In Go, we might use context instead
 }
 
