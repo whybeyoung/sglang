@@ -77,12 +77,39 @@ func NewRustFFITokenizerWithChatTemplate(tokenizerPath string, chatTemplatePath 
 	var chatTemplate *string
 	var templateFormat ChatTemplateContentFormat
 
-	// Try to discover chat template from model directory
+	// Try to load chat template from provided path
+	var chatTemplateSource string // Track where chat template was loaded from
 	if chatTemplatePath != nil {
-		template, err := LoadChatTemplateFromConfig(*chatTemplatePath)
+		chatTemplateSource = *chatTemplatePath
+		// Check if it's a file path to tokenizer_config.json or a chat template file
+		// Use loadChatTemplateFromFile which handles both cases
+		template, err := loadChatTemplateFromFile(*chatTemplatePath)
 		if err == nil && template != nil {
 			chatTemplate = template
 			templateFormat = DetectChatTemplateContentFormat(*template)
+			logger.Info("Chat template loaded from file for Rust FFI tokenizer",
+				zap.String("source_file", *chatTemplatePath),
+				zap.String("tokenizer_path", tokenizerPath),
+				zap.String("format", templateFormat.String()),
+			)
+		} else {
+			// If loadChatTemplateFromFile fails, try LoadChatTemplateFromConfig
+			// (in case it's tokenizer_config.json)
+			template, err := LoadChatTemplateFromConfig(*chatTemplatePath)
+			if err == nil && template != nil {
+				chatTemplate = template
+				templateFormat = DetectChatTemplateContentFormat(*template)
+				logger.Info("Chat template loaded from tokenizer_config.json for Rust FFI tokenizer",
+					zap.String("source_file", *chatTemplatePath),
+					zap.String("tokenizer_path", tokenizerPath),
+					zap.String("format", templateFormat.String()),
+				)
+			} else if err != nil {
+				logger.Warn("Failed to load chat template from provided path",
+					zap.String("source_file", *chatTemplatePath),
+					zap.Error(err),
+				)
+			}
 		}
 	} else {
 		// Auto-discover chat template from tokenizer directory
@@ -91,6 +118,12 @@ func NewRustFFITokenizerWithChatTemplate(tokenizerPath string, chatTemplatePath 
 		if discovered != nil {
 			chatTemplate = discovered
 			templateFormat = DetectChatTemplateContentFormat(*discovered)
+			chatTemplateSource = *discovered
+			logger.Info("Chat template auto-discovered from tokenizer directory for Rust FFI tokenizer",
+				zap.String("source_file", *discovered),
+				zap.String("tokenizer_path", tokenizerPath),
+				zap.String("format", templateFormat.String()),
+			)
 		}
 	}
 
@@ -99,8 +132,9 @@ func NewRustFFITokenizerWithChatTemplate(tokenizerPath string, chatTemplatePath 
 	t.chatTemplateFormat = templateFormat
 	if chatTemplate != nil {
 		logger.Info("Chat template loaded for Rust FFI tokenizer",
-			zap.String("path", tokenizerPath),
-			zap.String("format", string(templateFormat)),
+			zap.String("tokenizer_path", tokenizerPath),
+			zap.String("chat_template_source", chatTemplateSource),
+			zap.String("format", templateFormat.String()),
 		)
 	}
 

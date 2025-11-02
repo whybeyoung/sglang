@@ -24,12 +24,20 @@ type ClientPool struct {
 
 // NewClientPool creates a new gRPC client pool
 func NewClientPool(logger *zap.Logger) *ClientPool {
+	// Set maximum message size to 100MB to handle large tokenizer files
+	// Default is 4MB which is too small for tokenizer.json files
+	maxMsgSize := 100 * 1024 * 1024 // 100MB
+
 	return &ClientPool{
 		clients: make(map[string]*grpc.ClientConn),
 		logger:  logger,
 		dialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithBlock(), // Wait for connection
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(maxMsgSize),
+				grpc.MaxCallSendMsgSize(maxMsgSize),
+			),
 		},
 		// Note: grpc.WithBlock() will block until connection is established or context times out
 	}

@@ -332,11 +332,18 @@ func ProcessChatMessages(
 
 	// If no chat template available, use simple formatting
 	if chatTemplate == nil {
-		logger.Debug("No chat template available, using simple message formatting",
+		logger.Warn("No chat template available, using simple message formatting",
 			zap.String("tokenizer_type", fmt.Sprintf("%T", tok)),
+			zap.Any("tokenizer", tok),
 		)
 		return processChatMessagesSimple(request)
 	}
+
+	logger.Debug("Using chat template for message processing",
+		zap.String("tokenizer_type", fmt.Sprintf("%T", tok)),
+		zap.String("content_format", contentFormat.String()),
+		zap.Bool("template_available", chatTemplate != nil),
+	)
 
 	// contentFormat already set above (from hfTokenizer or rustTokenizer)
 
@@ -373,9 +380,27 @@ func ProcessChatMessages(
 	if err != nil {
 		logger.Warn("Failed to apply chat template, using simple formatting",
 			zap.Error(err),
+			zap.String("template_preview", func() string {
+				if chatTemplate != nil && len(*chatTemplate) > 100 {
+					return (*chatTemplate)[:100] + "..."
+				} else if chatTemplate != nil {
+					return *chatTemplate
+				}
+				return ""
+			}()),
 		)
 		return processChatMessagesSimple(request)
 	}
+
+	logger.Debug("Chat template applied successfully",
+		zap.Int("formatted_text_length", len(formattedText)),
+		zap.String("formatted_text_preview", func() string {
+			if len(formattedText) > 200 {
+				return formattedText[:200] + "..."
+			}
+			return formattedText
+		}()),
+	)
 
 	return &ProcessedMessages{
 		Text:             formattedText,

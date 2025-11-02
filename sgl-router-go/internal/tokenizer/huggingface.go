@@ -92,22 +92,30 @@ func NewHuggingFaceTokenizerWithChatTemplate(
 
 	// Load chat template if provided
 	var chatTemplate *string
+	var chatTemplateSource string // Track where chat template was loaded from
 	if chatTemplatePath != nil {
+		chatTemplateSource = *chatTemplatePath
 		template, err := loadChatTemplateFromFile(*chatTemplatePath)
 		if err != nil {
 			logger.Warn("Failed to load chat template",
-				zap.String("path", *chatTemplatePath),
+				zap.String("source_file", *chatTemplatePath),
 				zap.Error(err),
 			)
 		} else if template != nil {
 			chatTemplate = template
+			logger.Info("Chat template loaded from file for HuggingFace tokenizer",
+				zap.String("source_file", *chatTemplatePath),
+				zap.String("tokenizer_path", path),
+			)
 		}
 	} else {
 		// Try to auto-discover chat template from tokenizer_config.json
 		template := discoverChatTemplate(path)
 		if template != nil {
 			chatTemplate = template
-			logger.Debug("Auto-discovered chat template",
+			chatTemplateSource = *template
+			logger.Info("Chat template auto-discovered from tokenizer directory for HuggingFace tokenizer",
+				zap.String("source_file", *template),
 				zap.String("tokenizer_path", path),
 			)
 		}
@@ -117,7 +125,9 @@ func NewHuggingFaceTokenizerWithChatTemplate(
 	var templateFormat ChatTemplateContentFormat
 	if chatTemplate != nil {
 		templateFormat = DetectChatTemplateContentFormat(*chatTemplate)
-		logger.Debug("Chat template content format detected",
+		logger.Info("Chat template loaded for HuggingFace tokenizer",
+			zap.String("tokenizer_path", path),
+			zap.String("chat_template_source", chatTemplateSource),
 			zap.String("format", templateFormat.String()),
 		)
 	}

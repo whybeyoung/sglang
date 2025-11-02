@@ -92,8 +92,17 @@ func CreateTokenizerWithChatTemplate(
 // discoverChatTemplateInDir tries to discover chat template in a directory
 // Similar to Rust discover_chat_template_in_dir
 func discoverChatTemplateInDir(dir string) *string {
+	// Try tokenizer_config.json first (may contain chat_template field)
+	configPath := filepath.Join(dir, "tokenizer_config.json")
+	if _, err := os.Stat(configPath); err == nil {
+		template, err := LoadChatTemplateFromConfig(configPath)
+		if err == nil && template != nil {
+			return template
+		}
+	}
+
+	// Try standalone chat template files
 	candidates := []string{
-		"tokenizer_config.json",
 		"chat_template.json",
 		"chat_template.jinja",
 	}

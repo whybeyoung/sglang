@@ -113,8 +113,11 @@ func FetchTokenizerFromWorker(
 			}
 		}
 
-		// Write chat template if explicitly provided
+		// Try to discover chat template from saved files
+		// Priority: 1. Standalone chat_template files, 2. tokenizer_config.json
 		var chatTemplate *string
+
+		// First, check if standalone chat template files exist
 		if chatTemplateContent, ok := tokenizerInfo.Files["chat_template.jinja"]; ok && chatTemplateContent != "" {
 			templatePath := filepath.Join(tempDir, "chat_template.jinja")
 			if err := os.WriteFile(templatePath, []byte(chatTemplateContent), 0644); err != nil {
@@ -123,6 +126,11 @@ func FetchTokenizerFromWorker(
 				)
 			} else {
 				chatTemplate = &templatePath
+				logger.Info("Using standalone chat_template.jinja from worker",
+					zap.String("source_file", "chat_template.jinja (from GetTokenizerInfo RPC)"),
+					zap.String("saved_path", templatePath),
+					zap.String("temp_dir", tempDir),
+				)
 			}
 		} else if chatTemplateContent, ok := tokenizerInfo.Files["chat_template.json"]; ok && chatTemplateContent != "" {
 			templatePath := filepath.Join(tempDir, "chat_template.json")
@@ -132,14 +140,37 @@ func FetchTokenizerFromWorker(
 				)
 			} else {
 				chatTemplate = &templatePath
+				logger.Info("Using standalone chat_template.json from worker",
+					zap.String("source_file", "chat_template.json (from GetTokenizerInfo RPC)"),
+					zap.String("saved_path", templatePath),
+					zap.String("temp_dir", tempDir),
+				)
 			}
 		}
 
-		// Try to discover chat template from saved files if not explicitly written
+		// If no standalone chat template, try to extract from tokenizer_config.json
 		if chatTemplate == nil {
-			discovered := discoverChatTemplateInDir(tempDir)
-			if discovered != nil {
-				chatTemplate = discovered
+			// Check if tokenizer_config.json exists and extract chat_template from it
+			configPath := filepath.Join(tempDir, "tokenizer_config.json")
+			if _, err := os.Stat(configPath); err == nil {
+				templateContent, err := LoadChatTemplateFromConfig(configPath)
+				if err == nil && templateContent != nil {
+					// Write extracted template content to a temporary file
+					// Since NewHuggingFaceTokenizerWithChatTemplate expects a file path
+					templatePath := filepath.Join(tempDir, "chat_template.jinja")
+					if err := os.WriteFile(templatePath, []byte(*templateContent), 0644); err != nil {
+						logger.Warn("Failed to write extracted chat template to file",
+							zap.Error(err),
+						)
+					} else {
+						chatTemplate = &templatePath
+						logger.Info("Extracted and saved chat template from tokenizer_config.json",
+							zap.String("source_file", configPath),
+							zap.String("saved_path", templatePath),
+							zap.String("temp_dir", tempDir),
+						)
+					}
+				}
 			}
 		}
 
