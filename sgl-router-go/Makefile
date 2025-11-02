@@ -15,7 +15,9 @@ proto:
 		--proto_path=$(PROTO_DIR) \
 		$(PROTO_DIR)/*.proto
 	protoc --go_out=$(INTERNAL_PROTO_DIR) --go_opt=paths=source_relative \
+		--go_opt=Msglang_scheduler.proto=github.com/sglang/sglang-router-go/internal/grpc/proto \
 		--go-grpc_out=$(INTERNAL_PROTO_DIR) --go-grpc_opt=paths=source_relative \
+		--go-grpc_opt=Msglang_scheduler.proto=github.com/sglang/sglang-router-go/internal/grpc/proto \
 		--proto_path=../sgl-router/src/proto \
 		../sgl-router/src/proto/sglang_scheduler.proto
 

@@ -33,12 +33,12 @@ func (s *ClientAcquisitionStage) Execute(ctx *pipeline.RequestContext) (interfac
 	// Acquire clients based on worker selection mode
 	if workers.IsDual {
 		// Dual mode: acquire prefill and decode clients
-		prefillConn, err := s.clientPool.GetClient(ctx.Context(), workers.Dual.Prefill)
+		prefillWrapper, err := s.clientPool.GetClientWrapper(ctx.Context(), workers.Dual.Prefill)
 		if err != nil {
 			return nil, fmt.Errorf("failed to acquire prefill client: %w", err)
 		}
 
-		decodeConn, err := s.clientPool.GetClient(ctx.Context(), workers.Dual.Decode)
+		decodeWrapper, err := s.clientPool.GetClientWrapper(ctx.Context(), workers.Dual.Decode)
 		if err != nil {
 			return nil, fmt.Errorf("failed to acquire decode client: %w", err)
 		}
@@ -46,18 +46,18 @@ func (s *ClientAcquisitionStage) Execute(ctx *pipeline.RequestContext) (interfac
 		ctx.State.Clients = &pipeline.ClientSelection{
 			IsDual: true,
 		}
-		ctx.State.Clients.Dual.Prefill = prefillConn
-		ctx.State.Clients.Dual.Decode = decodeConn
+		ctx.State.Clients.Dual.Prefill = prefillWrapper
+		ctx.State.Clients.Dual.Decode = decodeWrapper
 	} else {
 		// Single mode: acquire single client
-		conn, err := s.clientPool.GetClient(ctx.Context(), workers.Single)
+		wrapper, err := s.clientPool.GetClientWrapper(ctx.Context(), workers.Single)
 		if err != nil {
 			return nil, fmt.Errorf("failed to acquire client: %w", err)
 		}
 
 		ctx.State.Clients = &pipeline.ClientSelection{
 			IsDual: false,
-			Single: conn,
+			Single: wrapper,
 		}
 	}
 

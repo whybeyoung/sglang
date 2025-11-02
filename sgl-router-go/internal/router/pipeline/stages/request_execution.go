@@ -6,9 +6,10 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/sglang/sglang-router-go/internal/grpc"
 	"github.com/sglang/sglang-router-go/internal/router/pipeline"
+	"github.com/sglang/sglang-router-go/pkg/proto"
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
 )
 
 // ExecutionMode represents the execution mode
@@ -61,14 +62,14 @@ func (s *RequestExecutionStage) Execute(ctx *pipeline.RequestContext) (interface
 	}
 
 	// Convert proto request to actual proto type
-	// TODO: Replace with actual proto conversion after make generate
-	grpcRequest, err := s.convertToGRPCRequest(protoRequest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert request: %w", err)
+	grpcRequest, ok := protoRequest.(*proto.GenerateRequest)
+	if !ok {
+		return nil, fmt.Errorf("invalid proto request type: expected *proto.GenerateRequest, got %T", protoRequest)
 	}
 
 	// Execute based on mode
 	var result *pipeline.ExecutionResult
+	var err error
 	if s.mode == ExecutionModeSingle {
 		result, err = s.executeSingle(ctx.Context(), clients, grpcRequest)
 	} else {
@@ -94,42 +95,26 @@ func (s *RequestExecutionStage) Execute(ctx *pipeline.RequestContext) (interface
 func (s *RequestExecutionStage) executeSingle(
 	ctx context.Context,
 	clients *pipeline.ClientSelection,
-	grpcRequest interface{}, // TODO: Use actual proto.GenerateRequest
+	grpcRequest *proto.GenerateRequest,
 ) (*pipeline.ExecutionResult, error) {
 	if clients.IsDual {
 		return nil, fmt.Errorf("expected single client but got dual")
 	}
 
-	clientConn, ok := clients.Single.(*grpc.ClientConn)
+	clientWrapper, ok := clients.Single.(*grpc.SglangSchedulerClientWrapper)
 	if !ok {
-		return nil, fmt.Errorf("invalid client type: expected *grpc.ClientConn, got %T", clients.Single)
+		return nil, fmt.Errorf("invalid client type: expected *grpc.SglangSchedulerClientWrapper, got %T", clients.Single)
 	}
 
-	// TODO: Replace with actual proto client call after make generate
-	// After proto generation:
-	//   client := proto.NewSglangSchedulerClient(clientConn)
-	//   stream, err := client.Generate(ctx, grpcRequest.(*proto.GenerateRequest))
-	//   if err != nil {
-	//       return nil, fmt.Errorf("failed to start generation: %w", err)
-	//   }
-	//   return &pipeline.ExecutionResult{
-	//       IsDual: false,
-	//       Single: stream,
-	//   }, nil
+	// Call Generate RPC using proto client
+	stream, err := clientWrapper.Generate(ctx, grpcRequest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start generation: %w", err)
+	}
 
-	// For now, log and return placeholder
-	requestID := uuid.New().String()
-	s.Logger.Warn("gRPC Generate call using placeholder - requires proto-generated client",
-		zap.String("request_id", requestID),
-		zap.String("connection_state", clientConn.GetState().String()),
+	s.Logger.Debug("gRPC Generate stream started",
+		zap.String("request_id", grpcRequest.RequestId),
 	)
-
-	// Create a placeholder stream
-	// In actual implementation, this would be the gRPC stream from client.Generate()
-	stream := &GRPCStreamPlaceholder{
-		RequestID: requestID,
-		ctx:       ctx,
-	}
 
 	return &pipeline.ExecutionResult{
 		IsDual: false,
@@ -143,75 +128,54 @@ func (s *RequestExecutionStage) executeSingle(
 func (s *RequestExecutionStage) executeDual(
 	ctx context.Context,
 	clients *pipeline.ClientSelection,
-	grpcRequest interface{},
+	grpcRequest *proto.GenerateRequest,
 ) (*pipeline.ExecutionResult, error) {
 	if !clients.IsDual {
 		return nil, fmt.Errorf("expected dual clients but got single")
 	}
 
-	prefillConn, ok1 := clients.Dual.Prefill.(*grpc.ClientConn)
-	decodeConn, ok2 := clients.Dual.Decode.(*grpc.ClientConn)
+	prefillWrapper, ok1 := clients.Dual.Prefill.(*grpc.SglangSchedulerClientWrapper)
+	decodeWrapper, ok2 := clients.Dual.Decode.(*grpc.SglangSchedulerClientWrapper)
 	if !ok1 || !ok2 {
-		return nil, fmt.Errorf("invalid client types: expected *grpc.ClientConn, got prefill=%T, decode=%T",
+		return nil, fmt.Errorf("invalid client types: expected *grpc.SglangSchedulerClientWrapper, got prefill=%T, decode=%T",
 			clients.Dual.Prefill, clients.Dual.Decode)
 	}
 
-	// TODO: Replace with actual proto client calls after make generate
-	// After proto generation:
-	//   prefillClient := proto.NewSglangSchedulerClient(prefillConn)
-	//   decodeClient := proto.NewSglangSchedulerClient(decodeConn)
-	//
-	//   // Clone request for both workers (similar to Rust)
-	//   prefillReq := grpcRequest.(*proto.GenerateRequest) // Assuming Clone() method exists
-	//   decodeReq := prefillReq.Clone()
-	//
-	//   // Execute both in parallel (similar to Rust tokio::join!)
-	//   var prefillStream, decodeStream GenerateStream
-	//   var prefillErr, decodeErr error
-	//   var wg sync.WaitGroup
-	//   wg.Add(2)
-	//   go func() {
-	//       defer wg.Done()
-	//       prefillStream, prefillErr = prefillClient.Generate(ctx, prefillReq)
-	//   }()
-	//   go func() {
-	//       defer wg.Done()
-	//       decodeStream, decodeErr = decodeClient.Generate(ctx, decodeReq)
-	//   }()
-	//   wg.Wait()
-	//
-	//   if prefillErr != nil {
-	//       return nil, fmt.Errorf("prefill worker failed to start: %w", prefillErr)
-	//   }
-	//   if decodeErr != nil {
-	//       return nil, fmt.Errorf("decode worker failed to start: %w", decodeErr)
-	//   }
-	//
-	//   return &pipeline.ExecutionResult{
-	//       IsDual: true,
-	//       Dual: struct {
-	//           Prefill interface{}
-	//           Decode  interface{}
-	//       }{
-	//           Prefill: prefillStream,
-	//           Decode:  decodeStream,
-	//       },
-	//   }, nil
+	// Clone request for both workers (similar to Rust)
+	// Note: proto messages don't have Clone() by default, we need to manually copy
+	prefillReq := s.cloneGenerateRequest(grpcRequest)
+	decodeReq := s.cloneGenerateRequest(grpcRequest)
 
-	// For now, log and return placeholder
-	s.Logger.Warn("gRPC dual dispatch using placeholder - requires proto-generated client",
-		zap.String("prefill_state", prefillConn.GetState().String()),
-		zap.String("decode_state", decodeConn.GetState().String()),
+	// Execute both in parallel (similar to Rust tokio::join!)
+	var prefillStream proto.SglangScheduler_GenerateClient
+	var decodeStream proto.SglangScheduler_GenerateClient
+	var prefillErr, decodeErr error
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		prefillStream, prefillErr = prefillWrapper.Generate(ctx, prefillReq)
+	}()
+
+	go func() {
+		defer wg.Done()
+		decodeStream, decodeErr = decodeWrapper.Generate(ctx, decodeReq)
+	}()
+
+	wg.Wait()
+
+	if prefillErr != nil {
+		return nil, fmt.Errorf("prefill worker failed to start: %w", prefillErr)
+	}
+	if decodeErr != nil {
+		return nil, fmt.Errorf("decode worker failed to start: %w", decodeErr)
+	}
+
+	s.Logger.Debug("gRPC dual dispatch streams started",
+		zap.String("request_id", grpcRequest.RequestId),
 	)
-
-	prefillStream := &GRPCStreamPlaceholder{
-		RequestID: "prefill",
-		ctx:       ctx,
-	}
-	decodeStream := &GRPCStreamPlaceholder{
-		RequestID: "decode",
-		ctx:       ctx,
-	}
 
 	return &pipeline.ExecutionResult{
 		IsDual: true,
@@ -225,13 +189,34 @@ func (s *RequestExecutionStage) executeDual(
 	}, nil
 }
 
-// convertToGRPCRequest converts our placeholder proto request to actual proto type
-// TODO: Replace with actual conversion after proto code generation
-func (s *RequestExecutionStage) convertToGRPCRequest(req interface{}) (interface{}, error) {
-	// For now, just pass through
-	// After proto generation, convert ProtoGenerateRequest to proto.GenerateRequest
-	return req, nil
+// cloneGenerateRequest creates a deep copy of GenerateRequest
+// Note: proto messages don't have Clone() by default, so we manually copy fields
+func (s *RequestExecutionStage) cloneGenerateRequest(req *proto.GenerateRequest) *proto.GenerateRequest {
+	// Use proto.Clone if available, otherwise manual copy
+	// For now, create a new request with same fields
+	clone := &proto.GenerateRequest{
+		RequestId:            req.RequestId,
+		Tokenized:            req.Tokenized,
+		MmInputs:             req.MmInputs,
+		SamplingParams:       req.SamplingParams,
+		ReturnLogprob:        req.ReturnLogprob,
+		LogprobStartLen:      req.LogprobStartLen,
+		TopLogprobsNum:       req.TopLogprobsNum,
+		TokenIdsLogprob:      append([]uint32(nil), req.TokenIdsLogprob...),
+		ReturnHiddenStates:   req.ReturnHiddenStates,
+		DisaggregatedParams:  req.DisaggregatedParams,
+		CustomLogitProcessor: req.CustomLogitProcessor,
+		Timestamp:            req.Timestamp,
+		LogMetrics:           req.LogMetrics,
+		InputEmbeds:          append([]float32(nil), req.InputEmbeds...),
+		LoraId:               req.LoraId,
+		DataParallelRank:     req.DataParallelRank,
+		Stream:               req.Stream,
+	}
+	return clone
 }
+
+// convertToGRPCRequest is no longer needed - we now use proto.GenerateRequest directly
 
 // GRPCStreamPlaceholder is a placeholder for the actual gRPC stream
 // TODO: Replace with actual proto stream type after make generate

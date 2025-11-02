@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sglang/sglang-router-go/internal/router/pipeline"
+	"github.com/sglang/sglang-router-go/pkg/proto"
 	"go.uber.org/zap"
 )
 
@@ -31,8 +32,8 @@ func (s *DispatchMetadataStage) Execute(ctx *pipeline.RequestContext) (interface
 
 	// Get request ID from proto request if available
 	var requestID string
-	if protoReq, ok := protoRequest.(*ProtoGenerateRequest); ok {
-		requestID = protoReq.RequestID
+	if protoReq, ok := protoRequest.(*proto.GenerateRequest); ok {
+		requestID = protoReq.RequestId
 	}
 	if requestID == "" {
 		requestID = uuid.New().String()
@@ -46,7 +47,7 @@ func (s *DispatchMetadataStage) Execute(ctx *pipeline.RequestContext) (interface
 
 	// Determine if streaming
 	isStreaming := false
-	if protoReq, ok := protoRequest.(*ProtoGenerateRequest); ok {
+	if protoReq, ok := protoRequest.(*proto.GenerateRequest); ok {
 		isStreaming = protoReq.Stream
 	}
 

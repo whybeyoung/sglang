@@ -67,7 +67,7 @@ type ProcessingState struct {
 	Clients *ClientSelection
 
 	// Stage 4: Request building outputs
-	ProtoRequest interface{} // TODO: Use proper proto type
+	ProtoRequest interface{} // *proto.GenerateRequest from pkg/proto
 
 	// Stage 5: Dispatch metadata
 	Dispatch *DispatchMetadata
