@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"io"
 	"sync"
 
 	"github.com/sglang/sglang-router-go/internal/core"
@@ -74,6 +75,14 @@ type ProcessingState struct {
 
 	// Stage 6: Response processing state
 	Response *ResponseState
+}
+
+// StreamingResponse represents a streaming SSE response
+// Moved here to avoid import cycles between pipeline/stages and router packages
+type StreamingResponse struct {
+	Reader      io.Reader
+	ContentType string
+	Headers     map[string]string
 }
 
 // PreparationOutput contains outputs from the preparation stage

@@ -108,8 +108,13 @@ func (r *GrpcRouter) RouteChat(
 	// Check if this is a streaming response
 	// In Rust, streaming responses are returned directly as HTTP Response
 	// In Go, we return a StreamingResponse wrapper for HTTP server to handle
-	if streamResp, ok := response.(*StreamingResponse); ok {
-		return streamResp, nil
+	if streamResp, ok := response.(*pipeline.StreamingResponse); ok {
+		// Convert pipeline.StreamingResponse to router.StreamingResponse
+		return &StreamingResponse{
+			Reader:      streamResp.Reader,
+			ContentType: streamResp.ContentType,
+			Headers:     streamResp.Headers,
+		}, nil
 	}
 
 	// Non-streaming response
@@ -154,8 +159,13 @@ func (r *GrpcRouter) RouteGenerate(
 	}
 
 	// Check if this is a streaming response
-	if streamResp, ok := response.(*StreamingResponse); ok {
-		return streamResp, nil
+	if streamResp, ok := response.(*pipeline.StreamingResponse); ok {
+		// Convert pipeline.StreamingResponse to router.StreamingResponse
+		return &StreamingResponse{
+			Reader:      streamResp.Reader,
+			ContentType: streamResp.ContentType,
+			Headers:     streamResp.Headers,
+		}, nil
 	}
 
 	// Non-streaming response
