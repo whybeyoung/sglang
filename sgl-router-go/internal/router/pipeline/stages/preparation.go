@@ -48,9 +48,7 @@ func (s *PreparationStage) prepareChat(ctx *pipeline.RequestContext) (interface{
 
 	// Step 1: Filter tools if needed
 	// Note: In Rust, utils::filter_tools_for_request is used
-	// TODO: Implement tool filtering for Go
-	// For now, use original request
-	filteredRequest := chatReq
+	filteredRequest := FilterToolsForRequest(chatReq, s.Logger)
 
 	// Step 2: Process messages and apply chat template
 	// Note: In Rust, utils::process_chat_messages is used with tokenizer
@@ -58,17 +56,33 @@ func (s *PreparationStage) prepareChat(ctx *pipeline.RequestContext) (interface{
 	// 1. Applying chat template (model-specific formatting)
 	// 2. Converting messages to text format
 	// 3. Handling multimodal inputs (images, etc.)
-	// TODO: Implement message processing with tokenizer
-	// processedMessages := processChatMessages(filteredRequest, ctx.Components.Tokenizer)
-
-	// For now, create a simple text representation
 	var processedText string
-	for i, msg := range filteredRequest.Messages {
-		if i > 0 {
-			processedText += "\n"
+	if ctx.Components.Tokenizer != nil {
+		procMsgs, err := ProcessChatMessages(filteredRequest, ctx.Components.Tokenizer, s.Logger)
+		if err != nil {
+			s.Logger.Warn("Chat message processing failed, using simple format",
+				zap.Error(err),
+			)
+			// Fallback to simple formatting
+			for i, msg := range filteredRequest.Messages {
+				if i > 0 {
+					processedText += "\n"
+				}
+				processedText += fmt.Sprintf("%s: %s", msg.Role, msg.Content)
+			}
+		} else {
+			processedText = procMsgs.Text
+			// TODO: Store processedMessages for multimodal inputs if needed
+			_ = procMsgs
 		}
-		// Simple formatting - actual implementation should use chat template
-		processedText += fmt.Sprintf("%s: %s", msg.Role, msg.Content)
+	} else {
+		// No tokenizer - use simple formatting
+		for i, msg := range filteredRequest.Messages {
+			if i > 0 {
+				processedText += "\n"
+			}
+			processedText += fmt.Sprintf("%s: %s", msg.Role, msg.Content)
+		}
 	}
 
 	// Step 3: Tokenize the processed text
@@ -109,20 +123,70 @@ func (s *PreparationStage) prepareChat(ctx *pipeline.RequestContext) (interface{
 
 	// Step 4: Build tool constraints if needed
 	// Note: In Rust, utils::generate_tool_constraints is used
-	// TODO: Implement tool constraint generation
 	var toolConstraints *pipeline.ToolConstraints
 	if len(filteredRequest.Tools) > 0 {
-		// Basic tool constraint (actual implementation should be more sophisticated)
-		toolConstraints = &pipeline.ToolConstraints{
-			Type:  "tool_call",
-			Value: "enabled",
+		// Try to generate proper tool constraints
+		constraint, err := GenerateToolConstraints(
+			filteredRequest.Tools,
+			filteredRequest.ToolChoice,
+			filteredRequest.Model,
+			s.Logger,
+		)
+		if err == nil && constraint != nil {
+			toolConstraints = &pipeline.ToolConstraints{
+				Type:  constraint.Type,
+				Value: constraint.Value,
+			}
+		} else {
+			// Fallback to basic constraint
+			toolConstraints = &pipeline.ToolConstraints{
+				Type:  "tool_call",
+				Value: "enabled",
+			}
 		}
 	}
 
 	// Step 5: Create stop sequence decoder
 	// Note: In Rust, utils::create_stop_decoder is used
-	// TODO: Implement stop decoder
-	// stopDecoder := createStopDecoder(ctx.Components.Tokenizer, chatReq.Stop, ...)
+	var stopDecoder tokenizer.StopSequenceDecoder
+	if ctx.Components.Tokenizer != nil {
+		if tok, ok := ctx.Components.Tokenizer.(tokenizer.Tokenizer); ok {
+			// Extract stop parameters from request
+			var stopSequences []string
+			var stopTokenIDs []uint32
+			skipSpecialTokens := filteredRequest.SkipSpecialTokens
+			noStopTrim := filteredRequest.NoStopTrim
+
+			// Extract stop sequences
+			if filteredRequest.Stop != nil {
+				if stopStr, ok := filteredRequest.Stop.(string); ok {
+					stopSequences = []string{stopStr}
+				} else if stopSlice, ok := filteredRequest.Stop.([]string); ok {
+					stopSequences = stopSlice
+				} else if stopSlice, ok := filteredRequest.Stop.([]interface{}); ok {
+					for _, v := range stopSlice {
+						if str, ok := v.(string); ok {
+							stopSequences = append(stopSequences, str)
+						}
+					}
+				}
+			}
+			stopTokenIDs = filteredRequest.StopTokenIDs
+
+			// Create stop decoder
+			stopDecoder = tokenizer.CreateStopDecoder(
+				tok,
+				stopSequences,
+				stopTokenIDs,
+				skipSpecialTokens,
+				noStopTrim,
+			)
+			s.Logger.Debug("Stop decoder created",
+				zap.Int("stop_sequences", len(stopSequences)),
+				zap.Int("stop_token_ids", len(stopTokenIDs)),
+			)
+		}
+	}
 
 	// Store results in context
 	ctx.State.Preparation = &pipeline.PreparationOutput{
@@ -131,6 +195,11 @@ func (s *PreparationStage) prepareChat(ctx *pipeline.RequestContext) (interface{
 		ProcessedMessages: processedText, // Store as simple string for now
 		ToolConstraints:   toolConstraints,
 		FilteredRequest:   filteredRequest,
+	}
+
+	// Store stop decoder for reuse in response processing
+	if stopDecoder != nil {
+		ctx.State.Response.StopDecoder = stopDecoder
 	}
 
 	s.Logger.Debug("Chat request prepared",
@@ -167,8 +236,35 @@ func (s *PreparationStage) prepareGenerate(ctx *pipeline.RequestContext) (interf
 
 	// Create stop sequence decoder for generate requests
 	// Note: Stop decoder should be created from sampling params
-	// TODO: Implement stop decoder creation
-	// stopDecoder := createStopDecoder(ctx.Components.Tokenizer, ...)
+	var stopDecoder tokenizer.StopSequenceDecoder
+	if ctx.Components.Tokenizer != nil && genReq.SamplingParams != nil {
+		if tok, ok := ctx.Components.Tokenizer.(tokenizer.Tokenizer); ok {
+			sp := genReq.SamplingParams
+			stopSequences := sp.Stop
+			stopTokenIDs := sp.StopTokenIDs
+			skipSpecialTokens := true
+			if sp.SkipSpecialTokens != nil {
+				skipSpecialTokens = *sp.SkipSpecialTokens
+			}
+			noStopTrim := false
+			if sp.NoStopTrim != nil {
+				noStopTrim = *sp.NoStopTrim
+			}
+
+			// Create stop decoder
+			stopDecoder = tokenizer.CreateStopDecoder(
+				tok,
+				stopSequences,
+				stopTokenIDs,
+				skipSpecialTokens,
+				noStopTrim,
+			)
+			s.Logger.Debug("Stop decoder created for generate request",
+				zap.Int("stop_sequences", len(stopSequences)),
+				zap.Int("stop_token_ids", len(stopTokenIDs)),
+			)
+		}
+	}
 
 	ctx.State.Preparation = &pipeline.PreparationOutput{
 		OriginalText:      originalText,
@@ -176,6 +272,11 @@ func (s *PreparationStage) prepareGenerate(ctx *pipeline.RequestContext) (interf
 		ProcessedMessages: nil,
 		ToolConstraints:   nil,
 		FilteredRequest:   genReq,
+	}
+
+	// Store stop decoder for reuse in response processing
+	if stopDecoder != nil {
+		ctx.State.Response.StopDecoder = stopDecoder
 	}
 
 	s.Logger.Debug("Generate request prepared",

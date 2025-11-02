@@ -16,6 +16,7 @@ import (
 	"github.com/sglang/sglang-router-go/internal/policy"
 	"github.com/sglang/sglang-router-go/internal/router"
 	"github.com/sglang/sglang-router-go/internal/server"
+	"github.com/sglang/sglang-router-go/internal/tokenizer"
 	"go.uber.org/zap"
 )
 
@@ -52,14 +53,28 @@ func main() {
 		var connMode core.ConnectionMode
 		if strings.HasPrefix(workerURL, "grpc://") {
 			connMode = core.ConnectionModeGRPC
-		} else {
+		} else if strings.HasPrefix(workerURL, "http://") || strings.HasPrefix(workerURL, "https://") {
 			connMode = core.ConnectionModeHTTP
+		} else {
+			// Default to HTTP if no protocol prefix (assume http://)
+			connMode = core.ConnectionModeHTTP
+			if !strings.HasPrefix(workerURL, "http://") && !strings.HasPrefix(workerURL, "https://") {
+				workerURL = "http://" + workerURL
+			}
 		}
 
 		// Extract model ID from URL or use default
 		modelID := parsedURL.Query().Get("model")
 		if modelID == "" {
 			modelID = "default"
+		}
+
+		// Normalize worker URL for HTTP mode
+		if connMode == core.ConnectionModeHTTP {
+			// Ensure http:// prefix
+			if !strings.HasPrefix(workerURL, "http://") && !strings.HasPrefix(workerURL, "https://") {
+				workerURL = "http://" + workerURL
+			}
 		}
 
 		// Create worker metadata
@@ -77,10 +92,28 @@ func main() {
 		worker := core.NewBasicWorkerWithLogger(metadata, logger)
 		workerRegistry.Register(worker)
 
+		// Perform initial health check synchronously for HTTP workers
+		if connMode == core.ConnectionModeHTTP {
+			healthCtx, healthCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := worker.CheckHealth(healthCtx)
+			healthCancel()
+			if err != nil {
+				logger.Warn("Initial health check failed, worker will be checked again",
+					zap.String("url", workerURL),
+					zap.Error(err),
+				)
+			} else {
+				logger.Info("Initial health check passed",
+					zap.String("url", workerURL),
+				)
+			}
+		}
+
 		logger.Info("Registered worker",
 			zap.String("url", workerURL),
 			zap.String("model_id", modelID),
 			zap.String("connection_mode", string(connMode)),
+			zap.Bool("healthy", worker.IsHealthy()),
 		)
 	}
 
@@ -98,17 +131,67 @@ func main() {
 	}
 	policyRegistry := policy.NewPolicyRegistry(defaultPolicy)
 
-	// Create gRPC router
-	grpcRouter, err := router.NewGrpcRouter(
-		workerRegistry,
-		policyRegistry,
-		nil, // TODO: Create tokenizer when tokenizer library is integrated
-		nil, // TODO: Create tool parser factory
-		nil, // TODO: Create reasoning parser factory
-		logger,
-	)
-	if err != nil {
-		logger.Fatal("Failed to create gRPC router", zap.Error(err))
+	// Create tokenizer if tokenizer path or model path is configured
+	// Similar to Rust: tokenizer_path.or_else(|| model_path.clone())
+	var tok tokenizer.Tokenizer
+	tokenizerPath := ""
+	if cfg.TokenizerPath != nil && *cfg.TokenizerPath != "" {
+		tokenizerPath = *cfg.TokenizerPath
+	} else if cfg.ModelPath != nil && *cfg.ModelPath != "" {
+		tokenizerPath = *cfg.ModelPath
+	}
+
+	if tokenizerPath != "" {
+		var err error
+		// TODO: Add chat template path support when config supports it
+		tok, err = tokenizer.CreateTokenizerWithChatTemplateBlocking(
+			tokenizerPath,
+			nil, // chatTemplatePath
+			logger,
+		)
+		if err != nil {
+			logger.Fatal("Failed to create tokenizer",
+				zap.String("path", tokenizerPath),
+				zap.Error(err),
+			)
+		}
+		logger.Info("Tokenizer loaded",
+			zap.String("path", tokenizerPath),
+			zap.Int("vocab_size", tok.GetVocabSize()),
+		)
+	} else {
+		logger.Warn("No tokenizer configured - tokenization will use placeholder")
+	}
+
+	// Create router based on connection mode
+	var r router.Router
+	if cfg.ConnectionMode == core.ConnectionModeGRPC {
+		// Create gRPC router
+		grpcRouter, err := router.NewGrpcRouter(
+			workerRegistry,
+			policyRegistry,
+			tok,
+			nil, // TODO: Create tool parser factory
+			nil, // TODO: Create reasoning parser factory
+			logger,
+		)
+		if err != nil {
+			logger.Fatal("Failed to create gRPC router", zap.Error(err))
+		}
+		r = grpcRouter
+		logger.Info("Using gRPC router mode")
+	} else {
+		// Create HTTP router
+		httpRouter, err := router.NewHttpRouter(
+			workerRegistry,
+			policyRegistry,
+			logger,
+		)
+		if err != nil {
+			logger.Fatal("Failed to create HTTP router", zap.Error(err))
+		}
+		r = httpRouter
+		logger.Info("Using HTTP router mode")
 	}
 
 	// Start health checker
@@ -123,7 +206,7 @@ func main() {
 
 	// Start HTTP server
 	httpServer := server.NewHTTPServer(
-		grpcRouter,
+		r,               // Use router interface (can be GrpcRouter or HttpRouter)
 		registryAdapter, // Pass registry adapter for /workers endpoint
 		cfg.Host,
 		cfg.Port,

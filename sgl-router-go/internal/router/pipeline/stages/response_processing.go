@@ -65,12 +65,14 @@ func (s *ResponseProcessingStage) Execute(ctx *pipeline.RequestContext) (interfa
 				requestCtx,
 				execResult,
 				dispatch,
+				ctx.Components,
 			)
 		} else {
 			streamResp, err = s.streamProcessor.ProcessStreamingGenerate(
 				requestCtx,
 				execResult,
 				dispatch,
+				ctx.Components,
 			)
 		}
 

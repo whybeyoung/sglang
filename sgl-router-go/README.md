@@ -1,5 +1,15 @@
 # SGLang Router (Go Implementation)
 
+> ⚠️ **重要提示：这是一个学习实验分支，仅用于学习目的**
+> 
+> 本项目是为了学习和理解 Rust 版本的 `sgl-router` 架构而创建的 Go 语言实现。这不是生产环境的实现，仅用于：
+> - 学习 Rust router 的架构设计
+> - 理解 gRPC/HTTP 路由器的实现原理
+> - 实验不同的实现方式和技术栈
+> - 教育和研究目的
+> 
+> **请勿在生产环境中使用此实现。** 生产环境请使用官方 Rust 版本的 `sgl-router`。
+
 This is a Go implementation of the SGLang Router, a high-performance model routing control and data plane for large-scale LLM deployments. This implementation follows the architecture of the [Rust version](../sgl-router) and provides gRPC-based routing capabilities.
 
 ## Overview

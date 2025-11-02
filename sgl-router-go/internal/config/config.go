@@ -52,23 +52,14 @@ func LoadFromFlags() (*Config, error) {
 
 	var tokenizerPath string
 	flag.StringVar(&tokenizerPath, "tokenizer-path", "", "Path to tokenizer.json file")
-	if tokenizerPath != "" {
-		cfg.TokenizerPath = &tokenizerPath
-	}
 
 	var modelPath string
 	flag.StringVar(&modelPath, "model-path", "", "Path to model (HuggingFace ID or local path)")
-	if modelPath != "" {
-		cfg.ModelPath = &modelPath
-	}
 
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 
 	var logDir string
 	flag.StringVar(&logDir, "log-dir", "", "Log directory (optional)")
-	if logDir != "" {
-		cfg.LogDir = &logDir
-	}
 
 	flag.BoolVar(&cfg.MetricsEnabled, "enable-metrics", false, "Enable Prometheus metrics")
 	flag.StringVar(&cfg.MetricsHost, "metrics-host", "0.0.0.0", "Metrics host")
@@ -77,6 +68,19 @@ func LoadFromFlags() (*Config, error) {
 	cfg.MetricsPort = uint16(metricsPort)
 
 	flag.Parse()
+
+	// Set tokenizer and model paths after flag parsing
+	if tokenizerPath != "" {
+		cfg.TokenizerPath = &tokenizerPath
+	}
+
+	if modelPath != "" {
+		cfg.ModelPath = &modelPath
+	}
+
+	if logDir != "" {
+		cfg.LogDir = &logDir
+	}
 
 	// Parse worker URLs
 	if workerURLs != "" {
@@ -95,10 +99,12 @@ func LoadFromFlags() (*Config, error) {
 			cfg.GRPCEnabled = true
 		} else {
 			cfg.ConnectionMode = core.ConnectionModeHTTP
+			cfg.GRPCEnabled = false
 		}
 	} else {
-		cfg.ConnectionMode = core.ConnectionModeGRPC // Default to gRPC
-		cfg.GRPCEnabled = true
+		// Default to HTTP mode if no workers specified (more common for HTTP setup)
+		cfg.ConnectionMode = core.ConnectionModeHTTP
+		cfg.GRPCEnabled = false
 	}
 
 	// Validate configuration
@@ -126,6 +132,9 @@ func (c *Config) Validate() error {
 	if c.GRPCEnabled && c.TokenizerPath == nil && c.ModelPath == nil {
 		return fmt.Errorf("tokenizer-path or model-path is required for gRPC mode")
 	}
+
+	// For HTTP mode, tokenizer is optional (workers handle tokenization)
+	// No validation needed for HTTP mode
 
 	return nil
 }

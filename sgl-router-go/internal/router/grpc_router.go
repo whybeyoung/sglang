@@ -3,6 +3,8 @@ package router
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 
 	"github.com/sglang/sglang-router-go/internal/core"
 	"github.com/sglang/sglang-router-go/internal/grpc"
@@ -10,6 +12,7 @@ import (
 	"github.com/sglang/sglang-router-go/internal/protocols"
 	"github.com/sglang/sglang-router-go/internal/router/pipeline"
 	"github.com/sglang/sglang-router-go/internal/router/pipeline/stages"
+	"github.com/sglang/sglang-router-go/internal/tokenizer"
 	"go.uber.org/zap"
 )
 
@@ -27,7 +30,7 @@ type GrpcRouter struct {
 func NewGrpcRouter(
 	workerRegistry *core.WorkerRegistry,
 	policyRegistry *policy.PolicyRegistry,
-	tokenizer interface{}, // TODO: Define Tokenizer type
+	tokenizer tokenizer.Tokenizer, // Use actual Tokenizer interface
 	toolParserFactory interface{}, // TODO: Define factory type
 	reasoningParserFactory interface{}, // TODO: Define factory type
 	logger *zap.Logger,
@@ -174,4 +177,70 @@ func (r *GrpcRouter) RouteGenerate(
 	}
 
 	return generateResponse, nil
+}
+
+// RouteChatStream routes a streaming chat completion request
+func (r *GrpcRouter) RouteChatStream(
+	ctx context.Context,
+	request *protocols.ChatCompletionRequest,
+	modelID *string,
+	w http.ResponseWriter,
+) error {
+	// For gRPC router, streaming is handled through the pipeline
+	// which returns StreamingResponse. This method is for interface compatibility.
+	response, err := r.RouteChat(ctx, request, modelID)
+	if err != nil {
+		return err
+	}
+
+	if streamResp, ok := response.(*StreamingResponse); ok {
+		return r.handleStreamingResponse(w, streamResp)
+	}
+
+	// Non-streaming response in streaming request context - should not happen
+	return fmt.Errorf("unexpected non-streaming response for streaming request")
+}
+
+// RouteGenerateStream routes a streaming generate request
+func (r *GrpcRouter) RouteGenerateStream(
+	ctx context.Context,
+	request *protocols.GenerateRequest,
+	modelID *string,
+	w http.ResponseWriter,
+) error {
+	// For gRPC router, streaming is handled through the pipeline
+	// which returns StreamingResponse. This method is for interface compatibility.
+	response, err := r.RouteGenerate(ctx, request, modelID)
+	if err != nil {
+		return err
+	}
+
+	if streamResp, ok := response.(*StreamingResponse); ok {
+		return r.handleStreamingResponse(w, streamResp)
+	}
+
+	// Non-streaming response in streaming request context - should not happen
+	return fmt.Errorf("unexpected non-streaming response for streaming request")
+}
+
+// handleStreamingResponse writes a streaming SSE response
+func (r *GrpcRouter) handleStreamingResponse(w http.ResponseWriter, streamResp *StreamingResponse) error {
+	// Set SSE headers
+	w.Header().Set("Content-Type", streamResp.ContentType)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Set additional headers
+	for k, v := range streamResp.Headers {
+		w.Header().Set(k, v)
+	}
+
+	// Flush headers (important for SSE)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	// Copy stream data to response
+	_, err := io.Copy(w, streamResp.Reader)
+	return err
 }
