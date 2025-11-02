@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // ConnectionMode represents how to connect to a worker
@@ -104,16 +106,32 @@ type BasicWorker struct {
 	mu            sync.RWMutex
 	lastCheck     time.Time
 	checkInterval time.Duration
+	logger        *zap.Logger
 }
 
 // NewBasicWorker creates a new basic worker
 func NewBasicWorker(metadata *WorkerMetadata) *BasicWorker {
+	// Create a no-op logger if not provided
+	logger := zap.NewNop()
 	return &BasicWorker{
 		metadata:      metadata,
 		healthy:       true,
 		load:          0,
 		checkInterval: 60 * time.Second,
 		lastCheck:     time.Now(),
+		logger:        logger,
+	}
+}
+
+// NewBasicWorkerWithLogger creates a new basic worker with a logger
+func NewBasicWorkerWithLogger(metadata *WorkerMetadata, logger *zap.Logger) *BasicWorker {
+	return &BasicWorker{
+		metadata:      metadata,
+		healthy:       true,
+		load:          0,
+		checkInterval: 60 * time.Second,
+		lastCheck:     time.Now(),
+		logger:        logger,
 	}
 }
 
@@ -174,14 +192,30 @@ func (w *BasicWorker) DecrementLoad() {
 }
 
 func (w *BasicWorker) CheckHealth(ctx context.Context) error {
-	// TODO: Implement actual health check based on connection mode
-	// For gRPC, call HealthCheck RPC
-	// For HTTP, call /health endpoint
+	// Create health checker
+	checker := NewHealthChecker(w.logger, 5*time.Second)
+
+	// Perform health check
+	err := checker.CheckHealth(ctx, w)
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.lastCheck = time.Now()
-	// For now, assume healthy (will be implemented with actual health checks)
+
+	if err != nil {
+		w.healthy = false
+		w.logger.Debug("Worker health check failed",
+			zap.String("url", w.metadata.URL),
+			zap.Error(err),
+		)
+		return err
+	}
+
 	w.healthy = true
+	w.logger.Debug("Worker health check passed",
+		zap.String("url", w.metadata.URL),
+	)
+
 	return nil
 }
 

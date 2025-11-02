@@ -74,7 +74,7 @@ func main() {
 		}
 
 		// Create and register worker
-		worker := core.NewBasicWorker(metadata)
+		worker := core.NewBasicWorkerWithLogger(metadata, logger)
 		workerRegistry.Register(worker)
 
 		logger.Info("Registered worker",
@@ -118,9 +118,13 @@ func main() {
 	workerRegistry.StartHealthChecker(ctx, 60*time.Second)
 	defer workerRegistry.StopHealthChecker()
 
+	// Create registry adapter for HTTP server
+	registryAdapter := core.NewRegistryAdapter(workerRegistry, logger)
+
 	// Start HTTP server
 	httpServer := server.NewHTTPServer(
 		grpcRouter,
+		registryAdapter, // Pass registry adapter for /workers endpoint
 		cfg.Host,
 		cfg.Port,
 		logger,
