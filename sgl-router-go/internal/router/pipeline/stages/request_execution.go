@@ -3,6 +3,7 @@ package stages
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/sglang/sglang-router-go/internal/router/pipeline"
@@ -89,6 +90,7 @@ func (s *RequestExecutionStage) Execute(ctx *pipeline.RequestContext) (interface
 }
 
 // executeSingle executes a single-worker request
+// Similar to Rust execute_single method
 func (s *RequestExecutionStage) executeSingle(
 	ctx context.Context,
 	clients *pipeline.ClientSelection,
@@ -98,28 +100,35 @@ func (s *RequestExecutionStage) executeSingle(
 		return nil, fmt.Errorf("expected single client but got dual")
 	}
 
-	_, ok := clients.Single.(*grpc.ClientConn)
+	clientConn, ok := clients.Single.(*grpc.ClientConn)
 	if !ok {
-		return nil, fmt.Errorf("invalid client type: expected *grpc.ClientConn")
+		return nil, fmt.Errorf("invalid client type: expected *grpc.ClientConn, got %T", clients.Single)
 	}
 
 	// TODO: Replace with actual proto client call after make generate
-	// conn := clients.Single.(*grpc.ClientConn)
-	// client := proto.NewSglangSchedulerClient(conn)
-	// stream, err := client.Generate(ctx, grpcRequest.(*proto.GenerateRequest))
+	// After proto generation:
+	//   client := proto.NewSglangSchedulerClient(clientConn)
+	//   stream, err := client.Generate(ctx, grpcRequest.(*proto.GenerateRequest))
+	//   if err != nil {
+	//       return nil, fmt.Errorf("failed to start generation: %w", err)
+	//   }
+	//   return &pipeline.ExecutionResult{
+	//       IsDual: false,
+	//       Single: stream,
+	//   }, nil
 
-	// Generate request ID for placeholder
+	// For now, log and return placeholder
 	requestID := uuid.New().String()
-
-	// For now, return placeholder
-	s.Logger.Warn("gRPC Generate call not implemented - requires proto-generated client",
+	s.Logger.Warn("gRPC Generate call using placeholder - requires proto-generated client",
 		zap.String("request_id", requestID),
+		zap.String("connection_state", clientConn.GetState().String()),
 	)
 
 	// Create a placeholder stream
 	// In actual implementation, this would be the gRPC stream from client.Generate()
 	stream := &GRPCStreamPlaceholder{
 		RequestID: requestID,
+		ctx:       ctx,
 	}
 
 	return &pipeline.ExecutionResult{
@@ -129,6 +138,8 @@ func (s *RequestExecutionStage) executeSingle(
 }
 
 // executeDual executes a dual-worker (PD) request
+// Similar to Rust execute_dual_dispatch method
+// In PD mode, we dispatch to both prefill and decode workers in parallel
 func (s *RequestExecutionStage) executeDual(
 	ctx context.Context,
 	clients *pipeline.ClientSelection,
@@ -138,25 +149,69 @@ func (s *RequestExecutionStage) executeDual(
 		return nil, fmt.Errorf("expected dual clients but got single")
 	}
 
-	_, ok1 := clients.Dual.Prefill.(*grpc.ClientConn)
-	_, ok2 := clients.Dual.Decode.(*grpc.ClientConn)
+	prefillConn, ok1 := clients.Dual.Prefill.(*grpc.ClientConn)
+	decodeConn, ok2 := clients.Dual.Decode.(*grpc.ClientConn)
 	if !ok1 || !ok2 {
-		return nil, fmt.Errorf("invalid client types: expected *grpc.ClientConn")
+		return nil, fmt.Errorf("invalid client types: expected *grpc.ClientConn, got prefill=%T, decode=%T",
+			clients.Dual.Prefill, clients.Dual.Decode)
 	}
 
-	// TODO: Replace with actual proto client calls
-	// prefillConn := clients.Dual.Prefill.(*grpc.ClientConn)
-	// decodeConn := clients.Dual.Decode.(*grpc.ClientConn)
-	// prefillClient := proto.NewSglangSchedulerClient(prefillConn)
-	// decodeClient := proto.NewSglangSchedulerClient(decodeConn)
+	// TODO: Replace with actual proto client calls after make generate
+	// After proto generation:
+	//   prefillClient := proto.NewSglangSchedulerClient(prefillConn)
+	//   decodeClient := proto.NewSglangSchedulerClient(decodeConn)
 	//
-	// prefillStream, err := prefillClient.Generate(ctx, grpcRequest)
-	// decodeStream, err := decodeClient.Generate(ctx, grpcRequest)
+	//   // Clone request for both workers (similar to Rust)
+	//   prefillReq := grpcRequest.(*proto.GenerateRequest) // Assuming Clone() method exists
+	//   decodeReq := prefillReq.Clone()
+	//
+	//   // Execute both in parallel (similar to Rust tokio::join!)
+	//   var prefillStream, decodeStream GenerateStream
+	//   var prefillErr, decodeErr error
+	//   var wg sync.WaitGroup
+	//   wg.Add(2)
+	//   go func() {
+	//       defer wg.Done()
+	//       prefillStream, prefillErr = prefillClient.Generate(ctx, prefillReq)
+	//   }()
+	//   go func() {
+	//       defer wg.Done()
+	//       decodeStream, decodeErr = decodeClient.Generate(ctx, decodeReq)
+	//   }()
+	//   wg.Wait()
+	//
+	//   if prefillErr != nil {
+	//       return nil, fmt.Errorf("prefill worker failed to start: %w", prefillErr)
+	//   }
+	//   if decodeErr != nil {
+	//       return nil, fmt.Errorf("decode worker failed to start: %w", decodeErr)
+	//   }
+	//
+	//   return &pipeline.ExecutionResult{
+	//       IsDual: true,
+	//       Dual: struct {
+	//           Prefill interface{}
+	//           Decode  interface{}
+	//       }{
+	//           Prefill: prefillStream,
+	//           Decode:  decodeStream,
+	//       },
+	//   }, nil
 
-	s.Logger.Warn("gRPC dual dispatch not implemented - requires proto-generated client")
+	// For now, log and return placeholder
+	s.Logger.Warn("gRPC dual dispatch using placeholder - requires proto-generated client",
+		zap.String("prefill_state", prefillConn.GetState().String()),
+		zap.String("decode_state", decodeConn.GetState().String()),
+	)
 
-	prefillStream := &GRPCStreamPlaceholder{RequestID: "prefill"}
-	decodeStream := &GRPCStreamPlaceholder{RequestID: "decode"}
+	prefillStream := &GRPCStreamPlaceholder{
+		RequestID: "prefill",
+		ctx:       ctx,
+	}
+	decodeStream := &GRPCStreamPlaceholder{
+		RequestID: "decode",
+		ctx:       ctx,
+	}
 
 	return &pipeline.ExecutionResult{
 		IsDual: true,
@@ -180,6 +235,37 @@ func (s *RequestExecutionStage) convertToGRPCRequest(req interface{}) (interface
 
 // GRPCStreamPlaceholder is a placeholder for the actual gRPC stream
 // TODO: Replace with actual proto stream type after make generate
+// This should implement the GenerateStream interface from grpc/proto_interface.go
 type GRPCStreamPlaceholder struct {
 	RequestID string
+	ctx       context.Context
+	mu        sync.RWMutex
+	closed    bool
+}
+
+// Recv is a placeholder for receiving chunks from the stream
+func (g *GRPCStreamPlaceholder) Recv() (interface{}, error) {
+	g.mu.RLock()
+	if g.closed {
+		g.mu.RUnlock()
+		return nil, fmt.Errorf("stream closed")
+	}
+	g.mu.RUnlock()
+
+	// Wait for context cancellation
+	<-g.ctx.Done()
+	return nil, g.ctx.Err()
+}
+
+// Context returns the stream context
+func (g *GRPCStreamPlaceholder) Context() context.Context {
+	return g.ctx
+}
+
+// CloseSend closes the send direction (placeholder)
+func (g *GRPCStreamPlaceholder) CloseSend() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.closed = true
+	return nil
 }

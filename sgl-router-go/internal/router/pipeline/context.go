@@ -125,11 +125,12 @@ type DispatchMetadata struct {
 
 // ResponseState contains response processing state
 type ResponseState struct {
-	StopDecoder     interface{} // TODO: Define proper stop decoder
-	Streaming       *StreamingState
-	Collected       interface{} // For non-streaming responses
-	ExecutionResult *ExecutionResult
-	FinalResponse   interface{} // Final processed response
+	StopDecoder       interface{} // TODO: Define proper stop decoder
+	Streaming         *StreamingState
+	Collected         interface{} // For non-streaming responses
+	ExecutionResult   *ExecutionResult
+	FinalResponse     interface{} // Final processed response (non-streaming)
+	StreamingResponse interface{} // Streaming response (SSE, early pipeline exit)
 }
 
 // StreamingState tracks streaming state per choice/index

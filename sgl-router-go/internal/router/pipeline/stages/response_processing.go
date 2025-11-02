@@ -19,12 +19,14 @@ import (
 // 5. Response formatting
 type ResponseProcessingStage struct {
 	*pipeline.BaseStage
+	streamProcessor *StreamProcessor
 }
 
 // NewResponseProcessingStage creates a new response processing stage
 func NewResponseProcessingStage(logger *zap.Logger) *ResponseProcessingStage {
 	return &ResponseProcessingStage{
-		BaseStage: pipeline.NewBaseStage("ResponseProcessing", logger),
+		BaseStage:       pipeline.NewBaseStage("ResponseProcessing", logger),
+		streamProcessor: NewStreamProcessor(logger),
 	}
 }
 
@@ -49,10 +51,41 @@ func (s *ResponseProcessingStage) Execute(ctx *pipeline.RequestContext) (interfa
 	isStreaming := dispatch.IsStreaming
 
 	if isStreaming {
-		// TODO: Process streaming response
-		// In Rust: streaming_processor.process_streaming_response()
-		// For now, return error as streaming requires full stream handling
-		return nil, fmt.Errorf("streaming response processing not yet implemented - requires proto stream handling")
+		// Process streaming response
+		// Similar to Rust: streaming_processor.process_streaming_response()
+		// This should return an SSE HTTP response (early pipeline exit)
+		var streamResp interface{}
+		var err error
+
+		requestCtx := ctx.Context() // Get actual context from method
+
+		if ctx.Input.RequestType == pipeline.RequestTypeChat {
+			streamResp, err = s.streamProcessor.ProcessStreamingChat(
+				requestCtx,
+				execResult,
+				dispatch,
+			)
+		} else {
+			streamResp, err = s.streamProcessor.ProcessStreamingGenerate(
+				requestCtx,
+				execResult,
+				dispatch,
+			)
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("streaming processing failed: %w", err)
+		}
+
+		// Store streaming response (for HTTP server to return)
+		ctx.State.Response.StreamingResponse = streamResp
+
+		s.Logger.Debug("Streaming response prepared",
+			zap.String("request_id", dispatch.RequestID),
+		)
+
+		// Return early (similar to Rust Ok(Some(response)))
+		return streamResp, nil
 	}
 
 	// Non-streaming response processing
