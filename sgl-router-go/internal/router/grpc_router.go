@@ -55,8 +55,8 @@ func NewGrpcRouter(
 		stages.NewClientAcquisitionStage(clientPool, logger),
 		stages.NewRequestBuildingStage(false, logger), // No PD metadata
 		stages.NewDispatchMetadataStage(logger),
-		// TODO: Add RequestExecutionStage
-		// TODO: Add ResponseProcessingStage
+		stages.NewRequestExecutionStage(stages.ExecutionModeSingle, logger),
+		stages.NewResponseProcessingStage(logger),
 	}
 
 	requestPipeline := pipeline.NewPipeline(pipelineStages, logger)

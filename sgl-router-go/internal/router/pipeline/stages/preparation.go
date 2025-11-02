@@ -50,12 +50,20 @@ func (s *PreparationStage) prepareChat(ctx *pipeline.RequestContext) (interface{
 
 	// Step 3: Tokenize the processed text
 	// Note: In Rust, tokenizer.encode() is called
-	// TODO: Implement tokenization
-	// encoding := ctx.Components.Tokenizer.Encode(processedMessages.Text)
-	// tokenIDs := encoding.TokenIDs()
-
 	var tokenIDs []uint32
-	// tokenIDs = encoding.TokenIDs() // Placeholder
+	if ctx.Components.Tokenizer != nil {
+		// Try to use tokenizer if available
+		// TODO: Define proper tokenizer interface and use it here
+		// For now, tokenization is a placeholder
+		s.Logger.Debug("Tokenizer available but not yet integrated")
+	}
+
+	// If tokenization failed or tokenizer not available, use placeholder
+	if len(tokenIDs) == 0 {
+		// Placeholder - actual implementation requires tokenizer
+		s.Logger.Warn("Tokenization not available, using placeholder token IDs")
+		tokenIDs = []uint32{1, 2, 3} // Placeholder
+	}
 
 	// Step 4: Build tool constraints if needed
 	// Note: In Rust, utils::generate_tool_constraints is used

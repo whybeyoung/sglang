@@ -29,8 +29,14 @@ func (s *DispatchMetadataStage) Execute(ctx *pipeline.RequestContext) (interface
 		return nil, fmt.Errorf("request building stage not completed")
 	}
 
-	// Generate request ID
-	requestID := uuid.New().String()
+	// Get request ID from proto request if available
+	var requestID string
+	if protoReq, ok := protoRequest.(*ProtoGenerateRequest); ok {
+		requestID = protoReq.RequestID
+	}
+	if requestID == "" {
+		requestID = uuid.New().String()
+	}
 
 	// Get model ID
 	modelID := "unknown"
@@ -38,8 +44,11 @@ func (s *DispatchMetadataStage) Execute(ctx *pipeline.RequestContext) (interface
 		modelID = *ctx.Input.ModelID
 	}
 
-	// Determine if streaming (from request type - TODO: get from actual request)
-	isStreaming := false // TODO: Extract from request
+	// Determine if streaming
+	isStreaming := false
+	if protoReq, ok := protoRequest.(*ProtoGenerateRequest); ok {
+		isStreaming = protoReq.Stream
+	}
 
 	ctx.State.Dispatch = &pipeline.DispatchMetadata{
 		RequestID:     requestID,

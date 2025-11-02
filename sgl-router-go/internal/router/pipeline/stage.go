@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 
 	"go.uber.org/zap"
 )
@@ -82,8 +83,12 @@ func (p *Pipeline) Execute(ctx *RequestContext) (interface{}, error) {
 	}
 
 	// All stages completed, extract final response from context
-	// TODO: Extract final response from ctx.State.Response.FinalResponse
-	return nil, nil
+	if ctx.State.Response.FinalResponse != nil {
+		return ctx.State.Response.FinalResponse, nil
+	}
+
+	// No response was produced - this is an error
+	return nil, fmt.Errorf("pipeline completed but no response was produced")
 }
 
 // ExecuteWithContext creates a context and executes the pipeline
