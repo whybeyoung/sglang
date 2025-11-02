@@ -13,6 +13,7 @@ import (
 
 	"github.com/sglang/sglang-router-go/internal/config"
 	"github.com/sglang/sglang-router-go/internal/core"
+	"github.com/sglang/sglang-router-go/internal/grpc"
 	"github.com/sglang/sglang-router-go/internal/policy"
 	"github.com/sglang/sglang-router-go/internal/router"
 	"github.com/sglang/sglang-router-go/internal/server"
@@ -135,18 +136,51 @@ func main() {
 	// Similar to Rust: tokenizer_path.or_else(|| model_path.clone())
 	var tok tokenizer.Tokenizer
 	tokenizerPath := ""
+	var chatTemplatePath *string
+
 	if cfg.TokenizerPath != nil && *cfg.TokenizerPath != "" {
 		tokenizerPath = *cfg.TokenizerPath
 	} else if cfg.ModelPath != nil && *cfg.ModelPath != "" {
 		tokenizerPath = *cfg.ModelPath
+	} else if cfg.GRPCEnabled {
+		// If no tokenizer path provided and in gRPC mode, try to fetch from worker
+		logger.Info("No tokenizer path specified, attempting to fetch from worker",
+			zap.Int("worker_count", len(workerRegistry.GetAll())),
+		)
+
+		// Create client pool for fetching tokenizer (if needed)
+		// We'll need to create a temporary client pool or reuse the one created later
+		// For now, create a temporary client pool
+		tempClientPool := grpc.NewClientPool(logger)
+
+		// Fetch tokenizer info from worker
+		fetchedPath, fetchedChatTemplate, err := tokenizer.FetchTokenizerFromWorker(
+			context.Background(),
+			tempClientPool,
+			workerRegistry,
+			logger,
+		)
+		if err != nil {
+			logger.Fatal("Failed to fetch tokenizer from worker",
+				zap.Error(err),
+				zap.String("hint", "Please provide --tokenizer-path or --model-path"),
+			)
+		}
+
+		tokenizerPath = fetchedPath
+		chatTemplatePath = fetchedChatTemplate
+
+		logger.Info("Successfully fetched tokenizer info from worker",
+			zap.String("tokenizer_path", tokenizerPath),
+			zap.Bool("has_chat_template", chatTemplatePath != nil),
+		)
 	}
 
 	if tokenizerPath != "" {
 		var err error
-		// TODO: Add chat template path support when config supports it
 		tok, err = tokenizer.CreateTokenizerWithChatTemplateBlocking(
 			tokenizerPath,
-			nil, // chatTemplatePath
+			chatTemplatePath,
 			logger,
 		)
 		if err != nil {
@@ -160,6 +194,9 @@ func main() {
 			zap.Int("vocab_size", tok.GetVocabSize()),
 		)
 	} else {
+		if cfg.GRPCEnabled {
+			logger.Fatal("Tokenizer is required for gRPC mode, but could not be loaded or fetched from worker")
+		}
 		logger.Warn("No tokenizer configured - tokenization will use placeholder")
 	}
 

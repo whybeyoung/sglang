@@ -31,6 +31,7 @@ func NewClientPool(logger *zap.Logger) *ClientPool {
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithBlock(), // Wait for connection
 		},
+		// Note: grpc.WithBlock() will block until connection is established or context times out
 	}
 }
 
@@ -55,11 +56,6 @@ func (p *ClientPool) GetClient(ctx context.Context, worker core.Worker) (*grpc.C
 		conn.Close()
 	}
 
-	// Create new connection
-	p.logger.Debug("Creating new gRPC connection",
-		zap.String("url", url),
-	)
-
 	// Extract gRPC address from URL
 	// Format: grpc://host:port
 	grpcAddr, err := extractGRPCAddress(url)
@@ -67,14 +63,55 @@ func (p *ClientPool) GetClient(ctx context.Context, worker core.Worker) (*grpc.C
 		return nil, fmt.Errorf("invalid gRPC URL: %w", err)
 	}
 
+	// Create new connection
+	p.logger.Info("Creating new gRPC connection",
+		zap.String("url", url),
+		zap.String("extracted_address", grpcAddr),
+	)
+
 	// Create context with timeout for dialing
-	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// Default dial timeout is 15 seconds
+	dialTimeout := 15 * time.Second
+
+	// Check if parent context has a deadline
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline && ctx != context.Background() && ctx != context.TODO() {
+		// Parent context has a deadline, use the smaller of:
+		// - remaining time until parent deadline
+		// - default dial timeout
+		remaining := time.Until(deadline)
+		if remaining < dialTimeout {
+			dialTimeout = remaining
+			if dialTimeout <= 0 {
+				return nil, fmt.Errorf("parent context already expired")
+			}
+		}
+	}
+
+	// Create dial context with timeout
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
+
+	p.logger.Info("Dialing gRPC server",
+		zap.String("address", grpcAddr),
+		zap.Duration("timeout", dialTimeout),
+		zap.String("original_url", url),
+	)
 
 	newConn, err := grpc.DialContext(dialCtx, grpcAddr, p.dialOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial gRPC: %w", err)
+		p.logger.Error("Failed to dial gRPC server",
+			zap.String("address", grpcAddr),
+			zap.Duration("timeout", dialTimeout),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("failed to dial gRPC (address: %s, timeout: %v): %w", grpcAddr, dialTimeout, err)
 	}
+
+	p.logger.Info("Successfully connected to gRPC server",
+		zap.String("address", grpcAddr),
+		zap.String("state", newConn.GetState().String()),
+	)
 
 	// Store connection
 	p.mu.Lock()

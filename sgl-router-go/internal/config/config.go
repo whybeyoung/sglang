@@ -128,9 +128,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid policy: %s", c.Policy)
 	}
 
-	// For gRPC mode, tokenizer is required
-	if c.GRPCEnabled && c.TokenizerPath == nil && c.ModelPath == nil {
-		return fmt.Errorf("tokenizer-path or model-path is required for gRPC mode")
+	// For gRPC mode, tokenizer is required (unless it will be fetched from worker)
+	// Note: We allow gRPC mode without tokenizer-path/model-path if workers are configured
+	// The router will attempt to fetch tokenizer from worker in that case
+	if c.GRPCEnabled && c.TokenizerPath == nil && c.ModelPath == nil && len(c.WorkerURLs) == 0 {
+		return fmt.Errorf("tokenizer-path, model-path, or worker-urls is required for gRPC mode")
 	}
 
 	// For HTTP mode, tokenizer is optional (workers handle tokenization)

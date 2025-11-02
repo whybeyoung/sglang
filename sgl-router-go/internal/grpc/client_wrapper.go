@@ -36,6 +36,19 @@ func (c *SglangSchedulerClientWrapper) HealthCheck(ctx context.Context) error {
 	return err
 }
 
+// GetModelInfo gets model information including tokenizer path
+func (c *SglangSchedulerClientWrapper) GetModelInfo(ctx context.Context) (*proto.GetModelInfoResponse, error) {
+	return c.client.GetModelInfo(ctx, &proto.GetModelInfoRequest{})
+}
+
+// GetTokenizerInfo gets tokenizer files and configuration content directly
+func (c *SglangSchedulerClientWrapper) GetTokenizerInfo(ctx context.Context, requestedFiles []string) (*proto.GetTokenizerInfoResponse, error) {
+	req := &proto.GetTokenizerInfoRequest{
+		RequestedFiles: requestedFiles,
+	}
+	return c.client.GetTokenizerInfo(ctx, req)
+}
+
 // Close closes the connection (not needed, connection managed by pool)
 func (c *SglangSchedulerClientWrapper) Close() error {
 	// Connection is managed by ClientPool, don't close here
