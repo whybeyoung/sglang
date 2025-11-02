@@ -72,14 +72,20 @@ func NewGrpcRouter(
 
 // RouteChat routes a chat completion request
 // Similar to Rust route_chat_impl
+// Returns either:
+// - *protocols.ChatCompletionResponse for non-streaming
+// - StreamingResponse (SSE) for streaming requests
 func (r *GrpcRouter) RouteChat(
 	ctx context.Context,
 	request *protocols.ChatCompletionRequest,
 	modelID *string,
-) (*protocols.ChatCompletionResponse, error) {
+) (interface{}, error) {
 	r.logger.Debug("Processing chat completion request",
 		zap.Stringp("model_id", modelID),
 	)
+
+	// Store request in shared components or input for pipeline stages
+	// TODO: Add request to input if needed by stages
 
 	// Create request input
 	input := &pipeline.RequestInput{
@@ -99,7 +105,14 @@ func (r *GrpcRouter) RouteChat(
 		return nil, fmt.Errorf("pipeline execution failed: %w", err)
 	}
 
-	// Type assert to ChatCompletionResponse
+	// Check if this is a streaming response
+	// In Rust, streaming responses are returned directly as HTTP Response
+	// In Go, we return a StreamingResponse wrapper for HTTP server to handle
+	if streamResp, ok := response.(*StreamingResponse); ok {
+		return streamResp, nil
+	}
+
+	// Non-streaming response
 	chatResponse, ok := response.(*protocols.ChatCompletionResponse)
 	if !ok {
 		return nil, fmt.Errorf("unexpected response type: %T", response)
@@ -110,11 +123,14 @@ func (r *GrpcRouter) RouteChat(
 
 // RouteGenerate routes a generate request
 // Similar to Rust route_generate_impl
+// Returns either:
+// - *protocols.GenerateResponse for non-streaming
+// - StreamingResponse (SSE) for streaming requests
 func (r *GrpcRouter) RouteGenerate(
 	ctx context.Context,
 	request *protocols.GenerateRequest,
 	modelID *string,
-) (*protocols.GenerateResponse, error) {
+) (interface{}, error) {
 	r.logger.Debug("Processing generate request",
 		zap.Stringp("model_id", modelID),
 	)
@@ -137,7 +153,12 @@ func (r *GrpcRouter) RouteGenerate(
 		return nil, fmt.Errorf("pipeline execution failed: %w", err)
 	}
 
-	// Type assert to GenerateResponse
+	// Check if this is a streaming response
+	if streamResp, ok := response.(*StreamingResponse); ok {
+		return streamResp, nil
+	}
+
+	// Non-streaming response
 	generateResponse, ok := response.(*protocols.GenerateResponse)
 	if !ok {
 		return nil, fmt.Errorf("unexpected response type: %T", response)

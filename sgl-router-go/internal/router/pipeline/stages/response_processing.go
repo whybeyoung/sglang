@@ -31,6 +31,7 @@ func NewResponseProcessingStage(logger *zap.Logger) *ResponseProcessingStage {
 }
 
 // Execute implements PipelineStage
+// Similar to Rust ResponseProcessingStage::execute
 func (s *ResponseProcessingStage) Execute(ctx *pipeline.RequestContext) (interface{}, error) {
 	execResult := ctx.State.Response.ExecutionResult
 	if execResult == nil {
@@ -89,8 +90,7 @@ func (s *ResponseProcessingStage) Execute(ctx *pipeline.RequestContext) (interfa
 	}
 
 	// Non-streaming response processing
-	// TODO: Process non-streaming response
-	// In Rust: processor.process_non_streaming_chat_response() or process_non_streaming_generate_response()
+	// Similar to Rust: processor.process_non_streaming_chat_response() or process_non_streaming_generate_response()
 	// This involves:
 	// 1. Reading all chunks from stream
 	// 2. Detokenizing tokens
