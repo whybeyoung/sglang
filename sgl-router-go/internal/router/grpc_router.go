@@ -5,6 +5,9 @@ import (
 	"fmt"
 
 	"github.com/sglang/sglang-router-go/internal/core"
+	"github.com/sglang/sglang-router-go/internal/grpc"
+	"github.com/sglang/sglang-router-go/internal/policy"
+	"github.com/sglang/sglang-router-go/internal/protocols"
 	"github.com/sglang/sglang-router-go/internal/router/pipeline"
 	"github.com/sglang/sglang-router-go/internal/router/pipeline/stages"
 	"go.uber.org/zap"
@@ -16,18 +19,22 @@ type GrpcRouter struct {
 	workerRegistry   *core.WorkerRegistry
 	requestPipeline  *pipeline.Pipeline
 	sharedComponents *pipeline.SharedComponents
+	clientPool       *grpc.ClientPool
 	logger           *zap.Logger
 }
 
 // NewGrpcRouter creates a new gRPC router
 func NewGrpcRouter(
 	workerRegistry *core.WorkerRegistry,
-	policyRegistry interface{}, // TODO: Define PolicyRegistry type
+	policyRegistry *policy.PolicyRegistry,
 	tokenizer interface{}, // TODO: Define Tokenizer type
 	toolParserFactory interface{}, // TODO: Define factory type
 	reasoningParserFactory interface{}, // TODO: Define factory type
 	logger *zap.Logger,
 ) (*GrpcRouter, error) {
+	// Create client pool
+	clientPool := grpc.NewClientPool(logger)
+
 	// Create shared components
 	sharedComponents := &pipeline.SharedComponents{
 		Tokenizer:              tokenizer,
@@ -45,7 +52,7 @@ func NewGrpcRouter(
 			stages.WorkerSelectionModeRegular,
 			logger,
 		),
-		stages.NewClientAcquisitionStage(logger),
+		stages.NewClientAcquisitionStage(clientPool, logger),
 		stages.NewRequestBuildingStage(false, logger), // No PD metadata
 		stages.NewDispatchMetadataStage(logger),
 		// TODO: Add RequestExecutionStage
@@ -58,6 +65,7 @@ func NewGrpcRouter(
 		workerRegistry:   workerRegistry,
 		requestPipeline:  requestPipeline,
 		sharedComponents: sharedComponents,
+		clientPool:       clientPool,
 		logger:           logger,
 	}, nil
 }
@@ -66,9 +74,9 @@ func NewGrpcRouter(
 // Similar to Rust route_chat_impl
 func (r *GrpcRouter) RouteChat(
 	ctx context.Context,
-	request interface{}, // TODO: Define ChatCompletionRequest type
+	request *protocols.ChatCompletionRequest,
 	modelID *string,
-) (interface{}, error) {
+) (*protocols.ChatCompletionResponse, error) {
 	r.logger.Debug("Processing chat completion request",
 		zap.Stringp("model_id", modelID),
 	)
@@ -91,16 +99,22 @@ func (r *GrpcRouter) RouteChat(
 		return nil, fmt.Errorf("pipeline execution failed: %w", err)
 	}
 
-	return response, nil
+	// Type assert to ChatCompletionResponse
+	chatResponse, ok := response.(*protocols.ChatCompletionResponse)
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type: %T", response)
+	}
+
+	return chatResponse, nil
 }
 
 // RouteGenerate routes a generate request
 // Similar to Rust route_generate_impl
 func (r *GrpcRouter) RouteGenerate(
 	ctx context.Context,
-	request interface{}, // TODO: Define GenerateRequest type
+	request *protocols.GenerateRequest,
 	modelID *string,
-) (interface{}, error) {
+) (*protocols.GenerateResponse, error) {
 	r.logger.Debug("Processing generate request",
 		zap.Stringp("model_id", modelID),
 	)
@@ -123,5 +137,11 @@ func (r *GrpcRouter) RouteGenerate(
 		return nil, fmt.Errorf("pipeline execution failed: %w", err)
 	}
 
-	return response, nil
+	// Type assert to GenerateResponse
+	generateResponse, ok := response.(*protocols.GenerateResponse)
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type: %T", response)
+	}
+
+	return generateResponse, nil
 }

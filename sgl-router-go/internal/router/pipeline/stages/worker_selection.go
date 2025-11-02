@@ -21,7 +21,7 @@ const (
 type WorkerSelectionStage struct {
 	*pipeline.BaseStage
 	workerRegistry *core.WorkerRegistry
-	policyRegistry interface{} // TODO: Define PolicyRegistry interface
+	policyRegistry interface{} // PolicyRegistry interface (can be *policy.PolicyRegistry)
 	mode           WorkerSelectionMode
 }
 
