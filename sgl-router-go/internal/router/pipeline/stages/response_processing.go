@@ -105,6 +105,7 @@ func (s *ResponseProcessingStage) Execute(ctx *pipeline.RequestContext) (interfa
 			dispatch,
 			stopDecoder,
 			requestLogprobs,
+			ctx.Components,
 		)
 		if procErr != nil {
 			return nil, fmt.Errorf("failed to process chat response: %w", procErr)
@@ -117,6 +118,7 @@ func (s *ResponseProcessingStage) Execute(ctx *pipeline.RequestContext) (interfa
 			dispatch,
 			stopDecoder,
 			requestLogprobs,
+			ctx.Components,
 		)
 		if procErr != nil {
 			return nil, fmt.Errorf("failed to process generate response: %w", procErr)
