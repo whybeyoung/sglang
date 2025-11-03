@@ -63,7 +63,11 @@ class SocketMapping:
         self._mapping.clear()
 
     def register_ipc_mapping(
-        self, recv_obj: MultiTokenizerRegisterReq, worker_id: str, ipc_name: str ,is_tokenizer: bool
+        self,
+        recv_obj: MultiTokenizerRegisterReq,
+        worker_id: str,
+        ipc_name: str,
+        is_tokenizer: bool,
     ):
         type_str = "tokenizer" if is_tokenizer else "detokenizer"
         if worker_id in self._mapping:
@@ -407,7 +411,10 @@ class MultiHttpWorkerDetokenizerMixin:
             for i, worker_id in enumerate(worker_ids):
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
                     self.socket_mapping.register_ipc_mapping(
-                        recv_obj, worker_id, ipc_name=recv_obj.ipc_name, is_tokenizer=False
+                        recv_obj,
+                        worker_id,
+                        ipc_name=recv_obj.ipc_name,
+                        is_tokenizer=False,
                     )
                 else:
                     if detokenizer_worker_num > 1:
@@ -480,7 +487,10 @@ class MultiTokenizerRouter:
             for i, worker_id in enumerate(worker_ids):
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
                     self.socket_mapping.register_ipc_mapping(
-                        recv_obj, worker_id, ipc_name=recv_obj.ipc_name, is_tokenizer=True
+                        recv_obj,
+                        worker_id,
+                        ipc_name=recv_obj.ipc_name,
+                        is_tokenizer=True,
                     )
                 else:
                     new_recv_obj = _handle_output_by_index(recv_obj, i)
