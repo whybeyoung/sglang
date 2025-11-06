@@ -679,7 +679,7 @@ def write_data_for_multi_tokenizer(
     return args_shm
 
 
-def monkey_patch_uvicorn_multiprocessing(timeout: float = 20):
+def monkey_patch_uvicorn_multiprocessing(timeout: float = 120):
     """Monkey patch uvicorn multiprocessing is_alive timeout"""
     # from default 5s -> 10s
     try:
