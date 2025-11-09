@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
+pub mod ffi;
 #[cfg(feature = "grpc-client")]
 pub mod grpc_client;
 pub mod mcp;

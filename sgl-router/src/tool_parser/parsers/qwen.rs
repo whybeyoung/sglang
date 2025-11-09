@@ -345,16 +345,17 @@ impl ToolParser for QwenParser {
                     let after_tool_call = &current_text[tool_call_pos + "<tool_call>".len()..];
                     let trimmed = after_tool_call.trim();
                     
-                    // XML format: has <function= and <parameter= tags
-                    if trimmed.contains("<function=") && trimmed.contains("<parameter=") {
+                    // XML format: has <function= tag (parameter= is optional, may come later)
+                    if trimmed.contains("<function=") {
                         true
                     } else if trimmed.starts_with('{') {
                         // JSON format: starts with { (JSON object)
                         false
                     } else {
-                        // Unknown format or incomplete, default to JSON (backward compatible)
-                        // This ensures existing JSON logic is not affected
-                        false
+                        // Incomplete: haven't seen <function= or { yet
+                        // Don't set format_detected yet, wait for more content
+                        // This allows XML format to be detected when <function= appears later
+                        return Ok(StreamingParseResult::default());
                     }
                 } else {
                     // No <tool_call> found, default to JSON

@@ -334,7 +334,6 @@ pub unsafe extern "C" fn sgl_tokenizer_apply_chat_template_with_tools(
         let tools_slice = tools.as_ref().map(|t| t.as_slice());
         let params = ChatTemplateParams {
             add_generation_prompt: true,
-            continue_final_message: false,
             tools: tools_slice,
             documents: Some(&empty_docs),
             template_kwargs: None,
@@ -437,7 +436,6 @@ pub unsafe extern "C" fn sgl_tokenizer_apply_chat_template(
         let empty_docs: [Value; 0] = [];
         let params = ChatTemplateParams {
             add_generation_prompt: true,  // Important: tells the model to start generating
-            continue_final_message: false,
             tools: Some(&empty_tools),
             documents: Some(&empty_docs),
             template_kwargs: None,
@@ -579,7 +577,7 @@ pub struct ToolParserHandle {
     parser: Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>,
     model: String, // Store model name for ID generation
     history_tool_calls_count: usize, // Track tool call count for ID generation
-    tool_index_to_id: std::collections::HashMap<usize, String>, // Map tool_index to ID for incremental updates
+    tool_index_to_id: HashMap<usize, String>, // Map tool_index to ID for incremental updates
 }
 
 /// Create a tool parser
@@ -632,7 +630,7 @@ pub unsafe extern "C" fn sgl_tool_parser_create(
         parser: Arc::new(tokio::sync::Mutex::new(parser)),
         model: type_str.to_string(),
         history_tool_calls_count: 0,
-        tool_index_to_id: std::collections::HashMap::new(),
+        tool_index_to_id: HashMap::new(),
     }))
 }
 
@@ -696,7 +694,7 @@ pub unsafe extern "C" fn sgl_tool_parser_parse_complete(
 
     // Use tokio runtime to run async code
     let result = RUNTIME.block_on(async {
-        let mut parser_guard = parser.lock().await;
+        let parser_guard = parser.lock().await;
         parser_guard.parse_complete(text_str).await
     });
 
