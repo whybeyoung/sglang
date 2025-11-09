@@ -93,12 +93,12 @@ impl QwenParser {
         let extractor = Regex::new(pattern).expect("Valid regex pattern");
 
         // Precompile XML format regex patterns for performance
-        let xml_function_pattern = Regex::new(r"<function=([^>]+)>")
-            .expect("Valid XML function pattern");
+        let xml_function_pattern =
+            Regex::new(r"<function=([^>]+)>").expect("Valid XML function pattern");
         let xml_param_pattern = Regex::new(r"<parameter=([^>]+)>(.*?)</parameter>")
             .expect("Valid XML parameter pattern");
-        let xml_param_start_pattern = Regex::new(r"<parameter=([^>]+)>")
-            .expect("Valid XML parameter start pattern");
+        let xml_param_start_pattern =
+            Regex::new(r"<parameter=([^>]+)>").expect("Valid XML parameter start pattern");
 
         Self {
             partial_json: PartialJson::default(),
@@ -153,10 +153,13 @@ impl QwenParser {
     /// Parse XML format tool call: <function=name><parameter=key>value</parameter></function>
     fn parse_xml_format(&self, content: &str) -> ParserResult<Option<ToolCall>> {
         // Use precompiled regex patterns
-        let function_captures = self.xml_function_pattern.captures(content)
+        let function_captures = self
+            .xml_function_pattern
+            .captures(content)
             .ok_or_else(|| ParserError::ParsingFailed("No function name found".to_string()))?;
-        
-        let function_name = function_captures.get(1)
+
+        let function_name = function_captures
+            .get(1)
             .ok_or_else(|| ParserError::ParsingFailed("Function name capture failed".to_string()))?
             .as_str()
             .trim()
@@ -172,7 +175,7 @@ impl QwenParser {
             if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                 let key = key_match.as_str().trim().to_string();
                 let value = value_match.as_str().trim();
-                
+
                 // Try to parse value as JSON, otherwise use as string
                 match serde_json::from_str::<Value>(value) {
                     Ok(json_value) => {
@@ -240,7 +243,7 @@ impl ToolParser for QwenParser {
         for captures in self.extractor.captures_iter(text) {
             if let Some(content_str) = captures.get(1) {
                 let content = content_str.as_str().trim();
-                
+
                 // Detect format and parse accordingly
                 match self.detect_format(content) {
                     ToolCallFormat::Json => {
@@ -272,7 +275,7 @@ impl ToolParser for QwenParser {
                     ToolCallFormat::Unknown => {
                         // Try both formats as fallback
                         let mut parsed = false;
-                        
+
                         // Try JSON first
                         if let Ok(Some(tool)) = serde_json::from_str::<Value>(content)
                             .map_err(|e| ParserError::ParsingFailed(e.to_string()))
@@ -281,7 +284,7 @@ impl ToolParser for QwenParser {
                             tools.push(tool);
                             parsed = true;
                         }
-                        
+
                         // Try XML if JSON failed
                         if !parsed {
                             if let Ok(Some(tool)) = self.parse_xml_format(content) {
@@ -354,7 +357,7 @@ impl ToolParser for QwenParser {
                 if let Some(tool_call_pos) = current_text.find("<tool_call>") {
                     let after_tool_call = &current_text[tool_call_pos + "<tool_call>".len()..];
                     let trimmed = after_tool_call.trim();
-                    
+
                     // XML format: has <function= tag (parameter= is optional, may come later)
                     if trimmed.contains("<function=") {
                         true
@@ -387,7 +390,8 @@ impl ToolParser for QwenParser {
             // Determine start index for JSON parsing
             let start_idx = if let Some(pos) = current_text.find(self.individual_tool_start_token) {
                 pos + self.individual_tool_start_token.len()
-            } else if self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator) {
+            } else if self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator)
+            {
                 self.tool_call_separator.len()
             } else {
                 0
@@ -485,10 +489,7 @@ impl QwenParser {
         if !self.in_xml_tool_call && !current_text.contains("<tool_call>") {
             normal_text = self.buffer.clone();
             self.buffer.clear();
-            return Ok(StreamingParseResult {
-                normal_text,
-                calls,
-            });
+            return Ok(StreamingParseResult { normal_text, calls });
         }
 
         // Look for tool call start
@@ -517,38 +518,43 @@ impl QwenParser {
             if let Some(captures) = self.xml_function_pattern.captures(&self.buffer) {
                 if let Some(name_match) = captures.get(1) {
                     let function_name = name_match.as_str().trim().to_string();
-                    
+
                     // Validate function name
                     if tool_indices.contains_key(&function_name) {
                         self.xml_current_function_name = function_name.clone();
                         self.current_tool_name_sent = true;
-                        
+
                         // Initialize tool call tracking
                         if self.current_tool_id == -1 {
                             self.current_tool_id = 0;
                         }
-                        
+
                         // Ensure tracking arrays are large enough
                         while self.prev_tool_call_arr.len() <= self.current_tool_id as usize {
-                            self.prev_tool_call_arr.push(Value::Object(serde_json::Map::new()));
+                            self.prev_tool_call_arr
+                                .push(Value::Object(serde_json::Map::new()));
                         }
                         while self.streamed_args_for_tool.len() <= self.current_tool_id as usize {
                             self.streamed_args_for_tool.push(String::new());
                         }
-                        
+
                         // Store tool call info
                         let mut tool_obj = serde_json::Map::new();
                         tool_obj.insert("name".to_string(), Value::String(function_name.clone()));
-                        tool_obj.insert("arguments".to_string(), Value::Object(serde_json::Map::new()));
-                        self.prev_tool_call_arr[self.current_tool_id as usize] = Value::Object(tool_obj);
-                        
+                        tool_obj.insert(
+                            "arguments".to_string(),
+                            Value::Object(serde_json::Map::new()),
+                        );
+                        self.prev_tool_call_arr[self.current_tool_id as usize] =
+                            Value::Object(tool_obj);
+
                         // Send tool name with empty parameters
                         calls.push(ToolCallItem {
                             tool_index: self.current_tool_id as usize,
                             name: Some(function_name),
                             parameters: String::new(),
                         });
-                        
+
                         // Remove the processed function declaration
                         self.buffer = self.buffer[captures.get(0).unwrap().end()..].to_string();
                     } else {
@@ -556,10 +562,7 @@ impl QwenParser {
                         self.in_xml_tool_call = false;
                         normal_text.push_str(&self.buffer);
                         self.buffer.clear();
-                        return Ok(StreamingParseResult {
-                            normal_text,
-                            calls,
-                        });
+                        return Ok(StreamingParseResult { normal_text, calls });
                     }
                 }
             }
@@ -575,7 +578,7 @@ impl QwenParser {
                         self.current_parameter_key = key_match.as_str().trim().to_string();
                         self.current_parameter_value.clear();
                         self.in_parameter = true;
-                        
+
                         // Remove the opening tag from buffer
                         if let Some(m) = cap.get(0) {
                             self.buffer = self.buffer[m.end()..].to_string();
@@ -583,83 +586,91 @@ impl QwenParser {
                     }
                 }
             }
-            
+
             // If we're in a parameter, accumulate value until we see </parameter>
             if self.in_parameter {
                 if let Some(end_pos) = self.buffer.find("</parameter>") {
                     // Found complete parameter
                     let value = self.buffer[..end_pos].trim().to_string();
                     self.current_parameter_value.push_str(&value);
-                    
+
                     // Remove the closing tag and processed content from buffer
                     self.buffer = self.buffer[end_pos + "</parameter>".len()..].to_string();
-                    
+
                     // Parse and add the parameter
                     let key = self.current_parameter_key.clone();
                     let value_str = self.current_parameter_value.trim().to_string();
-                    
+
                     // Try to parse value as JSON, otherwise use as string
                     let json_value = match serde_json::from_str::<Value>(&value_str) {
                         Ok(v) => v,
                         Err(_) => Value::String(value_str),
                     };
-                    
+
                     // Add to current parameters
-                    self.xml_current_parameters.insert(key.clone(), json_value.clone());
-                    
+                    self.xml_current_parameters
+                        .insert(key.clone(), json_value.clone());
+
                     // Stream the parameter update
                     let value_json = serde_json::to_string(&json_value)
                         .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
-                    
+
                     let json_fragment = if self.xml_streamed_parameters.is_empty() {
                         format!("{{\"{}\": {}}}", key, value_json)
                     } else {
                         format!(", \"{}\": {}", key, value_json)
                     };
-                    
+
                     calls.push(ToolCallItem {
                         tool_index: self.current_tool_id as usize,
                         name: None,
                         parameters: json_fragment.clone(),
                     });
-                    
+
                     // Update streamed args
-                    let current_args = &mut self.streamed_args_for_tool[self.current_tool_id as usize];
+                    let current_args =
+                        &mut self.streamed_args_for_tool[self.current_tool_id as usize];
                     if current_args.is_empty() {
                         *current_args = format!("{{\"{}\": {}}}", key, value_json);
                     } else {
                         // Trim trailing whitespace before checking for closing brace
                         // This ensures robust handling even if there's trailing whitespace
                         let trimmed = current_args.trim_end();
-                        if trimmed.ends_with('}') {
+                        if let Some(stripped) = trimmed.strip_suffix('}') {
                             // Remove the closing brace, add new parameter, add closing brace
-                            // Use trimmed string to avoid issues with trailing whitespace
-                            *current_args = format!("{}{}}}", &trimmed[..trimmed.len()-1], json_fragment);
+                            // Use stripped string to avoid issues with trailing whitespace
+                            *current_args = format!("{}{}}}", stripped, json_fragment);
                         } else {
                             // No closing brace found, append the fragment directly
                             // Trim any trailing whitespace first to ensure clean JSON
                             *current_args = format!("{}{}", trimmed, json_fragment);
                         }
                     }
-                    
+
                     // Update streamed parameters
                     self.xml_streamed_parameters.insert(key, json_value);
-                    
+
                     // Reset parameter state
                     self.in_parameter = false;
                     self.current_parameter_key.clear();
                     self.current_parameter_value.clear();
-                    
+
                     // Update prev_tool_call_arr
-                    if let Some(tool_obj) = self.prev_tool_call_arr[self.current_tool_id as usize].as_object_mut() {
-                        tool_obj.insert("arguments".to_string(), Value::Object(self.xml_current_parameters.clone()));
+                    if let Some(tool_obj) =
+                        self.prev_tool_call_arr[self.current_tool_id as usize].as_object_mut()
+                    {
+                        tool_obj.insert(
+                            "arguments".to_string(),
+                            Value::Object(self.xml_current_parameters.clone()),
+                        );
                     }
                 } else {
                     // Parameter value is incomplete, accumulate it
                     // Check if there's any content before a potential partial closing tag
                     if let Some(partial_end) = self.buffer.find("</") {
                         // There might be a partial closing tag, only take content before it
-                        self.current_parameter_value.push_str(&self.buffer[..partial_end]);
+                        self.current_parameter_value
+                            .push_str(&self.buffer[..partial_end]);
                         self.buffer = self.buffer[partial_end..].to_string();
                     } else {
                         // No closing tag yet, accumulate all content
@@ -668,22 +679,26 @@ impl QwenParser {
                     }
                 }
             }
-            
+
             // Check if tool call is complete
             if self.buffer.contains("</tool_call>") {
                 // Before completing, check if we need to send final parameters
                 // Only send if we have parameters that haven't been fully streamed
-                if !self.xml_current_function_name.is_empty() && !self.xml_current_parameters.is_empty() {
+                if !self.xml_current_function_name.is_empty()
+                    && !self.xml_current_parameters.is_empty()
+                {
                     // Check if all parameters have been streamed
-                    let all_streamed = self.xml_current_parameters.iter().all(|(k, _)| {
-                        self.xml_streamed_parameters.contains_key(k)
-                    });
-                    
+                    let all_streamed = self
+                        .xml_current_parameters
+                        .iter()
+                        .all(|(k, _)| self.xml_streamed_parameters.contains_key(k));
+
                     if !all_streamed {
                         // Some parameters haven't been streamed, send final complete arguments
-                        let final_args_json = serde_json::to_string(&self.xml_current_parameters)
-                            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
-                        
+                        let final_args_json =
+                            serde_json::to_string(&self.xml_current_parameters)
+                                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
+
                         calls.push(ToolCallItem {
                             tool_index: self.current_tool_id as usize,
                             name: None, // Final update, no name change
@@ -693,7 +708,8 @@ impl QwenParser {
                         // All parameters streamed, but ensure JSON is complete
                         // Check if streamed args JSON is complete (has closing brace)
                         // Trim trailing whitespace before checking to handle edge cases
-                        let streamed_args = &self.streamed_args_for_tool[self.current_tool_id as usize];
+                        let streamed_args =
+                            &self.streamed_args_for_tool[self.current_tool_id as usize];
                         if !streamed_args.trim_end().ends_with('}') && !streamed_args.is_empty() {
                             // JSON incomplete, send closing brace
                             calls.push(ToolCallItem {
@@ -704,7 +720,7 @@ impl QwenParser {
                         }
                     }
                 }
-                
+
                 // Complete the tool call
                 if let Some(end_pos) = self.buffer.find("</tool_call>") {
                     self.buffer = self.buffer[end_pos + "</tool_call>".len()..].to_string();
@@ -722,9 +738,6 @@ impl QwenParser {
             }
         }
 
-        Ok(StreamingParseResult {
-            normal_text,
-            calls,
-        })
+        Ok(StreamingParseResult { normal_text, calls })
     }
 }
