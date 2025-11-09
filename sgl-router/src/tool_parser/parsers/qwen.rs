@@ -560,8 +560,6 @@ impl QwenParser {
                     self.xml_current_parameters.insert(key.clone(), json_value.clone());
                     
                     // Stream the parameter update
-                    let key_json = serde_json::to_string(&key)
-                        .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
                     let value_json = serde_json::to_string(&json_value)
                         .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
                     
