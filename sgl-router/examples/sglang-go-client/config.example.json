@@ -1,0 +1,18 @@
+{
+  "tokenizer": {
+    "path": "/path/to/tokenizer"
+  },
+  "grpc": {
+    "endpoint": "grpc://localhost:20000",
+    "timeout": 30
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": -1,
+    "max_new_tokens": 100,
+    "skip_special_tokens": true,
+    "stream": false
+  }
+}
+
