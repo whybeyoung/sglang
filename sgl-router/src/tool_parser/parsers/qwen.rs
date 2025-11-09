@@ -58,6 +58,9 @@ pub struct QwenParser {
     /// XML format streaming state
     /// Whether we're currently parsing an XML format tool call
     in_xml_tool_call: bool,
+    /// Format detection: None = not detected yet, Some(true) = XML, Some(false) = JSON
+    /// This avoids repeated format detection on every chunk
+    format_detected: Option<bool>,
     /// Current function name for XML format
     xml_current_function_name: String,
     /// Current parameters for XML format (as JSON map)
@@ -94,6 +97,7 @@ impl QwenParser {
             individual_tool_end_token: "\n</tool_call>",
             tool_call_separator: "\n",
             in_xml_tool_call: false,
+            format_detected: None,
             xml_current_function_name: String::new(),
             xml_current_parameters: serde_json::Map::new(),
             xml_streamed_parameters: serde_json::Map::new(),
@@ -322,11 +326,47 @@ impl ToolParser for QwenParser {
         // Build tool indices
         let tool_indices = helpers::get_tool_indices(tools);
 
-        // Detect format: check if we're in XML mode or if content suggests XML format
-        let is_xml_format = self.in_xml_tool_call || 
-            (self.has_tool_markers(current_text) && 
-             current_text.contains("<function=") && 
-             current_text.contains("<parameter="));
+        // Detect format: only check once, then remember it
+        // Both JSON and XML formats use the same <tool_call> tags, difference is internal content
+        // - JSON: <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
+        // - XML: <tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>
+        let is_xml_format = if self.in_xml_tool_call {
+            // Already in XML mode, continue with XML parser
+            true
+        } else if let Some(is_xml) = self.format_detected {
+            // Format already detected, reuse the result (performance optimization)
+            is_xml
+        } else {
+            // First time detection: check content inside <tool_call> tags
+            // Only check if we have <tool_call> markers
+            let detected = if self.has_tool_markers(current_text) {
+                // Find content after <tool_call> tag
+                if let Some(tool_call_pos) = current_text.find("<tool_call>") {
+                    let after_tool_call = &current_text[tool_call_pos + "<tool_call>".len()..];
+                    let trimmed = after_tool_call.trim();
+                    
+                    // XML format: has <function= and <parameter= tags
+                    if trimmed.contains("<function=") && trimmed.contains("<parameter=") {
+                        true
+                    } else if trimmed.starts_with('{') {
+                        // JSON format: starts with { (JSON object)
+                        false
+                    } else {
+                        // Unknown format or incomplete, default to JSON (backward compatible)
+                        // This ensures existing JSON logic is not affected
+                        false
+                    }
+                } else {
+                    // No <tool_call> found, default to JSON
+                    false
+                }
+            } else {
+                // No tool markers, not a tool call, default to JSON
+                false
+            };
+            self.format_detected = Some(detected);
+            detected
+        };
 
         let mut result = if is_xml_format {
             // XML format streaming parsing
@@ -408,6 +448,7 @@ impl ToolParser for QwenParser {
         );
         // Reset XML format state
         self.in_xml_tool_call = false;
+        self.format_detected = None; // Reset format detection for next tool call
         self.xml_current_function_name.clear();
         self.xml_current_parameters.clear();
         self.xml_streamed_parameters.clear();
@@ -446,6 +487,7 @@ impl QwenParser {
                 normal_text.push_str(&current_text[..s]);
                 self.buffer = current_text[s + "<tool_call>".len()..].to_string();
                 self.in_xml_tool_call = true;
+                self.format_detected = Some(true); // Mark as XML format
                 self.xml_current_function_name.clear();
                 self.xml_current_parameters.clear();
                 self.xml_streamed_parameters.clear();
@@ -622,6 +664,7 @@ impl QwenParser {
                     self.buffer = self.buffer[end_pos + "</tool_call>".len()..].to_string();
                 }
                 self.in_xml_tool_call = false;
+                self.format_detected = None; // Reset for next tool call
                 self.current_tool_id += 1;
                 self.xml_current_function_name.clear();
                 self.xml_current_parameters.clear();
