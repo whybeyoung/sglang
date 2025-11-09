@@ -4,9 +4,10 @@ version = "0.0.0"
 edition = "2021"
 
 [features]
-default = ["grpc-client"]
+default = ["grpc-client", "ffi"]
 grpc-client = []
 grpc-server = []
+ffi = []
 
 [lints.rust]
 unused_qualifications = "warn"

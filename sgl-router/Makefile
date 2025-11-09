@@ -21,7 +21,19 @@ help: ## Show this help message
 
 build: ## Build the project in release mode
 	@echo "Building SGLang Router..."
-	@cargo build --release
+	@export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Users/yangyanbo/cargobuild}" && \
+	cargo build --release
+
+build-fast: ## Build with optimizations for speed (uses sccache, parallel jobs)
+	@echo "Building SGLang Router (fast mode)..."
+	@export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Users/yangyanbo/cargobuild}" && \
+	export CARGO_BUILD_JOBS=0 && \
+	cargo build --release
+	@if command -v sccache &> /dev/null; then \
+		echo ""; \
+		echo "sccache statistics:"; \
+		sccache --show-stats; \
+	fi
 
 test: ## Run all tests
 	@echo "Running tests..."
