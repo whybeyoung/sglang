@@ -126,6 +126,13 @@ impl QwenParser {
         }
     }
 
+    /// Parse JSON format tool call from content string
+    fn parse_json_format(&self, content: &str) -> ParserResult<Option<ToolCall>> {
+        serde_json::from_str::<Value>(content)
+            .map_err(|e| ParserError::ParsingFailed(e.to_string()))
+            .and_then(|v| self.parse_single_object(&v))
+    }
+
     /// Parse a single JSON object into a ToolCall
     fn parse_single_object(&self, obj: &Value) -> ParserResult<Option<ToolCall>> {
         let name = obj.get("name").and_then(|v| v.as_str());
@@ -247,12 +254,8 @@ impl ToolParser for QwenParser {
                 // Detect format and parse accordingly
                 match self.detect_format(content) {
                     ToolCallFormat::Json => {
-                        // Try JSON format first
-                        let parsed = serde_json::from_str::<Value>(content)
-                            .map_err(|e| ParserError::ParsingFailed(e.to_string()))
-                            .and_then(|v| self.parse_single_object(&v));
-
-                        match parsed {
+                        // Parse JSON format
+                        match self.parse_json_format(content) {
                             Ok(Some(tool)) => tools.push(tool),
                             Ok(None) => continue,
                             Err(e) => {
@@ -277,10 +280,7 @@ impl ToolParser for QwenParser {
                         let mut parsed = false;
 
                         // Try JSON first
-                        if let Ok(Some(tool)) = serde_json::from_str::<Value>(content)
-                            .map_err(|e| ParserError::ParsingFailed(e.to_string()))
-                            .and_then(|v| self.parse_single_object(&v))
-                        {
+                        if let Ok(Some(tool)) = self.parse_json_format(content) {
                             tools.push(tool);
                             parsed = true;
                         }
