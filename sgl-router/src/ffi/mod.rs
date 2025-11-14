@@ -31,8 +31,12 @@ use crate::protocols::common::{
     Tool, ToolChoice, ToolChoiceValue, ToolCallDelta, FunctionCallDelta, Usage, StringOrArray,
 };
 use crate::tokenizer::stop::StopSequenceDecoder;
-use crate::grpc_client::proto;
+use crate::grpc_client::{proto, sglang_scheduler::{SglangSchedulerClient, AbortOnDropStream}};
+use crate::protocols::chat::ChatCompletionRequest;
+use crate::routers::grpc::{utils::{process_chat_messages, generate_tool_constraints}, ProcessedMessages};
 use std::collections::HashMap;
+use futures_util::StreamExt;
+use uuid::Uuid;
 
 // ============================================================================
 // Error Handling
@@ -1607,6 +1611,493 @@ async fn convert_proto_chunk_to_openai(
 pub unsafe extern "C" fn sgl_grpc_response_converter_free(handle: *mut GrpcResponseConverterHandle) {
     if !handle.is_null() {
         let _ = Box::from_raw(handle);
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Convert proto::GenerateResponse to JSON Value (since prost types don't support serde)
+fn proto_response_to_json(response: &proto::GenerateResponse) -> String {
+    let mut json_obj = serde_json::Map::new();
+    json_obj.insert("request_id".to_string(), Value::String(response.request_id.clone()));
+    
+    match &response.response {
+        Some(proto::generate_response::Response::Chunk(chunk)) => {
+            let mut chunk_obj = serde_json::Map::new();
+            chunk_obj.insert("token_ids".to_string(), 
+                Value::Array(chunk.token_ids.iter().map(|&id| Value::Number(id.into())).collect()));
+            chunk_obj.insert("prompt_tokens".to_string(), Value::Number(chunk.prompt_tokens.into()));
+            chunk_obj.insert("completion_tokens".to_string(), Value::Number(chunk.completion_tokens.into()));
+            chunk_obj.insert("cached_tokens".to_string(), Value::Number(chunk.cached_tokens.into()));
+            chunk_obj.insert("index".to_string(), Value::Number(chunk.index.into()));
+            json_obj.insert("chunk".to_string(), Value::Object(chunk_obj));
+        }
+        Some(proto::generate_response::Response::Complete(complete)) => {
+            let mut complete_obj = serde_json::Map::new();
+            complete_obj.insert("output_ids".to_string(), 
+                Value::Array(complete.output_ids.iter().map(|&id| Value::Number(id.into())).collect()));
+            complete_obj.insert("finish_reason".to_string(), Value::String(complete.finish_reason.clone()));
+            complete_obj.insert("prompt_tokens".to_string(), Value::Number(complete.prompt_tokens.into()));
+            complete_obj.insert("completion_tokens".to_string(), Value::Number(complete.completion_tokens.into()));
+            complete_obj.insert("cached_tokens".to_string(), Value::Number(complete.cached_tokens.into()));
+            complete_obj.insert("index".to_string(), Value::Number(complete.index.into()));
+            json_obj.insert("complete".to_string(), Value::Object(complete_obj));
+        }
+        Some(proto::generate_response::Response::Error(err)) => {
+            let mut error_obj = serde_json::Map::new();
+            error_obj.insert("message".to_string(), Value::String(err.message.clone()));
+            error_obj.insert("http_status_code".to_string(), Value::String(err.http_status_code.clone()));
+            error_obj.insert("details".to_string(), Value::String(err.details.clone()));
+            json_obj.insert("error".to_string(), Value::Object(error_obj));
+        }
+        None => {}
+    }
+    
+    serde_json::to_string(&Value::Object(json_obj)).unwrap_or_else(|_| "{}".to_string())
+}
+
+// ============================================================================
+// Complete Request-Response Flow FFI (Client SDK)
+// ============================================================================
+
+/// Handle for complete client SDK (gRPC client + tokenizer)
+/// This handle manages the connection to sglang and provides a complete SDK interface
+pub struct SglangClientHandle {
+    client: Arc<SglangSchedulerClient>,
+    tokenizer: Arc<dyn Tokenizer>,
+}
+
+/// Handle for an active streaming request
+/// This handle manages the stream and response converter
+pub struct SglangStreamHandle {
+    stream: Arc<tokio::sync::Mutex<AbortOnDropStream>>,
+    converter: Arc<tokio::sync::Mutex<GrpcResponseConverterHandle>>,
+    client: Arc<SglangSchedulerClient>,
+}
+
+/// Create a new SGLang client handle
+///
+/// # Arguments
+/// * `endpoint` - gRPC endpoint (e.g., "grpc://localhost:20000")
+/// * `tokenizer_path` - Path to tokenizer directory
+/// * `error_out` - Optional pointer to receive error message
+///
+/// # Returns
+/// * Pointer to SglangClientHandle on success, null on failure
+#[no_mangle]
+pub unsafe extern "C" fn sgl_client_create(
+    endpoint: *const c_char,
+    tokenizer_path: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut SglangClientHandle {
+    if endpoint.is_null() || tokenizer_path.is_null() {
+        if !error_out.is_null() {
+            let msg = CString::new("Invalid arguments: null pointer").unwrap();
+            *error_out = msg.into_raw();
+        }
+        return ptr::null_mut();
+    }
+
+    let endpoint_str = match CStr::from_ptr(endpoint).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            if !error_out.is_null() {
+                let msg = CString::new("Invalid UTF-8 in endpoint").unwrap();
+                *error_out = msg.into_raw();
+            }
+            return ptr::null_mut();
+        }
+    };
+
+    let tokenizer_path_str = match CStr::from_ptr(tokenizer_path).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            if !error_out.is_null() {
+                let msg = CString::new("Invalid UTF-8 in tokenizer_path").unwrap();
+                *error_out = msg.into_raw();
+            }
+            return ptr::null_mut();
+        }
+    };
+
+    // Create tokenizer
+    let tokenizer = match create_tokenizer_from_file(tokenizer_path_str) {
+        Ok(t) => t,
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = CString::new(format!("Failed to create tokenizer: {}", e)).unwrap();
+                *error_out = msg.into_raw();
+            }
+            return ptr::null_mut();
+        }
+    };
+
+    // Create gRPC client
+    let client = match RUNTIME.block_on(async {
+        SglangSchedulerClient::connect(endpoint_str).await
+    }) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = CString::new(format!("Failed to connect to endpoint: {}", e)).unwrap();
+                *error_out = msg.into_raw();
+            }
+            return ptr::null_mut();
+        }
+    };
+
+    Box::into_raw(Box::new(SglangClientHandle {
+        client,
+        tokenizer,
+    }))
+}
+
+/// Free a client handle
+#[no_mangle]
+pub unsafe extern "C" fn sgl_client_free(handle: *mut SglangClientHandle) {
+    if !handle.is_null() {
+        let _ = Box::from_raw(handle);
+    }
+}
+
+/// Send a chat completion request and start streaming
+///
+/// # Arguments
+/// * `client_handle` - Client handle
+/// * `request_json` - OpenAI ChatCompletionRequest as JSON string
+/// * `stream_handle_out` - Pointer to receive stream handle
+/// * `error_out` - Optional pointer to receive error message
+///
+/// # Returns
+/// * SglErrorCode::Success on success, error code on failure
+#[no_mangle]
+pub unsafe extern "C" fn sgl_client_chat_completion_stream(
+    client_handle: *mut SglangClientHandle,
+    request_json: *const c_char,
+    stream_handle_out: *mut *mut SglangStreamHandle,
+    error_out: *mut *mut c_char,
+) -> SglErrorCode {
+    if client_handle.is_null() || request_json.is_null() || stream_handle_out.is_null() {
+        if !error_out.is_null() {
+            let msg = CString::new("Invalid arguments: null pointer").unwrap();
+            *error_out = msg.into_raw();
+        }
+        return SglErrorCode::InvalidArgument;
+    }
+
+    let request_str = match CStr::from_ptr(request_json).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            if !error_out.is_null() {
+                let msg = CString::new("Invalid UTF-8 in request_json").unwrap();
+                *error_out = msg.into_raw();
+            }
+            return SglErrorCode::InvalidArgument;
+        }
+    };
+
+    let client_ref = &*client_handle;
+    let client = Arc::clone(&client_ref.client);
+    let tokenizer = Arc::clone(&client_ref.tokenizer);
+
+    // Parse OpenAI ChatCompletionRequest
+    let chat_request: ChatCompletionRequest = match serde_json::from_str(request_str) {
+        Ok(req) => req,
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = CString::new(format!("Failed to parse request JSON: {}", e)).unwrap();
+                *error_out = msg.into_raw();
+            }
+            return SglErrorCode::ParsingError;
+        }
+    };
+
+    // Process messages and apply chat template
+    let processed_messages = match process_chat_messages(&chat_request, tokenizer.as_ref()) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = CString::new(format!("Failed to process messages: {}", e)).unwrap();
+                *error_out = msg.into_raw();
+            }
+            return SglErrorCode::TokenizationError;
+        }
+    };
+
+    // Tokenize
+    let token_ids = match tokenizer.encode(&processed_messages.text) {
+        Ok(encoding) => encoding.token_ids().to_vec(),
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = CString::new(format!("Failed to tokenize: {}", e)).unwrap();
+                *error_out = msg.into_raw();
+            }
+            return SglErrorCode::TokenizationError;
+        }
+    };
+
+    // Generate tool constraints if needed
+    let tool_constraint = if let Some(tools) = chat_request.tools.as_ref() {
+        match generate_tool_constraints(tools, &chat_request.tool_choice, &chat_request.model) {
+            Ok(Some((constraint_type, constraint_value))) => Some((constraint_type, constraint_value)),
+            Ok(None) => None,
+            Err(e) => {
+                if !error_out.is_null() {
+                    let msg = CString::new(format!("Failed to generate tool constraints: {}", e)).unwrap();
+                    *error_out = msg.into_raw();
+                }
+                return SglErrorCode::ParsingError;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build GenerateRequest
+    let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+    let proto_request = match client.build_generate_request_from_chat(
+        request_id.clone(),
+        &chat_request,
+        processed_messages.text,
+        token_ids,
+        processed_messages.multimodal_inputs,
+        tool_constraint,
+    ) {
+        Ok(req) => req,
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = CString::new(format!("Failed to build generate request: {}", e)).unwrap();
+                *error_out = msg.into_raw();
+            }
+            return SglErrorCode::ParsingError;
+        }
+    };
+
+    // Send request and get stream
+    let stream = match RUNTIME.block_on(async {
+        client.generate(proto_request).await
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = CString::new(format!("Failed to send request: {}", e)).unwrap();
+                *error_out = msg.into_raw();
+            }
+            return SglErrorCode::UnknownError;
+        }
+    };
+
+    // Create response converter
+    let tools_json = chat_request.tools.as_ref()
+        .and_then(|t| serde_json::to_string(t).ok())
+        .map(|s| CString::new(s).unwrap().into_raw());
+    let tool_choice_json = chat_request.tool_choice.as_ref()
+        .and_then(|tc| serde_json::to_string(tc).ok())
+        .map(|s| CString::new(s).unwrap().into_raw());
+    let stop_json = chat_request.stop.as_ref()
+        .and_then(|s| serde_json::to_string(s).ok())
+        .map(|s| CString::new(s).unwrap().into_raw());
+    let stop_token_ids_json = chat_request.stop_token_ids.as_ref()
+        .and_then(|ids| serde_json::to_string(ids).ok())
+        .map(|s| CString::new(s).unwrap().into_raw());
+
+    // Create tokenizer handle for converter (we'll create a temporary one)
+    let tokenizer_handle = Box::into_raw(Box::new(TokenizerHandle {
+        tokenizer: Arc::clone(&tokenizer),
+    }));
+
+    let converter = sgl_grpc_response_converter_create(
+        tokenizer_handle,
+        CString::new(chat_request.model.clone()).unwrap().as_ptr(),
+        CString::new(request_id.clone()).unwrap().as_ptr(),
+        tools_json.unwrap_or(ptr::null_mut()),
+        tool_choice_json.unwrap_or(ptr::null_mut()),
+        stop_json.unwrap_or(ptr::null_mut()),
+        stop_token_ids_json.unwrap_or(ptr::null_mut()),
+        if chat_request.skip_special_tokens { 1 } else { 0 },
+        error_out,
+    );
+
+    // Free temporary tokenizer handle (converter now owns the tokenizer)
+    let _ = Box::from_raw(tokenizer_handle);
+
+    if converter.is_null() {
+        return SglErrorCode::MemoryError;
+    }
+
+    // Clean up temporary CStrings
+    if let Some(ptr) = tools_json {
+        let _ = CString::from_raw(ptr);
+    }
+    if let Some(ptr) = tool_choice_json {
+        let _ = CString::from_raw(ptr);
+    }
+    if let Some(ptr) = stop_json {
+        let _ = CString::from_raw(ptr);
+    }
+    if let Some(ptr) = stop_token_ids_json {
+        let _ = CString::from_raw(ptr);
+    }
+
+    // Create stream handle
+    *stream_handle_out = Box::into_raw(Box::new(SglangStreamHandle {
+        stream: Arc::new(tokio::sync::Mutex::new(stream)),
+        converter: Arc::new(tokio::sync::Mutex::new(*Box::from_raw(converter))),
+        client: Arc::clone(&client),
+    }));
+
+    SglErrorCode::Success
+}
+
+/// Read next chunk from stream and convert to OpenAI format
+///
+/// # Arguments
+/// * `stream_handle` - Stream handle
+/// * `response_json_out` - Pointer to receive OpenAI format JSON (must be freed with sgl_free_string)
+/// * `is_done_out` - Pointer to receive 1 if stream is done, 0 otherwise
+/// * `error_out` - Optional pointer to receive error message
+///
+/// # Returns
+/// * SglErrorCode::Success on success, error code on failure
+#[no_mangle]
+pub unsafe extern "C" fn sgl_stream_read_next(
+    stream_handle: *mut SglangStreamHandle,
+    response_json_out: *mut *mut c_char,
+    is_done_out: *mut c_int,
+    error_out: *mut *mut c_char,
+) -> SglErrorCode {
+    if stream_handle.is_null() || response_json_out.is_null() || is_done_out.is_null() {
+        if !error_out.is_null() {
+            let msg = CString::new("Invalid arguments: null pointer").unwrap();
+            *error_out = msg.into_raw();
+        }
+        return SglErrorCode::InvalidArgument;
+    }
+
+    let handle_ref = &*stream_handle;
+    let stream = Arc::clone(&handle_ref.stream);
+    let converter = Arc::clone(&handle_ref.converter);
+
+    // Read next chunk from stream
+    let chunk_result = RUNTIME.block_on(async {
+        let mut stream_guard = stream.lock().await;
+        stream_guard.next().await
+    });
+
+    match chunk_result {
+        Some(Ok(proto_response)) => {
+            // Convert proto response to OpenAI format
+            // We need to get the converter lock first
+            let conversion_result = RUNTIME.block_on(async {
+                let mut converter_guard = converter.lock().await;
+                
+                // Clone necessary fields for conversion
+                let tokenizer = Arc::clone(&converter_guard.tokenizer);
+                let model = converter_guard.model.clone();
+                let request_id = converter_guard.request_id.clone();
+                let created = converter_guard.created;
+                let system_fingerprint = converter_guard.system_fingerprint.clone();
+                
+                // Call the conversion function
+                convert_proto_chunk_to_openai(
+                    proto_response.clone(),
+                    &mut *converter_guard,
+                    &tokenizer,
+                    &model,
+                    &request_id,
+                    created,
+                    system_fingerprint.as_deref(),
+                )
+                .await
+            });
+
+            match conversion_result {
+                Ok(Some(openai_response)) => {
+                    // Serialize to JSON
+                    let result_str = match serde_json::to_string(&openai_response) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            if !error_out.is_null() {
+                                let msg = CString::new(format!("Failed to serialize response: {}", e)).unwrap();
+                                *error_out = msg.into_raw();
+                            }
+                            return SglErrorCode::ParsingError;
+                        }
+                    };
+
+                    let result_cstr = match CString::new(result_str) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            if !error_out.is_null() {
+                                let msg = CString::new(format!("Failed to create result string: {}", e)).unwrap();
+                                *error_out = msg.into_raw();
+                            }
+                            return SglErrorCode::MemoryError;
+                        }
+                    };
+
+                    // Check if this is a complete response (stream done)
+                    let is_complete = matches!(proto_response.response, Some(proto::generate_response::Response::Complete(_)) | Some(proto::generate_response::Response::Error(_)));
+
+                    *response_json_out = result_cstr.into_raw();
+                    *is_done_out = if is_complete { 1 } else { 0 };
+
+                    if is_complete {
+                        // Mark stream as completed
+                        RUNTIME.block_on(async {
+                            let stream_guard = stream.lock().await;
+                            stream_guard.mark_completed();
+                        });
+                    }
+
+                    SglErrorCode::Success
+                }
+                Ok(None) => {
+                    // No response to send (e.g., empty chunk)
+                    *response_json_out = ptr::null_mut();
+                    *is_done_out = 0;
+                    SglErrorCode::Success
+                }
+                Err(e) => {
+                    if !error_out.is_null() {
+                        let msg = CString::new(format!("Conversion error: {}", e)).unwrap();
+                        *error_out = msg.into_raw();
+                    }
+                    SglErrorCode::ParsingError
+                }
+            }
+        }
+        Some(Err(e)) => {
+            if !error_out.is_null() {
+                let msg = CString::new(format!("Stream error: {}", e)).unwrap();
+                *error_out = msg.into_raw();
+            }
+            *is_done_out = 1;
+            SglErrorCode::UnknownError
+        }
+        None => {
+            // Stream ended
+            *response_json_out = ptr::null_mut();
+            *is_done_out = 1;
+            SglErrorCode::Success
+        }
+    }
+}
+
+/// Free a stream handle
+#[no_mangle]
+pub unsafe extern "C" fn sgl_stream_free(handle: *mut SglangStreamHandle) {
+    if !handle.is_null() {
+        let handle_ref = Box::from_raw(handle);
+        // Free converter
+        let converter = Arc::try_unwrap(handle_ref.converter)
+            .ok()
+            .map(|m| m.into_inner());
+        if let Some(conv) = converter {
+            sgl_grpc_response_converter_free(Box::into_raw(Box::new(conv)));
+        }
     }
 }
 
