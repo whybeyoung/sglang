@@ -29,11 +29,11 @@ DEFAULT_TOKENIZER_PATH="${SGL_TOKENIZER_PATH:-/Users/yangyanbo/projects/iflytek/
 # Default endpoint
 DEFAULT_ENDPOINT="${SGL_GRPC_ENDPOINT:-grpc://10.109.185.20:8001}"
 # Default parser type
-DEFAULT_PARSER_TYPE="qwen"
+DEFAULT_PARSER_TYPE="qwen_coder"
 
 TOKENIZER_PATH="${1:-${DEFAULT_TOKENIZER_PATH}}"
 ENDPOINT="${2:-${DEFAULT_ENDPOINT}}"
-PARSER_TYPE="${3:-${DEFAULT_PARSER_TYPE}}"
+PARSER_TYPE=qwen_coder
 
 echo "Running streaming tool call example..."
 echo "Library path: ${LIB_DIR}"

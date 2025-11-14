@@ -54,51 +54,14 @@ pub struct QwenParser {
     individual_tool_start_token: &'static str,
     individual_tool_end_token: &'static str,
     tool_call_separator: &'static str,
-
-    /// XML format streaming state
-    /// Whether we're currently parsing an XML format tool call
-    in_xml_tool_call: bool,
-    /// Format detection: None = not detected yet, Some(true) = XML, Some(false) = JSON
-    /// This avoids repeated format detection on every chunk
-    format_detected: Option<bool>,
-    /// Current function name for XML format
-    xml_current_function_name: String,
-    /// Current parameters for XML format (as JSON map)
-    xml_current_parameters: serde_json::Map<String, Value>,
-    /// Streamed parameters for XML format (for diff calculation)
-    xml_streamed_parameters: serde_json::Map<String, Value>,
-    /// Whether we're currently inside a parameter tag
-    in_parameter: bool,
-    /// Current parameter key being parsed
-    current_parameter_key: String,
-    /// Buffer for current parameter value (accumulated across chunks)
-    current_parameter_value: String,
-
-    /// Precompiled regex patterns for XML format parsing
-    /// Pattern for matching function name: <function=name>
-    xml_function_pattern: Regex,
-    /// Pattern for matching complete parameter: <parameter=key>value</parameter>
-    xml_param_pattern: Regex,
-    /// Pattern for matching parameter start tag: <parameter=key>
-    xml_param_start_pattern: Regex,
 }
 
 impl QwenParser {
     /// Create a new Qwen parser
     pub fn new() -> Self {
         // Use (?s) flag for DOTALL mode to handle newlines
-        // Support both JSON format: <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
-        // and XML format: <tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>
-        let pattern = r"(?s)<tool_call>\s*(.*?)\s*</tool_call>";
+        let pattern = r"(?s)<tool_call>\n(.*?)\n</tool_call>";
         let extractor = Regex::new(pattern).expect("Valid regex pattern");
-
-        // Precompile XML format regex patterns for performance
-        let xml_function_pattern =
-            Regex::new(r"<function=([^>]+)>").expect("Valid XML function pattern");
-        let xml_param_pattern = Regex::new(r"<parameter=([^>]+)>(.*?)</parameter>")
-            .expect("Valid XML parameter pattern");
-        let xml_param_start_pattern =
-            Regex::new(r"<parameter=([^>]+)>").expect("Valid XML parameter start pattern");
 
         Self {
             partial_json: PartialJson::default(),
@@ -112,25 +75,7 @@ impl QwenParser {
             individual_tool_start_token: "<tool_call>\n",
             individual_tool_end_token: "\n</tool_call>",
             tool_call_separator: "\n",
-            in_xml_tool_call: false,
-            format_detected: None,
-            xml_current_function_name: String::new(),
-            xml_current_parameters: serde_json::Map::new(),
-            xml_streamed_parameters: serde_json::Map::new(),
-            in_parameter: false,
-            current_parameter_key: String::new(),
-            current_parameter_value: String::new(),
-            xml_function_pattern,
-            xml_param_pattern,
-            xml_param_start_pattern,
         }
-    }
-
-    /// Parse JSON format tool call from content string
-    fn parse_json_format(&self, content: &str) -> ParserResult<Option<ToolCall>> {
-        serde_json::from_str::<Value>(content)
-            .map_err(|e| ParserError::ParsingFailed(e.to_string()))
-            .and_then(|v| self.parse_single_object(&v))
     }
 
     /// Parse a single JSON object into a ToolCall
@@ -156,75 +101,6 @@ impl QwenParser {
             Ok(None)
         }
     }
-
-    /// Parse XML format tool call: <function=name><parameter=key>value</parameter></function>
-    fn parse_xml_format(&self, content: &str) -> ParserResult<Option<ToolCall>> {
-        // Use precompiled regex patterns
-        let function_captures = self
-            .xml_function_pattern
-            .captures(content)
-            .ok_or_else(|| ParserError::ParsingFailed("No function name found".to_string()))?;
-
-        let function_name = function_captures
-            .get(1)
-            .ok_or_else(|| ParserError::ParsingFailed("Function name capture failed".to_string()))?
-            .as_str()
-            .trim()
-            .to_string();
-
-        if function_name.is_empty() {
-            return Ok(None);
-        }
-
-        let mut parameters = serde_json::Map::new();
-
-        for cap in self.xml_param_pattern.captures_iter(content) {
-            if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
-                let key = key_match.as_str().trim().to_string();
-                let value = value_match.as_str().trim();
-
-                // Try to parse value as JSON, otherwise use as string
-                match serde_json::from_str::<Value>(value) {
-                    Ok(json_value) => {
-                        parameters.insert(key, json_value);
-                    }
-                    Err(_) => {
-                        // If not valid JSON, treat as string
-                        parameters.insert(key, Value::String(value.to_string()));
-                    }
-                }
-            }
-        }
-
-        let arguments = serde_json::to_string(&parameters)
-            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
-
-        Ok(Some(ToolCall {
-            function: FunctionCall {
-                name: function_name,
-                arguments,
-            },
-        }))
-    }
-
-    /// Detect if content is JSON or XML format
-    fn detect_format(&self, content: &str) -> ToolCallFormat {
-        // Check for XML format markers
-        if content.contains("<function=") && content.contains("<parameter=") {
-            ToolCallFormat::Xml
-        } else if content.trim_start().starts_with('{') {
-            ToolCallFormat::Json
-        } else {
-            ToolCallFormat::Unknown
-        }
-    }
-}
-
-/// Format of tool call content inside <tool_call> tags
-enum ToolCallFormat {
-    Json,
-    Xml,
-    Unknown,
 }
 
 impl Default for QwenParser {
@@ -248,49 +124,17 @@ impl ToolParser for QwenParser {
         // Extract tool calls
         let mut tools = Vec::new();
         for captures in self.extractor.captures_iter(text) {
-            if let Some(content_str) = captures.get(1) {
-                let content = content_str.as_str().trim();
+            if let Some(json_str) = captures.get(1) {
+                let parsed = serde_json::from_str::<Value>(json_str.as_str().trim())
+                    .map_err(|e| ParserError::ParsingFailed(e.to_string()))
+                    .and_then(|v| self.parse_single_object(&v));
 
-                // Detect format and parse accordingly
-                match self.detect_format(content) {
-                    ToolCallFormat::Json => {
-                        // Parse JSON format
-                        match self.parse_json_format(content) {
-                            Ok(Some(tool)) => tools.push(tool),
-                            Ok(None) => continue,
-                            Err(e) => {
-                                tracing::warn!("Failed to parse JSON tool call: {:?}", e);
-                                continue;
-                            }
-                        }
-                    }
-                    ToolCallFormat::Xml => {
-                        // Try XML format
-                        match self.parse_xml_format(content) {
-                            Ok(Some(tool)) => tools.push(tool),
-                            Ok(None) => continue,
-                            Err(e) => {
-                                tracing::warn!("Failed to parse XML tool call: {:?}", e);
-                                continue;
-                            }
-                        }
-                    }
-                    ToolCallFormat::Unknown => {
-                        // Try both formats as fallback
-                        let mut parsed = false;
-
-                        // Try JSON first
-                        if let Ok(Some(tool)) = self.parse_json_format(content) {
-                            tools.push(tool);
-                            parsed = true;
-                        }
-
-                        // Try XML if JSON failed
-                        if !parsed {
-                            if let Ok(Some(tool)) = self.parse_xml_format(content) {
-                                tools.push(tool);
-                            }
-                        }
+                match parsed {
+                    Ok(Some(tool)) => tools.push(tool),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse tool call: {:?}", e);
+                        continue;
                     }
                 }
             }
@@ -315,8 +159,7 @@ impl ToolParser for QwenParser {
 
         // Check if current_text has tool_call
         let has_tool_start = self.has_tool_markers(current_text)
-            || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator))
-            || self.in_xml_tool_call;
+            || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
@@ -339,76 +182,26 @@ impl ToolParser for QwenParser {
         // Build tool indices
         let tool_indices = helpers::get_tool_indices(tools);
 
-        // Detect format: only check once, then remember it
-        // Both JSON and XML formats use the same <tool_call> tags, difference is internal content
-        // - JSON: <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
-        // - XML: <tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>
-        let is_xml_format = if self.in_xml_tool_call {
-            // Already in XML mode, continue with XML parser
-            true
-        } else if let Some(is_xml) = self.format_detected {
-            // Format already detected, reuse the result (performance optimization)
-            is_xml
+        // Determine start index for JSON parsing
+        let start_idx = if let Some(pos) = current_text.find(self.individual_tool_start_token) {
+            pos + self.individual_tool_start_token.len()
+        } else if self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator) {
+            self.tool_call_separator.len()
         } else {
-            // First time detection: check content inside <tool_call> tags
-            // Only check if we have <tool_call> markers
-            let detected = if self.has_tool_markers(current_text) {
-                // Find content after <tool_call> tag
-                if let Some(tool_call_pos) = current_text.find("<tool_call>") {
-                    let after_tool_call = &current_text[tool_call_pos + "<tool_call>".len()..];
-                    let trimmed = after_tool_call.trim();
-
-                    // XML format: has <function= tag (parameter= is optional, may come later)
-                    if trimmed.contains("<function=") {
-                        true
-                    } else if trimmed.starts_with('{') {
-                        // JSON format: starts with { (JSON object)
-                        false
-                    } else {
-                        // Incomplete: haven't seen <function= or { yet
-                        // Don't set format_detected yet, wait for more content
-                        // This allows XML format to be detected when <function= appears later
-                        return Ok(StreamingParseResult::default());
-                    }
-                } else {
-                    // No <tool_call> found, default to JSON
-                    false
-                }
-            } else {
-                // No tool markers, not a tool call, default to JSON
-                false
-            };
-            self.format_detected = Some(detected);
-            detected
+            0
         };
 
-        let mut result = if is_xml_format {
-            // XML format streaming parsing
-            self.parse_xml_incremental(current_text, &tool_indices)?
-        } else {
-            // JSON format streaming parsing
-            // Determine start index for JSON parsing
-            let start_idx = if let Some(pos) = current_text.find(self.individual_tool_start_token) {
-                pos + self.individual_tool_start_token.len()
-            } else if self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator)
-            {
-                self.tool_call_separator.len()
-            } else {
-                0
-            };
-
-            helpers::handle_json_tool_streaming(
-                current_text,
-                start_idx,
-                &mut self.partial_json,
-                &tool_indices,
-                &mut self.buffer,
-                &mut self.current_tool_id,
-                &mut self.current_tool_name_sent,
-                &mut self.streamed_args_for_tool,
-                &mut self.prev_tool_call_arr,
-            )?
-        };
+        let mut result = helpers::handle_json_tool_streaming(
+            current_text,
+            start_idx,
+            &mut self.partial_json,
+            &tool_indices,
+            &mut self.buffer,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+            &mut self.prev_tool_call_arr,
+        )?;
 
         // Qwen-specific: Handle partial end tokens in normal text
         // After tool calls complete, normal text might contain partial "</tool_call>" tags
@@ -461,283 +254,5 @@ impl ToolParser for QwenParser {
             &mut self.current_tool_name_sent,
             &mut self.streamed_args_for_tool,
         );
-        // Reset XML format state
-        self.in_xml_tool_call = false;
-        self.format_detected = None; // Reset format detection for next tool call
-        self.xml_current_function_name.clear();
-        self.xml_current_parameters.clear();
-        self.xml_streamed_parameters.clear();
-        self.in_parameter = false;
-        self.current_parameter_key.clear();
-        self.current_parameter_value.clear();
-    }
-}
-
-impl QwenParser {
-    /// Parse XML format tool calls incrementally (similar to Python Qwen3CoderDetector)
-    fn parse_xml_incremental(
-        &mut self,
-        current_text: &str,
-        tool_indices: &std::collections::HashMap<String, usize>,
-    ) -> ParserResult<StreamingParseResult> {
-        use crate::tool_parser::types::ToolCallItem;
-
-        let mut normal_text = String::new();
-        let mut calls: Vec<ToolCallItem> = vec![];
-
-        // If we're not in a tool call and don't see a start token, return normal text
-        if !self.in_xml_tool_call && !current_text.contains("<tool_call>") {
-            normal_text = self.buffer.clone();
-            self.buffer.clear();
-            return Ok(StreamingParseResult { normal_text, calls });
-        }
-
-        // Look for tool call start
-        if !self.in_xml_tool_call {
-            if let Some(s) = current_text.find("<tool_call>") {
-                normal_text.push_str(&current_text[..s]);
-                self.buffer = current_text[s + "<tool_call>".len()..].to_string();
-                self.in_xml_tool_call = true;
-                self.format_detected = Some(true); // Mark as XML format
-                self.xml_current_function_name.clear();
-                self.xml_current_parameters.clear();
-                self.xml_streamed_parameters.clear();
-                self.current_tool_name_sent = false;
-                self.in_parameter = false;
-                self.current_parameter_key.clear();
-                self.current_parameter_value.clear();
-            } else {
-                // Partial start token, keep buffering
-                return Ok(StreamingParseResult::default());
-            }
-        }
-
-        // We're in a tool call, try to parse function name if not sent yet
-        if !self.current_tool_name_sent {
-            // Use precompiled regex pattern
-            if let Some(captures) = self.xml_function_pattern.captures(&self.buffer) {
-                if let Some(name_match) = captures.get(1) {
-                    let function_name = name_match.as_str().trim().to_string();
-
-                    // Validate function name
-                    if tool_indices.contains_key(&function_name) {
-                        self.xml_current_function_name = function_name.clone();
-                        self.current_tool_name_sent = true;
-
-                        // Initialize tool call tracking
-                        if self.current_tool_id == -1 {
-                            self.current_tool_id = 0;
-                        }
-
-                        // Ensure tracking arrays are large enough
-                        while self.prev_tool_call_arr.len() <= self.current_tool_id as usize {
-                            self.prev_tool_call_arr
-                                .push(Value::Object(serde_json::Map::new()));
-                        }
-                        while self.streamed_args_for_tool.len() <= self.current_tool_id as usize {
-                            self.streamed_args_for_tool.push(String::new());
-                        }
-
-                        // Store tool call info
-                        let mut tool_obj = serde_json::Map::new();
-                        tool_obj.insert("name".to_string(), Value::String(function_name.clone()));
-                        tool_obj.insert(
-                            "arguments".to_string(),
-                            Value::Object(serde_json::Map::new()),
-                        );
-                        self.prev_tool_call_arr[self.current_tool_id as usize] =
-                            Value::Object(tool_obj);
-
-                        // Send tool name with empty parameters
-                        calls.push(ToolCallItem {
-                            tool_index: self.current_tool_id as usize,
-                            name: Some(function_name),
-                            parameters: String::new(),
-                        });
-
-                        // Remove the processed function declaration
-                        self.buffer = self.buffer[captures.get(0).unwrap().end()..].to_string();
-                    } else {
-                        // Invalid function name, reset state
-                        self.in_xml_tool_call = false;
-                        normal_text.push_str(&self.buffer);
-                        self.buffer.clear();
-                        return Ok(StreamingParseResult { normal_text, calls });
-                    }
-                }
-            }
-        }
-
-        // Parse parameters incrementally
-        if self.current_tool_name_sent {
-            // Use precompiled regex pattern
-            // Check if we're entering a new parameter
-            if !self.in_parameter {
-                if let Some(cap) = self.xml_param_start_pattern.captures(&self.buffer) {
-                    if let Some(key_match) = cap.get(1) {
-                        self.current_parameter_key = key_match.as_str().trim().to_string();
-                        self.current_parameter_value.clear();
-                        self.in_parameter = true;
-
-                        // Remove the opening tag from buffer
-                        if let Some(m) = cap.get(0) {
-                            self.buffer = self.buffer[m.end()..].to_string();
-                        }
-                    }
-                }
-            }
-
-            // If we're in a parameter, accumulate value until we see </parameter>
-            if self.in_parameter {
-                if let Some(end_pos) = self.buffer.find("</parameter>") {
-                    // Found complete parameter
-                    let value = self.buffer[..end_pos].trim().to_string();
-                    self.current_parameter_value.push_str(&value);
-
-                    // Remove the closing tag and processed content from buffer
-                    self.buffer = self.buffer[end_pos + "</parameter>".len()..].to_string();
-
-                    // Parse and add the parameter
-                    let key = self.current_parameter_key.clone();
-                    let value_str = self.current_parameter_value.trim().to_string();
-
-                    // Try to parse value as JSON, otherwise use as string
-                    let json_value = match serde_json::from_str::<Value>(&value_str) {
-                        Ok(v) => v,
-                        Err(_) => Value::String(value_str),
-                    };
-
-                    // Add to current parameters
-                    self.xml_current_parameters
-                        .insert(key.clone(), json_value.clone());
-
-                    // Stream the parameter update
-                    let value_json = serde_json::to_string(&json_value)
-                        .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
-
-                    let json_fragment = if self.xml_streamed_parameters.is_empty() {
-                        format!("{{\"{}\": {}}}", key, value_json)
-                    } else {
-                        format!(", \"{}\": {}", key, value_json)
-                    };
-
-                    calls.push(ToolCallItem {
-                        tool_index: self.current_tool_id as usize,
-                        name: None,
-                        parameters: json_fragment.clone(),
-                    });
-
-                    // Update streamed args
-                    let current_args =
-                        &mut self.streamed_args_for_tool[self.current_tool_id as usize];
-                    if current_args.is_empty() {
-                        *current_args = format!("{{\"{}\": {}}}", key, value_json);
-                    } else {
-                        // Trim trailing whitespace before checking for closing brace
-                        // This ensures robust handling even if there's trailing whitespace
-                        let trimmed = current_args.trim_end();
-                        if let Some(stripped) = trimmed.strip_suffix('}') {
-                            // Remove the closing brace, add new parameter, add closing brace
-                            // Use stripped string to avoid issues with trailing whitespace
-                            *current_args = format!("{}{}}}", stripped, json_fragment);
-                        } else {
-                            // No closing brace found, append the fragment directly
-                            // Trim any trailing whitespace first to ensure clean JSON
-                            *current_args = format!("{}{}", trimmed, json_fragment);
-                        }
-                    }
-
-                    // Update streamed parameters
-                    self.xml_streamed_parameters.insert(key, json_value);
-
-                    // Reset parameter state
-                    self.in_parameter = false;
-                    self.current_parameter_key.clear();
-                    self.current_parameter_value.clear();
-
-                    // Update prev_tool_call_arr
-                    if let Some(tool_obj) =
-                        self.prev_tool_call_arr[self.current_tool_id as usize].as_object_mut()
-                    {
-                        tool_obj.insert(
-                            "arguments".to_string(),
-                            Value::Object(self.xml_current_parameters.clone()),
-                        );
-                    }
-                } else {
-                    // Parameter value is incomplete, accumulate it
-                    // Check if there's any content before a potential partial closing tag
-                    if let Some(partial_end) = self.buffer.find("</") {
-                        // There might be a partial closing tag, only take content before it
-                        self.current_parameter_value
-                            .push_str(&self.buffer[..partial_end]);
-                        self.buffer = self.buffer[partial_end..].to_string();
-                    } else {
-                        // No closing tag yet, accumulate all content
-                        self.current_parameter_value.push_str(&self.buffer);
-                        self.buffer.clear();
-                    }
-                }
-            }
-
-            // Check if tool call is complete
-            if self.buffer.contains("</tool_call>") {
-                // Before completing, check if we need to send final parameters
-                // Only send if we have parameters that haven't been fully streamed
-                if !self.xml_current_function_name.is_empty()
-                    && !self.xml_current_parameters.is_empty()
-                {
-                    // Check if all parameters have been streamed
-                    let all_streamed = self
-                        .xml_current_parameters
-                        .iter()
-                        .all(|(k, _)| self.xml_streamed_parameters.contains_key(k));
-
-                    if !all_streamed {
-                        // Some parameters haven't been streamed, send final complete arguments
-                        let final_args_json =
-                            serde_json::to_string(&self.xml_current_parameters)
-                                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
-
-                        calls.push(ToolCallItem {
-                            tool_index: self.current_tool_id as usize,
-                            name: None, // Final update, no name change
-                            parameters: final_args_json,
-                        });
-                    } else if !self.xml_streamed_parameters.is_empty() {
-                        // All parameters streamed, but ensure JSON is complete
-                        // Check if streamed args JSON is complete (has closing brace)
-                        // Trim trailing whitespace before checking to handle edge cases
-                        let streamed_args =
-                            &self.streamed_args_for_tool[self.current_tool_id as usize];
-                        if !streamed_args.trim_end().ends_with('}') && !streamed_args.is_empty() {
-                            // JSON incomplete, send closing brace
-                            calls.push(ToolCallItem {
-                                tool_index: self.current_tool_id as usize,
-                                name: None,
-                                parameters: "}".to_string(),
-                            });
-                        }
-                    }
-                }
-
-                // Complete the tool call
-                if let Some(end_pos) = self.buffer.find("</tool_call>") {
-                    self.buffer = self.buffer[end_pos + "</tool_call>".len()..].to_string();
-                }
-                self.in_xml_tool_call = false;
-                self.format_detected = None; // Reset for next tool call
-                self.current_tool_id += 1;
-                self.xml_current_function_name.clear();
-                self.xml_current_parameters.clear();
-                self.xml_streamed_parameters.clear();
-                self.current_tool_name_sent = false;
-                self.in_parameter = false;
-                self.current_parameter_key.clear();
-                self.current_parameter_value.clear();
-            }
-        }
-
-        Ok(StreamingParseResult { normal_text, calls })
     }
 }
