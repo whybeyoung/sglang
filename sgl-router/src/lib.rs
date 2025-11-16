@@ -6,7 +6,10 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
-pub mod ffi;
+// FFI module moved to bindings/golang/src/lib.rs
+#[path = "../bindings/golang/src/lib.rs"]
+pub mod golang_ffi;
+pub use golang_ffi as ffi;
 #[cfg(feature = "grpc-client")]
 pub mod grpc_client;
 pub mod mcp;
