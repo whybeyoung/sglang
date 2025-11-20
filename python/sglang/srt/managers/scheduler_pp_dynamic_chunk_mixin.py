@@ -10,6 +10,7 @@ import torch.distributed
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import point_to_point_pyobj
 from sglang.srt.warmup import PP_WARMUP_RID_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -223,8 +224,10 @@ class SchedulerPPDynamicChunkMixin:
     def _complete_warmup(self: "Scheduler"):
         """Complete warmup phase by fitting f(l) = al^2 + bl + c.
         
-        In PP mode, we collect data from all PP ranks and fit a unified set of coefficients
-        on PP rank 0, then broadcast to all ranks.
+        In PP mode:
+        1. Non-TP0-PP0 ranks send their data to TP0-PP0 via point-to-point communication
+        2. TP0-PP0 collects all data and fits coefficients
+        3. TP0-PP0 broadcasts coefficients to all ranks
         """
         if self.warmup_complete:
             return
@@ -241,70 +244,131 @@ class SchedulerPPDynamicChunkMixin:
                 local_warmup_total_latencies.append(total_latency)
         
         logger.info(
-            f"[PP Dynamic Chunk] [PP{self.pp_rank}] Collected {len(local_warmup_seq_lens)} local data points "
+            f"[PP Dynamic Chunk] [PP{self.pp_rank} TP{self.tp_rank}] Collected {len(local_warmup_seq_lens)} local data points "
             f"from {len(self.warmup_request_data)} requests."
         )
         
-        # In PP mode, gather data from all ranks and fit on rank 0, then broadcast
+        # In PP mode, use point-to-point communication to send data to TP0-PP0
         if self.pp_size > 1:
             local_data = list(zip(local_warmup_seq_lens, local_warmup_total_latencies))
             
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.barrier(group=self.pp_group.cpu_group)
+                # Calculate rank IDs
+                # TP0-PP0 rank ID: pp_rank=0, tp_rank=0, dp_rank=0 (if applicable)
+                dp_offset = getattr(self, 'attn_dp_rank', 0) * getattr(self, 'attn_tp_size', self.tp_size)
+                current_rank = self.pp_rank * self.tp_size + dp_offset + self.tp_rank
+                tp0_pp0_rank = 0 * self.tp_size + 0 + 0  # TP0-PP0 rank ID (pp=0, tp=0, dp=0)
                 
-                gathered_data_list = [None] * self.pp_size
-                torch.distributed.all_gather_object(
-                    gathered_data_list, local_data, group=self.pp_group.cpu_group
-                )
-            else:
-                gathered_data_list = [local_data]
-            
-            # On rank 0, aggregate all data and fit
-            if self.pp_rank == 0:
-                warmup_seq_lens: List[int] = []
-                warmup_total_latencies: List[float] = []
-                
-                for rank_data in gathered_data_list:
-                    if rank_data is not None:
-                        for seq_len, total_latency in rank_data:
-                            warmup_seq_lens.append(seq_len)
-                            warmup_total_latencies.append(total_latency)
-                
+                # Barrier: ensure all ranks reach this point
                 logger.info(
-                    f"[PP Dynamic Chunk] [PP0] Aggregated {len(warmup_seq_lens)} total data points "
-                    f"from all {self.pp_size} PP ranks for unified fitting."
+                    f"[PP Dynamic Chunk] [PP{self.pp_rank} TP{self.tp_rank}] Entering barrier, waiting for all ranks..."
+                )
+                torch.distributed.barrier(group=self.pp_group.cpu_group)
+                logger.info(
+                    f"[PP Dynamic Chunk] [PP{self.pp_rank} TP{self.tp_rank}] Barrier passed."
                 )
                 
-                if len(warmup_seq_lens) < 3:
-                    raise ValueError(
-                        f"Not enough data points for fitting ({len(warmup_seq_lens)} < 3). "
-                        "Need at least 3 samples with different sequence lengths."
+                # Non-TP0-PP0 ranks: send data to TP0-PP0 via point-to-point
+                # Only TP0 ranks send data (similar to PP communication pattern)
+                if not (self.pp_rank == 0 and self.tp_rank == 0):
+                    if self.tp_rank == 0:  # Only TP0 ranks send data
+                        logger.info(
+                            f"[PP Dynamic Chunk] [PP{self.pp_rank} TP{self.tp_rank}] Sending {len(local_data)} data points "
+                            f"to TP0-PP0 (rank {tp0_pp0_rank})..."
+                        )
+                        point_to_point_pyobj(
+                            local_data,
+                            current_rank,
+                            self.world_group.cpu_group,
+                            src=current_rank,
+                            dst=tp0_pp0_rank,
+                            async_send=False,
+                        )
+                        logger.info(
+                            f"[PP Dynamic Chunk] [PP{self.pp_rank} TP{self.tp_rank}] Data sent to TP0-PP0."
+                        )
+                    else:
+                        logger.debug(
+                            f"[PP Dynamic Chunk] [PP{self.pp_rank} TP{self.tp_rank}] Skipping send (non-TP0 rank, "
+                            f"data should be collected by TP0 rank in same PP stage)"
+                        )
+                
+                # TP0-PP0: receive data from all other ranks and fit
+                if self.pp_rank == 0 and self.tp_rank == 0:
+                    warmup_seq_lens: List[int] = []
+                    warmup_total_latencies: List[float] = []
+                    
+                    # Add local data first
+                    for seq_len, total_latency in local_data:
+                        warmup_seq_lens.append(seq_len)
+                        warmup_total_latencies.append(total_latency)
+                    
+                    # Receive data from all other TP0 ranks (one per PP stage)
+                    # Only TP0 ranks send data, so we only receive from TP0 ranks
+                    for pp_idx in range(self.pp_size):
+                        if pp_idx == 0:
+                            continue  # Skip self (PP0)
+                        
+                        # Calculate TP0 rank ID for this PP stage
+                        tp0_rank_for_pp = pp_idx * self.tp_size + dp_offset + 0  # tp_rank=0
+                        
+                        logger.info(
+                            f"[PP Dynamic Chunk] [TP0-PP0] Receiving data from PP{pp_idx} TP0 (rank {tp0_rank_for_pp})..."
+                        )
+                        received_data = point_to_point_pyobj(
+                            [],
+                            tp0_pp0_rank,
+                            self.world_group.cpu_group,
+                            src=tp0_rank_for_pp,
+                            dst=tp0_pp0_rank,
+                            async_send=False,
+                        )
+                        
+                        if received_data:
+                            logger.info(
+                                f"[PP Dynamic Chunk] [TP0-PP0] Received {len(received_data)} data points from PP{pp_idx} TP0."
+                            )
+                            for seq_len, total_latency in received_data:
+                                warmup_seq_lens.append(seq_len)
+                                warmup_total_latencies.append(total_latency)
+                    
+                    logger.info(
+                        f"[PP Dynamic Chunk] [TP0-PP0] Aggregated {len(warmup_seq_lens)} total data points "
+                        f"from all ranks for unified fitting."
                     )
-                
-                # Fit on rank 0
-                fitted_a, fitted_b, fitted_c = self._fit_quadratic_coefficients(
-                    warmup_seq_lens, warmup_total_latencies
-                )
-                
-                # Broadcast coefficients to all ranks
-                coeffs_to_broadcast = [fitted_a, fitted_b, fitted_c]
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    
+                    if len(warmup_seq_lens) < 3:
+                        raise ValueError(
+                            f"Not enough data points for fitting ({len(warmup_seq_lens)} < 3). "
+                            "Need at least 3 samples with different sequence lengths."
+                        )
+                    
+                    # Fit on TP0-PP0
+                    fitted_a, fitted_b, fitted_c = self._fit_quadratic_coefficients(
+                        warmup_seq_lens, warmup_total_latencies
+                    )
+                    
+                    # Broadcast coefficients to all ranks
+                    coeffs_to_broadcast = [fitted_a, fitted_b, fitted_c]
                     torch.distributed.broadcast_object_list(
-                        coeffs_to_broadcast, src=0, group=self.pp_group.cpu_group
+                        coeffs_to_broadcast, src=tp0_pp0_rank, group=self.pp_group.cpu_group
                     )
-                
-                fitted_a, fitted_b, fitted_c = coeffs_to_broadcast
-            else:
-                # Other ranks: receive coefficients from rank 0
-                coeffs_to_receive = [None, None, None]
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    torch.distributed.broadcast_object_list(
-                        coeffs_to_receive, src=0, group=self.pp_group.cpu_group
-                    )
+                    
+                    fitted_a, fitted_b, fitted_c = coeffs_to_broadcast
                 else:
-                    raise RuntimeError("Distributed not available but PP size > 1")
-                
-                fitted_a, fitted_b, fitted_c = coeffs_to_receive
+                    # Other ranks: receive coefficients from TP0-PP0
+                    coeffs_to_receive = [None, None, None]
+                    torch.distributed.broadcast_object_list(
+                        coeffs_to_receive, src=tp0_pp0_rank, group=self.pp_group.cpu_group
+                    )
+                    
+                    fitted_a, fitted_b, fitted_c = coeffs_to_receive
+                    logger.info(
+                        f"[PP Dynamic Chunk] [PP{self.pp_rank} TP{self.tp_rank}] Received coefficients from TP0-PP0: "
+                        f"a={fitted_a:.2e}, b={fitted_b:.2e}, c={fitted_c:.2e}"
+                    )
+            else:
+                raise RuntimeError("Distributed not available but PP size > 1")
         else:
             # Single rank mode: fit locally
             if len(local_warmup_seq_lens) < 3:
