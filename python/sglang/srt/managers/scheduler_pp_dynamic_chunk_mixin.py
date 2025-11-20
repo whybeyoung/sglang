@@ -291,7 +291,7 @@ class SchedulerPPDynamicChunkMixin:
                 latencies.append(latency)
 
                 # Release KV cache
-                from sglang.srt.managers.schedule_policy import release_kv_cache
+                from sglang.srt.mem_cache.common import release_kv_cache
 
                 release_kv_cache(req, self.tree_cache)
 
