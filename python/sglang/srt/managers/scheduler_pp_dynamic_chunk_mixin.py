@@ -217,9 +217,9 @@ class SchedulerPPDynamicChunkMixin:
         if self.pp_group.is_first_rank:
             logger.info("Profiling prefill latency for dynamic chunk sizing...")
 
-            # Create requests with different lengths: base_chunk_size // (2**i) for i in range(5)
+            # Create requests with different lengths: base_chunk_size // (2**i) for i in range(10)
             input_ids_list = []
-            for i in range(5):
+            for i in range(10):
                 chunk_size = self.chunked_prefill_size // (2 ** i)
                 if chunk_size <= 0:
                     break
