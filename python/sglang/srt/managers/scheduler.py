@@ -460,8 +460,19 @@ class Scheduler(
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
         
-        # Initialize PP dynamic chunk size coefficients (will be set during warmup)
-        self.init_pp_dynamic_chunk_size()
+        # Initialize PP dynamic chunk size predictor
+        self.init_pp_dynamic_chunk_size(server_args)
+        
+        # Profile prefill latency for dynamic chunk sizing (after model is loaded)
+        if self.enable_dynamic_chunking:
+            try:
+                self.profile_pp_prefill_latency()
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
+                    "Dynamic chunking will be disabled."
+                )
+                self.enable_dynamic_chunking = False
 
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
@@ -1304,8 +1315,6 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
-            # Calculate dynamic chunk sizes if warmup is complete and coefficients are available
-            self._calculate_dynamic_chunk_sizes_for_request(req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1333,8 +1342,6 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
-            # Calculate dynamic chunk sizes if warmup is complete and coefficients are available
-            self._calculate_dynamic_chunk_sizes_for_request(req)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -1574,9 +1581,6 @@ class Scheduler(
             http_worker_ipc=recv_req.http_worker_ipc,
         )
         req.tokenizer = self.tokenizer
-        
-        # Calculate dynamic chunk sizes if warmup is complete and coefficients are available
-        self._calculate_dynamic_chunk_sizes_for_request(req)
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
@@ -1801,9 +1805,18 @@ class Scheduler(
             return None
 
         # Determine chunked_prefill_size for this batch
-        chunked_prefill_size = self._get_dynamic_chunk_size_for_batch()
-        if chunked_prefill_size is None:
-            chunked_prefill_size = self.chunked_prefill_size
+        chunked_prefill_size = self.chunked_prefill_size
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            # Use dynamic chunk size prediction if available
+            if (
+                self.enable_dynamic_chunking
+                and self.length_predictor.is_ready
+            ):
+                history_len = len(self.chunked_req.prefix_indices)
+                dynamic_size = self.predict_next_chunk_size(history_len)
+                if dynamic_size is not None:
+                    chunked_prefill_size = dynamic_size
 
         # Prefill policy
         adder = PrefillAdder(
@@ -2138,8 +2151,6 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
             
-            # Record chunk execution time for PP dynamic chunk size warmup
-            self._record_warmup_chunk_time(batch)
 
         return ret
 

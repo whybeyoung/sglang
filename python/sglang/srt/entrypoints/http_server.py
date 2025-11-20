@@ -287,16 +287,6 @@ async def lifespan(fast_api_app: FastAPI):
     if server_args.warmups is not None:
         warmup_names = server_args.warmups.split(",")
     
-    # Auto-add PP chunk tuning warmup if conditions are met
-    if (
-        server_args.pp_size > 1
-        and server_args.chunked_prefill_size
-        and server_args.chunked_prefill_size > 0
-        and "pp_chunk_tuning" not in warmup_names
-    ):
-        warmup_names.append("pp_chunk_tuning")
-        logger.info("Auto-adding pp_chunk_tuning warmup (PP mode + chunked_prefill_size enabled)")
-    
     if warmup_names:
         await execute_warmups(
             server_args.disaggregation_mode,
