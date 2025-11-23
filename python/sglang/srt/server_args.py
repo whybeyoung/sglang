@@ -268,6 +268,8 @@ class ServerArgs:
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
+    enable_dynamic_chunking: bool = False
+    dynamic_chunking_model: str = "linear"  # "quadratic" or "linear"
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -2180,6 +2182,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            default=ServerArgs.enable_dynamic_chunking,
+            help="Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+        )
+        parser.add_argument(
+            "--dynamic-chunking-model",
+            type=str,
+            default=ServerArgs.dynamic_chunking_model,
+            choices=["quadratic", "linear"],
+            help="Model type for dynamic chunking: 'quadratic' (f(l)=al^2+bl+c) or 'linear' (f(l)=bl+c). Default is 'linear'.",
         )
         parser.add_argument(
             "--max-prefill-tokens",

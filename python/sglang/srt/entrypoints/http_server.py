@@ -283,10 +283,14 @@ async def lifespan(fast_api_app: FastAPI):
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
 
     # Execute custom warmups
+    warmup_names = []
     if server_args.warmups is not None:
+        warmup_names = server_args.warmups.split(",")
+    
+    if warmup_names:
         await execute_warmups(
             server_args.disaggregation_mode,
-            server_args.warmups.split(","),
+            warmup_names,
             _global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
