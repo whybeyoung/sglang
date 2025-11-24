@@ -144,12 +144,12 @@ class ChunkSizePredictor:
 
         if self.target_latency <= 0:
             raise ValueError(
-                f"Calculated target_latency={self.target_latency:.4f}s is not positive. "
+                f"Calculated target_latency={self.target_latency:.2f}ms is not positive. "
                 "Check warmup data quality."
             )
 
         logger.info(
-            f"[ChunkSizePredictor] Target latency: {self.target_latency:.4f}s "
+            f"[ChunkSizePredictor] Target latency: {self.target_latency:.2f}ms "
             f"(base_chunk_size={base_chunk_size})"
         )
 
@@ -201,7 +201,7 @@ class ChunkSizePredictor:
             if discriminant < 0:
                 logger.warning(
                     f"Discriminant is negative ({discriminant:.2e}). "
-                    f"No real solution for chunk size. L={history_len}, T={self.target_latency:.4f}s."
+                    f"No real solution for chunk size. L={history_len}, T={self.target_latency:.2f}ms."
                 )
                 return None
 
@@ -211,7 +211,7 @@ class ChunkSizePredictor:
         if calculated_chunk_size_float <= 0:
             logger.warning(
                 f"Calculated chunk size is non-positive ({calculated_chunk_size_float:.2f}). "
-                f"L={history_len}, T={self.target_latency:.4f}s."
+                f"L={history_len}, T={self.target_latency:.2f}ms."
             )
             return None
 
@@ -348,7 +348,11 @@ class SchedulerPPDynamicChunkMixin:
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
-                # Measure latency
+                # Measure latency with CUDA synchronization for accurate timing
+                # Synchronize before starting timing to ensure clean measurement
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
                 start = time.perf_counter()
                 batch.prepare_for_extend()
                 model_worker_batch = batch.get_model_worker_batch()
@@ -360,10 +364,15 @@ class SchedulerPPDynamicChunkMixin:
                 _, _ = self.tp_worker.model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
-
-                latency = time.perf_counter() - start
+                
+                # Synchronize after forward to ensure GPU operations complete
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                latency_seconds = time.perf_counter() - start
+                latency_ms = latency_seconds * 1e3  # Convert to milliseconds
                 seq_lens.append(len(input_ids))
-                latencies.append(latency)
+                latencies.append(latency_ms)
 
                 # Release KV cache
                 from sglang.srt.mem_cache.common import release_kv_cache
@@ -372,7 +381,7 @@ class SchedulerPPDynamicChunkMixin:
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
-                f"seq_lens={seq_lens}, latencies={latencies}"
+                f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
         # Broadcast data to all ranks
@@ -399,7 +408,7 @@ class SchedulerPPDynamicChunkMixin:
             self.length_predictor.is_ready = True
             logger.info(
                 f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (linear). "
-                f"Target latency: {self.length_predictor.target_latency:.4f}s"
+                f"Target latency: {self.length_predictor.target_latency:.2f}ms"
             )
         else:
             # Quadratic model: f(l) = al^2 + bl + c
@@ -408,7 +417,7 @@ class SchedulerPPDynamicChunkMixin:
             self.length_predictor.is_ready = True
             logger.info(
                 f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
-                f"Target latency: {self.length_predictor.target_latency:.4f}s"
+                f"Target latency: {self.length_predictor.target_latency:.2f}ms"
             )
 
     def predict_next_chunk_size(self: "Scheduler", history_len: int) -> Optional[int]:
