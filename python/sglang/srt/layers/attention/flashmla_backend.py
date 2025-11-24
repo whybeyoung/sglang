@@ -77,7 +77,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        self.is_fp8_kvcache = self.data_type in {torch.float8_e4m3fn, torch.float8_e5m2fn}
+        # Check for FP8 KV cache types (e4m3fn, e4m3fnuz, e5m2, e5m2fnuz)
+        fp8_types = {torch.float8_e4m3fn,torch.float8_e5m2}
+        self.is_fp8_kvcache = self.data_type in fp8_types
         logger.info(f"FlashMLABackend: is_fp8_kvcache={self.is_fp8_kvcache}")
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
