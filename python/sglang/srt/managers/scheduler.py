@@ -1811,6 +1811,7 @@ class Scheduler(
             # Use dynamic chunk size prediction if available
             if (
                 self.enable_dynamic_chunking
+                and self.length_predictor is not None
                 and self.length_predictor.is_ready
             ):
                 history_len = len(self.chunked_req.prefix_indices)

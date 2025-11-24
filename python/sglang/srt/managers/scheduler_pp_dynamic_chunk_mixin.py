@@ -253,6 +253,12 @@ class SchedulerPPDynamicChunkMixin:
 
     def init_pp_dynamic_chunk_size(self: "Scheduler", server_args):
         """Initialize PP dynamic chunk size predictor."""
+        # Initialize attributes to default values
+        # This ensures the attributes exist even when pp_size <= 1
+        self.enable_dynamic_chunking = False
+        self.length_predictor = None
+        self.dynamic_chunking_model = server_args.dynamic_chunking_model
+        
         if self.pp_size <= 1:
             return
 
@@ -274,6 +280,9 @@ class SchedulerPPDynamicChunkMixin:
         Only runs on PP0 (first rank), then broadcasts data to all ranks.
         All ranks fit coefficients using the same data.
         """
+        # Early return if PP is not enabled or dynamic chunking is disabled
+        if self.pp_size <= 1:
+            return
         if not self.enable_dynamic_chunking:
             return
 
@@ -412,7 +421,7 @@ class SchedulerPPDynamicChunkMixin:
         Returns:
             Predicted chunk size, or None to use default chunked_prefill_size
         """
-        if not self.enable_dynamic_chunking or not self.length_predictor.is_ready:
+        if not self.enable_dynamic_chunking or self.length_predictor is None or not self.length_predictor.is_ready:
             return None
 
         max_chunk_size = getattr(self, "max_prefill_tokens", None)
