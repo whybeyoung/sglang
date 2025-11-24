@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from tkinter import NO
 from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
@@ -144,12 +145,12 @@ class ChunkSizePredictor:
 
         if self.target_latency <= 0:
             raise ValueError(
-                f"Calculated target_latency={self.target_latency:.4f}s is not positive. "
+                f"Calculated target_latency={self.target_latency:.4f}ms is not positive. "
                 "Check warmup data quality."
             )
 
         logger.info(
-            f"[ChunkSizePredictor] Target latency: {self.target_latency:.4f}s "
+            f"[ChunkSizePredictor] Target latency: {self.target_latency:.4f}ms "
             f"(base_chunk_size={base_chunk_size})"
         )
 
@@ -201,7 +202,7 @@ class ChunkSizePredictor:
             if discriminant < 0:
                 logger.warning(
                     f"Discriminant is negative ({discriminant:.2e}). "
-                    f"No real solution for chunk size. L={history_len}, T={self.target_latency:.4f}s."
+                    f"No real solution for chunk size. L={history_len}, T={self.target_latency:.4f}ms."
                 )
                 return None
 
@@ -211,7 +212,7 @@ class ChunkSizePredictor:
         if calculated_chunk_size_float <= 0:
             logger.warning(
                 f"Calculated chunk size is non-positive ({calculated_chunk_size_float:.2f}). "
-                f"L={history_len}, T={self.target_latency:.4f}s."
+                f"L={history_len}, T={self.target_latency:.4f}ms."
             )
             return None
 
@@ -253,10 +254,7 @@ class SchedulerPPDynamicChunkMixin:
 
     def init_pp_dynamic_chunk_size(self: "Scheduler", server_args):
         """Initialize PP dynamic chunk size predictor."""
-        if self.pp_size <= 1:
-            return
-
-        self.length_predictor = ChunkSizePredictor()
+        self.length_predictor = None
         # Enable dynamic chunking only if explicitly enabled via server_args
         # and chunked_prefill_size is set
         self.enable_dynamic_chunking = (
@@ -265,7 +263,12 @@ class SchedulerPPDynamicChunkMixin:
             and self.chunked_prefill_size > 0
         )
         # Store model type for fitting
-        self.dynamic_chunking_model = getattr(server_args, "dynamic_chunking_model", "linear")
+        self.dynamic_chunking_model = server_args.dynamic_chunking_model
+
+        if self.pp_size <= 1:
+            return
+        self.length_predictor = ChunkSizePredictor()
+
 
     def profile_pp_prefill_latency(self: "Scheduler"):
         """
@@ -340,6 +343,8 @@ class SchedulerPPDynamicChunkMixin:
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
                 # Measure latency
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 start = time.perf_counter()
                 batch.prepare_for_extend()
                 model_worker_batch = batch.get_model_worker_batch()
@@ -351,8 +356,9 @@ class SchedulerPPDynamicChunkMixin:
                 _, _ = self.tp_worker.model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
-
-                latency = time.perf_counter() - start
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                latency = (time.perf_counter() - start) * 1000  # Convert to milliseconds
                 seq_lens.append(len(input_ids))
                 latencies.append(latency)
 
@@ -390,7 +396,7 @@ class SchedulerPPDynamicChunkMixin:
             self.length_predictor.is_ready = True
             logger.info(
                 f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (linear). "
-                f"Target latency: {self.length_predictor.target_latency:.4f}s"
+                f"Target latency: {self.length_predictor.target_latency:.4f}ms"
             )
         else:
             # Quadratic model: f(l) = al^2 + bl + c
@@ -399,7 +405,7 @@ class SchedulerPPDynamicChunkMixin:
             self.length_predictor.is_ready = True
             logger.info(
                 f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
-                f"Target latency: {self.length_predictor.target_latency:.4f}s"
+                f"Target latency: {self.length_predictor.target_latency:.4f}ms"
             )
 
     def predict_next_chunk_size(self: "Scheduler", history_len: int) -> Optional[int]:
@@ -412,7 +418,7 @@ class SchedulerPPDynamicChunkMixin:
         Returns:
             Predicted chunk size, or None to use default chunked_prefill_size
         """
-        if not self.enable_dynamic_chunking or not self.length_predictor.is_ready:
+        if not self.enable_dynamic_chunking or self.length_predictor is None or not self.length_predictor.is_ready:
             return None
 
         max_chunk_size = getattr(self, "max_prefill_tokens", None)

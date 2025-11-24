@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
+import logging
+logger = logging.getLogger(__name__)
 
 # FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
@@ -75,7 +77,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
-
+        self.is_fp8_kvcache = self.data_type in {torch.float8_e4m3fn, torch.float8_e5m2fn}
+        logger.info(f"FlashMLABackend: is_fp8_kvcache={self.is_fp8_kvcache}")
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -104,6 +107,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
+                self.is_fp8_kvcache,
             )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
@@ -134,6 +138,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
+                self.is_fp8_kvcache,
             )
 
             # Use FlashMLADecodeMetadata which has the attributes forward_extend expects
@@ -168,6 +173,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 ),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
+                self.is_fp8_kvcache,
             )
         else:
             self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
@@ -176,6 +182,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 ),
                 self.num_q_heads,
                 1,
+                self.is_fp8_kvcache,
             )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
@@ -206,6 +213,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens.to(torch.int32),
                 num_q_heads,
                 1,
+                self.is_fp8_kvcache,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -231,6 +239,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
+                self.is_fp8_kvcache,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -281,6 +290,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens.to(torch.int32),
                 num_q_heads,
                 1,
+                self.is_fp8_kvcache,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -306,6 +316,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
+                self.is_fp8_kvcache,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
