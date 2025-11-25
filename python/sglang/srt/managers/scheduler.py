@@ -129,6 +129,9 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+from sglang.srt.managers.scheduler_pp_dynamic_chunk_mixin import (
+    SchedulerPPDynamicChunkMixin,
+)
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -218,6 +221,7 @@ class Scheduler(
     SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
+    SchedulerPPDynamicChunkMixin,
     SchedulerDPAttnMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
@@ -455,6 +459,20 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
+        
+        # Initialize PP dynamic chunk size predictor
+        self.init_pp_dynamic_chunk_size(server_args)
+        
+        # Profile prefill latency for dynamic chunk sizing (after model is loaded)
+        if self.enable_dynamic_chunking:
+            try:
+                self.profile_pp_prefill_latency()
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
+                    "Dynamic chunking will be disabled."
+                )
+                self.enable_dynamic_chunking = False
 
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
@@ -1786,6 +1804,21 @@ class Scheduler(
             # in the waiting queue.
             return None
 
+        # Determine chunked_prefill_size for this batch
+        chunked_prefill_size = self.chunked_prefill_size
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            # Use dynamic chunk size prediction if available
+            if (
+                self.enable_dynamic_chunking
+                and self.length_predictor is not None
+                and self.length_predictor.is_ready
+            ):
+                history_len = len(self.chunked_req.prefix_indices)
+                dynamic_size = self.predict_next_chunk_size(history_len)
+                if dynamic_size is not None:
+                    chunked_prefill_size = dynamic_size
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -1794,7 +1827,7 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )
@@ -2118,6 +2151,7 @@ class Scheduler(
             current_time = time.perf_counter()
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
+            
 
         return ret
 
