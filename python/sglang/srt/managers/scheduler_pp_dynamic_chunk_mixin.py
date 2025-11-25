@@ -10,7 +10,6 @@ import torch
 import torch.distributed
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
@@ -22,7 +21,7 @@ if TYPE_CHECKING:
 class ChunkSizePredictor:
     """
     Predictor for dynamic chunk size based on quadratic latency model.
-    
+
     Models latency as: f(l) = a*l^2 + b*l + c
     Predicts next chunk size x such that: f(L+x) - f(L) = target_latency
     """
@@ -31,7 +30,6 @@ class ChunkSizePredictor:
         self.quadratic_coeff_a = 0.0
         self.linear_coeff_b = 0.0
         self.constant_coeff_c = 0.0
-        self.use_linear_model = False  # Flag to indicate if using linear model
         self.target_latency: Optional[float] = None
         self.is_ready = False
 
@@ -82,63 +80,17 @@ class ChunkSizePredictor:
             f"[ChunkSizePredictor] Fitted coefficients: a={fitted_a:.2e}, "
             f"b={fitted_b:.2e}, c={fitted_c:.2e}"
         )
-        self.use_linear_model = False
-
-    def fit_linear(self, seq_lens: List[int], latencies: List[float]):
-        """
-        Fit linear model: f(l) = b*l + c
-        
-        This is a simpler model that assumes latency grows linearly with sequence length.
-        """
-        L = np.array(seq_lens, dtype=np.float64)
-        T = np.array(latencies, dtype=np.float64)
-
-        if len(L) < 8:
-            raise ValueError(
-                f"Not enough data points for linear fitting ({len(L)} < 8). "
-                "Need at least 8 samples with different sequence lengths."
-            )
-
-        # Build design matrix for f(l) = bl + c
-        X = np.column_stack([L, np.ones_like(L)])  # [l, 1]
-
-        try:
-            coeffs, residuals, rank, s = np.linalg.lstsq(X, T, rcond=None)
-            if len(coeffs) >= 2:
-                fitted_b = float(coeffs[0])  # linear coefficient
-                fitted_c = float(coeffs[1])  # constant coefficient
-            else:
-                raise ValueError("Failed to fit linear coefficients: insufficient rank")
-        except np.linalg.LinAlgError as e:
-            raise ValueError(f"Failed to fit f(l) = bl + c: {e}")
-
-        # Validate coefficients
-        if fitted_b <= 0:
-            raise ValueError(
-                f"Fitted linear coefficient b={fitted_b:.2e} is not positive. "
-                "Latency should increase with sequence length, so b must be positive. "
-                "Check warmup data quality."
-            )
-
-        # Store coefficients (set quadratic coefficient to 0 for linear model)
-        self.quadratic_coeff_a = 0.0
-        self.linear_coeff_b = fitted_b
-        self.constant_coeff_c = fitted_c
-        self.use_linear_model = True
-
-        logger.info(
-            f"[ChunkSizePredictor] Fitted linear coefficients: "
-            f"b={fitted_b:.2e}, c={fitted_c:.2e}"
-        )
 
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
+
         def f(l: float) -> float:
             """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
-            if self.use_linear_model:
-                return self.linear_coeff_b * l + self.constant_coeff_c
-            else:
-                return self.quadratic_coeff_a * l * l + self.linear_coeff_b * l + self.constant_coeff_c
+            return (
+                self.quadratic_coeff_a * l * l
+                + self.linear_coeff_b * l
+                + self.constant_coeff_c
+            )
 
         self.target_latency = f(float(base_chunk_size)) - f(0.0)
 
@@ -162,51 +114,42 @@ class ChunkSizePredictor:
     ) -> Optional[int]:
         """
         Predict next chunk size x such that f(history_len + x) - f(history_len) = target_latency.
-        
+
         Args:
             history_len: Current sequence length (L)
             page_size: Page size for alignment
             context_len: Maximum context length
             max_chunk_size: Maximum allowed chunk size (optional)
-            
+
         Returns:
             Predicted chunk size, or None if prediction fails
         """
         if not self.is_ready or self.target_latency is None:
             return None
 
-        # Handle linear model: f(l) = bl + c
-        if self.use_linear_model:
-            # For linear model: f(L+x) - f(L) = b*(L+x) + c - (b*L + c) = b*x = T
-            # So x = T / b
-            if self.linear_coeff_b <= 0:
-                return None
-            
-            calculated_chunk_size_float = self.target_latency / self.linear_coeff_b
-        else:
-            # Handle quadratic model: f(l) = al^2 + bl + c
-            if self.quadratic_coeff_a <= 0:
-                return None
+        # Handle quadratic model: f(l) = al^2 + bl + c
+        if self.quadratic_coeff_a <= 0:
+            return None
 
-            # Solve f(L+x) - f(L) = T
-            # where f(L) = a*L^2 + b*L + c
-            # This expands to: ax^2 + (2aL+b)x - T = 0
-            # A = a, B = 2aL + b, C = -T
-            A = self.quadratic_coeff_a
-            B = 2 * self.quadratic_coeff_a * history_len + self.linear_coeff_b
-            C = -self.target_latency
+        # Solve f(L+x) - f(L) = T
+        # where f(L) = a*L^2 + b*L + c
+        # This expands to: ax^2 + (2aL+b)x - T = 0
+        # A = a, B = 2aL + b, C = -T
+        A = self.quadratic_coeff_a
+        B = 2 * self.quadratic_coeff_a * history_len + self.linear_coeff_b
+        C = -self.target_latency
 
-            discriminant = B * B - 4 * A * C
+        discriminant = B * B - 4 * A * C
 
-            if discriminant < 0:
-                logger.warning(
-                    f"Discriminant is negative ({discriminant:.2e}). "
-                    f"No real solution for chunk size. L={history_len}, T={self.target_latency:.2f}ms."
-                )
-                return None
+        if discriminant < 0:
+            logger.warning(
+                f"Discriminant is negative ({discriminant:.2e}). "
+                f"No real solution for chunk size. L={history_len}, T={self.target_latency:.2f}ms."
+            )
+            return None
 
-            sqrt_discriminant = math.sqrt(discriminant)
-            calculated_chunk_size_float = (-B + sqrt_discriminant) / (2 * A)
+        sqrt_discriminant = math.sqrt(discriminant)
+        calculated_chunk_size_float = (-B + sqrt_discriminant) / (2 * A)
 
         if calculated_chunk_size_float <= 0:
             logger.warning(
@@ -243,7 +186,7 @@ class ChunkSizePredictor:
 class SchedulerPPDynamicChunkMixin:
     """
     Mixin for PP mode dynamic chunk size adjustment.
-    
+
     Per reference implementation:
     1. Profile prefill latency on PP0 (first rank)
     2. Broadcast profiling data to all ranks
@@ -258,7 +201,7 @@ class SchedulerPPDynamicChunkMixin:
         self.enable_dynamic_chunking = False
         self.length_predictor = None
         self.dynamic_chunking_model = server_args.dynamic_chunking_model
-        
+
         if self.pp_size <= 1:
             return
 
@@ -271,12 +214,14 @@ class SchedulerPPDynamicChunkMixin:
             and self.chunked_prefill_size > 0
         )
         # Store model type for fitting
-        self.dynamic_chunking_model = getattr(server_args, "dynamic_chunking_model", "linear")
+        self.dynamic_chunking_model = getattr(
+            server_args, "dynamic_chunking_model", "linear"
+        )
 
     def profile_pp_prefill_latency(self: "Scheduler"):
         """
         Profile prefill latency for dynamic chunk sizing.
-        
+
         Only runs on PP0 (first rank), then broadcasts data to all ranks.
         All ranks fit coefficients using the same data.
         """
@@ -294,8 +239,10 @@ class SchedulerPPDynamicChunkMixin:
 
             # Create requests with different lengths: base_chunk_size // (2**i) for i in range(10)
             input_ids_list = []
-            for i in range(10):
-                chunk_size = self.chunked_prefill_size // (2 ** i)
+            for i in range(32):
+                chunk_size = self.chunked_prefill_size - i * (
+                    self.chunked_prefill_size // 32
+                )
                 if chunk_size <= 0:
                     break
                 input_ids = np.random.randint(
@@ -334,12 +281,18 @@ class SchedulerPPDynamicChunkMixin:
                 current_seq_len = len(req.fill_ids)
                 proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (current_seq_len, self.tp_worker.model_runner.model_config.hidden_size),
+                        (
+                            current_seq_len,
+                            self.tp_worker.model_runner.model_config.hidden_size,
+                        ),
                         dtype=self.tp_worker.model_runner.model_config.dtype,
                         device="cuda",
                     ),
                     "residual": torch.zeros(
-                        (current_seq_len, self.tp_worker.model_runner.model_config.hidden_size),
+                        (
+                            current_seq_len,
+                            self.tp_worker.model_runner.model_config.hidden_size,
+                        ),
                         dtype=self.tp_worker.model_runner.model_config.dtype,
                         device="cuda",
                     ),
@@ -352,7 +305,7 @@ class SchedulerPPDynamicChunkMixin:
                 # Synchronize before starting timing to ensure clean measurement
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                
+
                 start = time.perf_counter()
                 batch.prepare_for_extend()
                 model_worker_batch = batch.get_model_worker_batch()
@@ -364,11 +317,11 @@ class SchedulerPPDynamicChunkMixin:
                 _, _ = self.tp_worker.model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
-                
+
                 # Synchronize after forward to ensure GPU operations complete
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                
+
                 latency_seconds = time.perf_counter() - start
                 latency_ms = latency_seconds * 1e3  # Convert to milliseconds
                 seq_lens.append(len(input_ids))
@@ -377,6 +330,7 @@ class SchedulerPPDynamicChunkMixin:
                 # Release KV cache
                 from sglang.srt.mem_cache.common import release_kv_cache
 
+                # logger.info(f"[PP Dynamic Chunk] [PP0] Releasing KV cache for {req}")
                 release_kv_cache(req, self.tree_cache)
 
             logger.info(
@@ -400,37 +354,31 @@ class SchedulerPPDynamicChunkMixin:
                 f"Dynamic chunking disabled."
             )
             return
-        
-        if self.dynamic_chunking_model == "linear":
-            # Linear model: f(l) = bl + c
-            self.length_predictor.fit_linear(seq_lens, latencies)
-            self.length_predictor.set_target_latency(self.chunked_prefill_size)
-            self.length_predictor.is_ready = True
-            logger.info(
-                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (linear). "
-                f"Target latency: {self.length_predictor.target_latency:.2f}ms"
-            )
-        else:
-            # Quadratic model: f(l) = al^2 + bl + c
-            self.length_predictor.fit(seq_lens, latencies)
-            self.length_predictor.set_target_latency(self.chunked_prefill_size)
-            self.length_predictor.is_ready = True
-            logger.info(
-                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
-                f"Target latency: {self.length_predictor.target_latency:.2f}ms"
-            )
+
+        # Quadratic model: f(l) = al^2 + bl + c
+        self.length_predictor.fit(seq_lens, latencies)
+        self.length_predictor.set_target_latency(self.chunked_prefill_size)
+        self.length_predictor.is_ready = True
+        logger.info(
+            f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
+            f"Target latency: {self.length_predictor.target_latency:.2f}ms"
+        )
 
     def predict_next_chunk_size(self: "Scheduler", history_len: int) -> Optional[int]:
         """
         Predict next chunk size dynamically based on current history length.
-        
+
         Args:
             history_len: Current sequence length
-            
+
         Returns:
             Predicted chunk size, or None to use default chunked_prefill_size
         """
-        if not self.enable_dynamic_chunking or self.length_predictor is None or not self.length_predictor.is_ready:
+        if (
+            not self.enable_dynamic_chunking
+            or self.length_predictor is None
+            or not self.length_predictor.is_ready
+        ):
             return None
 
         max_chunk_size = getattr(self, "max_prefill_tokens", None)
