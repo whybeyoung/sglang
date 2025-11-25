@@ -1002,7 +1002,10 @@ async def get_mooncake_request_over_time(
             # Form the full prompt from history
             try:
                 full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history, tokenize=False, add_generation_prompt=True
+                    chat_history,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    return_dict=False,
                 )
             except Exception:
                 full_prompt_text = "\n".join(
@@ -1168,6 +1171,7 @@ def sample_sharegpt_requests(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 tokenize=False,
+                return_dict=False,
             )
             if tokenizer.bos_token:
                 prompt = prompt.replace(tokenizer.bos_token, "")
