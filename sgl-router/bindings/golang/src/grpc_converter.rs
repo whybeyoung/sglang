@@ -80,6 +80,7 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
     stop: *const c_char,
     stop_token_ids: *const c_char,
     skip_special_tokens: c_int,
+    initial_prompt_tokens: c_int,
     error_out: *mut *mut c_char,
 ) -> *mut GrpcResponseConverterHandle {
     if tokenizer_handle.is_null() || model.is_null() || request_id.is_null() {
@@ -194,7 +195,11 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
         is_first_chunk: HashMap::new(),
         prompt_tokens: HashMap::new(),
         completion_tokens: HashMap::new(),
-        initial_prompt_tokens: None, // Will be set from stream handle
+        initial_prompt_tokens: if initial_prompt_tokens > 0 {
+            Some(initial_prompt_tokens)
+        } else {
+            None
+        },
         skip_special_tokens: skip_special_tokens != 0,
     }))
 }

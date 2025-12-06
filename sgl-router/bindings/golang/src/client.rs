@@ -239,6 +239,7 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
         stop_json.unwrap_or(ptr::null_mut()),
         stop_token_ids_json.unwrap_or(ptr::null_mut()),
         if chat_request.skip_special_tokens { 1 } else { 0 },
+        prompt_tokens,
         error_out,
     );
 
@@ -263,9 +264,8 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
         let _ = CString::from_raw(ptr);
     }
 
-    // Create converter handle and set initial_prompt_tokens immediately
-    let mut converter_handle = *Box::from_raw(converter);
-    converter_handle.initial_prompt_tokens = Some(prompt_tokens);
+    // Create converter handle (initial_prompt_tokens is already set in the converter)
+    let converter_handle = *Box::from_raw(converter);
 
     // Create stream handle with prompt_tokens
     *stream_handle_out = Box::into_raw(Box::new(SglangStreamHandle {

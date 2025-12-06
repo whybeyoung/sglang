@@ -29,9 +29,9 @@ vendored-openssl = ["sglang-router/vendored-openssl"]
 
 [profile.release]
 opt-level = "z"     # Optimize for size
-lto = "fat"         # Full LTO for smaller binaries
+lto = "thin"        # Thin LTO (full LTO may remove unused FFI functions)
 codegen-units = 1   # Better optimization, slower compile
-strip = true        # Strip debug symbols
+strip = false       # Don't strip symbols (needed for FFI exports)
 
 [profile.ci]
 inherits = "release"
