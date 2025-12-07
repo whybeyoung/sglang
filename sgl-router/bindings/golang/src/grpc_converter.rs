@@ -407,8 +407,9 @@ pub(crate) async fn convert_proto_chunk_to_openai(
             let first_chunk = *is_first;
             *is_first = false;
 
-            // Track token counts from chunks (cumulative values from proto)
-            // These are cumulative values, so we always use the latest value
+            // Track token counts from chunks
+            // CRITICAL: Don't trust proto's completion_tokens - calculate it ourselves by accumulating token_ids
+            // This matches Rust router's behavior and ensures accuracy
             // For prompt_tokens, if chunk value is 0, preserve existing value or use initial_prompt_tokens
             // This prevents overwriting valid prompt_tokens with 0
             if chunk.prompt_tokens > 0 {
@@ -423,8 +424,10 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                 }
                 // If existing value exists, keep it (don't overwrite with 0)
             }
-            // For completion_tokens, always update (even if 0) as it's cumulative
-            handle.completion_tokens.insert(index, chunk.completion_tokens);
+            // CRITICAL: Calculate completion_tokens by accumulating token_ids (matching Rust router)
+            // Don't trust proto's completion_tokens field - it may be inaccurate
+            let current_completion = handle.completion_tokens.entry(index).or_insert(0);
+            *current_completion += chunk.token_ids.len() as i32;
 
             // Process tokens through stop decoder if available, otherwise use incremental decoder
             let chunk_text = if let Some(ref stop_decoder) = handle.stop_decoder {
@@ -582,6 +585,17 @@ pub(crate) async fn convert_proto_chunk_to_openai(
             }
 
             // Regular content emission
+            // Return cumulative usage in streaming chunks (matching Rust behavior and OpenAI API)
+            // This allows clients (like bench_serving.py) to track token usage in real-time
+            let completion_tokens = handle.completion_tokens.get(&index)
+                .copied()
+                .unwrap_or(0);
+            let prompt_tokens = handle.prompt_tokens.get(&index)
+                .copied()
+                .filter(|&v| v > 0)
+                .or(handle.initial_prompt_tokens)
+                .unwrap_or(0);
+            
             let content_response = ChatCompletionStreamResponse {
                 id: request_id.to_string(),
                 object: "chat.completion.chunk".to_string(),
@@ -600,7 +614,12 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     finish_reason: None,
                     matched_stop: None,
                 }],
-                usage: None,
+                usage: Some(Usage {
+                    prompt_tokens: prompt_tokens.max(0) as u32,
+                    completion_tokens: completion_tokens.max(0) as u32,
+                    total_tokens: (prompt_tokens.max(0) + completion_tokens.max(0)) as u32,
+                    completion_tokens_details: None,
+                }),
             };
 
             Ok(Some(content_response))

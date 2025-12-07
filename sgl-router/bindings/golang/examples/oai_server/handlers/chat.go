@@ -88,7 +88,11 @@ func (h *ChatHandler) HandleChatCompletion(ctx *fasthttp.RequestCtx) {
 		topP := float32(*req.TopP)
 		sglReq.TopP = &topP
 	}
-	if req.MaxTokens != nil {
+	// CRITICAL: Support both max_tokens and max_completion_tokens
+	// OpenAI API uses max_tokens, but bench_serving.py uses max_completion_tokens
+	if req.MaxCompletionTokens != nil {
+		sglReq.MaxCompletionTokens = req.MaxCompletionTokens
+	} else if req.MaxTokens != nil {
 		sglReq.MaxCompletionTokens = req.MaxTokens
 	}
 
@@ -113,12 +117,11 @@ func isBrokenPipeError(err error) bool {
 	errStr := err.Error()
 	return strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "connection closed") ||
 		strings.Contains(errStr, "write: connection closed")
 }
 
 func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, requestCtx context.Context, req sglang.ChatCompletionRequest) {
-	requestStartTime := time.Now()
-
 	h.logger.Info("Streaming chat completion started", zap.String("model", req.Model))
 
 	// Setup SSE headers
@@ -137,11 +140,9 @@ func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, reques
 	// 2. Use independent context (streamCtx) for stream operations
 	// 3. Check requestCtx.Done() to detect client disconnection
 
-	// Track metrics (captured in closure)
+	// Track metrics
 	var chunkCount int
 	var clientDisconnected bool
-	var lastChunkTime time.Time
-	var chunkIntervals []time.Duration // Track intervals between chunks
 
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 		// CRITICAL: Create independent context for stream operations INSIDE callback
@@ -170,40 +171,20 @@ func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, reques
 		}()
 
 		defer func() {
-			requestEndTime := time.Now()
-			totalDuration := requestEndTime.Sub(requestStartTime)
-
-			// Calculate client-side TPOT (average time between sending chunks to client)
-			var avgClientTPOT time.Duration
-			if len(chunkIntervals) > 0 {
-				var sum time.Duration
-				for _, interval := range chunkIntervals {
-					sum += interval
-				}
-				avgClientTPOT = sum / time.Duration(len(chunkIntervals))
-			}
-
 			if clientDisconnected {
 				h.logger.Info("Streaming chat completion interrupted",
 					zap.Int("chunks", chunkCount),
-					zap.Duration("duration", totalDuration),
-					zap.Duration("avg_client_tpot", avgClientTPOT),
 				)
 			} else {
 				h.logger.Info("Streaming chat completion completed",
 					zap.Int("chunks", chunkCount),
-					zap.Duration("duration", totalDuration),
-					zap.Duration("avg_client_tpot", avgClientTPOT),
 				)
 			}
 		}()
 
 		for {
-			// Check if original request context is cancelled (client disconnected)
+			// Check if stream context is cancelled (client disconnected or error)
 			select {
-			case <-requestCtx.Done():
-				clientDisconnected = true
-				return
 			case <-streamCtx.Done():
 				return
 			default:
@@ -229,14 +210,6 @@ func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, reques
 			}
 			chunkCount++
 
-			// Track TPOT: record time when we send each chunk to client
-			currentChunkTime := time.Now()
-			if chunkCount > 1 {
-				// Calculate interval since last chunk
-				chunkIntervals = append(chunkIntervals, currentChunkTime.Sub(lastChunkTime))
-			}
-			lastChunkTime = currentChunkTime
-
 			// OPTIMIZATION: Directly use Rust FFI JSON string - no parsing/serialization needed!
 			// Just add SSE prefix and suffix
 			w.WriteString("data: ")
@@ -245,11 +218,15 @@ func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, reques
 
 			// CRITICAL: Flush immediately after each chunk
 			// This ensures data is sent immediately, reducing TTFT
+			// If flush fails, cancel streamCtx to stop readLoop
 			if err := w.Flush(); err != nil {
 				if isBrokenPipeError(err) {
+					// Client disconnected - silently handle (normal case)
 					clientDisconnected = true
+					cancel() // Cancel streamCtx to stop readLoop
 					return
 				}
+				// Only log non-disconnection errors (should be rare)
 				h.logger.Warn("Flush error", zap.Error(err))
 			}
 		}
@@ -258,7 +235,9 @@ func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, reques
 		if !clientDisconnected {
 			w.WriteString("data: [DONE]\n\n")
 			if err := w.Flush(); err != nil {
+				// Silently ignore client disconnection errors
 				if !isBrokenPipeError(err) {
+					// Only log non-disconnection errors (should be rare)
 					h.logger.Warn("Final flush error", zap.Error(err))
 				}
 			}

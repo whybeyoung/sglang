@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -27,6 +26,12 @@ import (
 type grpcClientStream interface {
 	Recv() (*proto.GenerateResponse, error)
 	CloseSend() error
+}
+
+// recvResult holds the result of a Recv() call
+type recvResult struct {
+	resp *proto.GenerateResponse
+	err  error
 }
 
 // GrpcClient is a gRPC-based client for SGLang
@@ -111,76 +116,26 @@ func (c *GrpcClient) Close() error {
 // This uses preprocessing FFI for chat_template and tokenization,
 // then direct gRPC calls, and batch postprocessing FFI for tool parsing
 func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON string) (*GrpcChatCompletionStream, error) {
-	// Check if FFI preprocessing should be disabled (for performance testing)
-	disableFFIPreprocess := os.Getenv("DISABLE_FFI_PREPROCESS") == "true"
-
-	var preprocessed *ffi.PreprocessedRequest
-	var err error
-
-	if !disableFFIPreprocess {
-		// Step 1: Preprocess using Rust FFI (chat_template + tokenization)
-		// Tokenizer handle is pre-created at startup, so we can use it directly without locks
-		// CRITICAL: TokenizerHandle is thread-safe (Arc<dyn TokenizerTrait> with Send + Sync)
-		// All tokenizer methods are read-only (&self), so concurrent calls are safe
-		// No lock needed - this eliminates lock contention and allows true parallelism
-		if c.tokenizerHandle == nil {
-			return nil, fmt.Errorf("tokenizer handle is nil (should be created at startup)")
-		}
-
-		// Direct call without lock - tokenizer is thread-safe
-		// This allows multiple requests to preprocess concurrently, eliminating the bottleneck
-		preprocessed, err = ffi.PreprocessChatRequestWithTokenizer(reqJSON, c.tokenizerHandle)
-
-		if err != nil {
-			return nil, fmt.Errorf("preprocessing failed: %w", err)
-		}
-		defer func() {
-			if preprocessed != nil {
-				preprocessed.Free()
-			}
-		}()
-	} else {
-		// Skip FFI preprocessing - use placeholder data for performance testing
-		// Parse request JSON to extract basic info
-		var reqMap map[string]interface{}
-		if err := json.Unmarshal([]byte(reqJSON), &reqMap); err != nil {
-			return nil, fmt.Errorf("failed to parse request JSON: %w", err)
-		}
-
-		// Extract messages and build simple prompt text (no chat_template)
-		promptText := ""
-		if messages, ok := reqMap["messages"].([]interface{}); ok {
-			var parts []string
-			for _, msg := range messages {
-				if msgMap, ok := msg.(map[string]interface{}); ok {
-					if role, ok := msgMap["role"].(string); ok {
-						if content, ok := msgMap["content"].(string); ok {
-							parts = append(parts, fmt.Sprintf("%s: %s", role, content))
-						}
-					}
-				}
-			}
-			promptText = strings.Join(parts, "\n")
-		}
-
-		// Use placeholder token IDs for performance testing
-		// In real scenario, we'd need tokenization, but we skip it to test pure gRPC performance
-		// This will produce incorrect output, but allows us to measure gRPC overhead
-		placeholderTokenIDs := make([]uint32, 100) // Placeholder: 100 tokens
-		for i := range placeholderTokenIDs {
-			placeholderTokenIDs[i] = uint32(i + 1)
-		}
-
-		// Create a mock preprocessed request (no C memory allocated, so no Free() needed)
-		// The internal pointers (promptTextPtr, tokenIDsPtr, etc.) will be nil by default,
-		// so Free() will correctly skip freeing C memory
-		preprocessed = &ffi.PreprocessedRequest{
-			PromptText:          promptText,
-			TokenIDs:            placeholderTokenIDs,
-			ToolConstraintsJSON: "",
-			PromptTokens:        int32(len(placeholderTokenIDs)),
-		}
+	// Step 1: Preprocess using Rust FFI (chat_template + tokenization)
+	// Tokenizer handle is pre-created at startup, so we can use it directly without locks
+	// CRITICAL: TokenizerHandle is thread-safe (Arc<dyn TokenizerTrait> with Send + Sync)
+	// All tokenizer methods are read-only (&self), so concurrent calls are safe
+	// No lock needed - this eliminates lock contention and allows true parallelism
+	if c.tokenizerHandle == nil {
+		return nil, fmt.Errorf("tokenizer handle is nil (should be created at startup)")
 	}
+
+	// Direct call without lock - tokenizer is thread-safe
+	// This allows multiple requests to preprocess concurrently, eliminating the bottleneck
+	preprocessed, err := ffi.PreprocessChatRequestWithTokenizer(reqJSON, c.tokenizerHandle)
+	if err != nil {
+		return nil, fmt.Errorf("preprocessing failed: %w", err)
+	}
+	defer func() {
+		if preprocessed != nil {
+			preprocessed.Free()
+		}
+	}()
 
 	// Parse request JSON to get parameters
 	var reqMap map[string]interface{}
@@ -220,9 +175,21 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 	if topK, ok := reqMap["top_k"].(float64); ok {
 		samplingParams.TopK = int32(topK)
 	}
-	if maxTokens, ok := reqMap["max_tokens"].(float64); ok {
-		maxTokensInt := int32(maxTokens)
-		samplingParams.MaxNewTokens = &maxTokensInt
+	// CRITICAL: Check both max_completion_tokens and max_tokens (matching Rust behavior)
+	// Priority: max_completion_tokens (recommended) > max_tokens (deprecated, backward compatibility)
+	// Rust normalize() migrates max_tokens → max_completion_tokens, then only uses max_completion_tokens
+	var maxTokensInt *int32
+	if maxCompletionTokens, ok := reqMap["max_completion_tokens"].(float64); ok {
+		// Use max_completion_tokens (recommended field, used by bench_serving.py)
+		tokens := int32(maxCompletionTokens)
+		maxTokensInt = &tokens
+	} else if maxTokens, ok := reqMap["max_tokens"].(float64); ok {
+		// Fallback to max_tokens (deprecated, for backward compatibility with OpenAI API)
+		tokens := int32(maxTokens)
+		maxTokensInt = &tokens
+	}
+	if maxTokensInt != nil {
+		samplingParams.MaxNewTokens = maxTokensInt
 	}
 
 	// Parse tool constraints if available
@@ -285,69 +252,46 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		skipSpecialTokens = skipSpecialTokensVal
 	}
 
-	// Check if FFI postprocessing should be disabled (for performance testing)
-	disableFFIPostprocess := os.Getenv("DISABLE_FFI_POSTPROCESS") == "true"
-
-	var converterHandle *ffi.GrpcResponseConverterHandle
-	var tokenizerHandle *ffi.TokenizerHandle
-	var batchPostprocessor *ffi.BatchPostprocessor
-	batchSize := 1 // Default batch size for optimization check
-
-	// Only create converter handle if postprocessing is enabled
-	if !disableFFIPostprocess {
-		// Tokenizer handle is pre-created at startup, so we can use it directly
-		if c.tokenizerHandle == nil {
-			stream.CloseSend()
-			return nil, fmt.Errorf("tokenizer handle is nil (should be created at startup)")
-		}
-
-		// Use pre-created tokenizer to create converter (much faster!)
-		converterHandle, err = ffi.CreateGrpcResponseConverterWithTokenizer(
-			c.tokenizerHandle,
-			model,
-			generateReq.RequestId,
-			toolsJSON,
-			toolChoiceJSON,
-			stopJSON,
-			stopTokenIDs,
-			skipSpecialTokens,
-			preprocessed.PromptTokens, // Pass initial prompt tokens from preprocessing
-		)
-		if err != nil {
-			stream.CloseSend()
-			return nil, fmt.Errorf("failed to create converter handle: %w", err)
-		}
-
-		// CRITICAL: Optimize for ultra-low latency TPOT (target: ~28ms like Rust)
-		// - batchSize=1: No batching delay - process immediately
-		// - flushInterval=0: No timeout - process immediately when batch is full
-		// Key insight: Any batching delay directly adds to TPOT
-		// Trade-off: More FFI calls (1 per token) but eliminates ALL batching delay
-		// This matches Rust's per-token processing approach
-		batchSize = 1
-		batchPostprocessor = ffi.NewBatchPostprocessor(converterHandle, batchSize, 0) // 0 = immediate processing
-	} else {
-		// If postprocessing is disabled, we still need tokenizer handle for direct decoding (if enabled later)
-		// But for pure gRPC testing, we can skip it
-		// For now, set to nil - will be created on demand if needed
-		tokenizerHandle = nil
+	// Create converter handle for postprocessing
+	// Tokenizer handle is pre-created at startup, so we can use it directly
+	if c.tokenizerHandle == nil {
+		stream.CloseSend()
+		return nil, fmt.Errorf("tokenizer handle is nil (should be created at startup)")
 	}
 
+	// Use pre-created tokenizer to create converter (much faster!)
+	converterHandle, err := ffi.CreateGrpcResponseConverterWithTokenizer(
+		c.tokenizerHandle,
+		model,
+		generateReq.RequestId,
+		toolsJSON,
+		toolChoiceJSON,
+		stopJSON,
+		stopTokenIDs,
+		skipSpecialTokens,
+		preprocessed.PromptTokens, // Pass initial prompt tokens from preprocessing
+	)
+	if err != nil {
+		stream.CloseSend()
+		return nil, fmt.Errorf("failed to create converter handle: %w", err)
+	}
+
+	// Batch postprocessor for processing chunks
+	// batchSize=1: Process immediately without batching delay
+	batchSize := 1
+	batchPostprocessor := ffi.NewBatchPostprocessor(converterHandle, batchSize, 0) // 0 = immediate processing
+
 	grpcStream := &GrpcChatCompletionStream{
-		stream:                stream,
-		converterHandle:       converterHandle,
-		batchPostprocessor:    batchPostprocessor,
-		batchSize:             batchSize, // Store for optimization check
-		ctx:                   ctx,
-		resultChan:            make(chan *ChatCompletionStreamResponse, 2000), // Increased buffer to prevent channel full deadlock
-		resultJSONChan:        make(chan string, 2000),                        // Increased buffer to prevent channel full deadlock
-		errChan:               make(chan error, 100),                          // Larger error buffer for concurrent requests
-		readLoopDone:          make(chan struct{}),
-		disableFFIPostprocess: disableFFIPostprocess,
-		disableFFIPreprocess:  disableFFIPreprocess, // Store for debug logging
-		requestID:             generateReq.RequestId,
-		model:                 model,
-		tokenizerHandle:       tokenizerHandle, // Cache tokenizer for direct decoding when FFI disabled
+		stream:             stream,
+		converterHandle:    converterHandle,
+		batchPostprocessor: batchPostprocessor,
+		batchSize:          batchSize,
+		ctx:                ctx,
+		resultJSONChan:     make(chan string, 2000), // Buffer for processed JSON responses
+		errChan:            make(chan error, 100),   // Buffer for errors
+		readLoopDone:       make(chan struct{}),
+		requestID:          generateReq.RequestId,
+		model:              model,
 	}
 
 	// Start async read loop to process stream in background
@@ -362,380 +306,213 @@ type GrpcChatCompletionStream struct {
 	stream             grpcClientStream
 	converterHandle    *ffi.GrpcResponseConverterHandle
 	batchPostprocessor *ffi.BatchPostprocessor
-	batchSize          int // Store batchSize for optimization check
+	batchSize          int
 	ctx                context.Context
-	// Removed mu sync.Mutex - no longer needed, using atomic for closed flag
-	closed int32 // Use atomic for closed flag to reduce lock contention
-	// Removed pendingResults - no longer used, replaced by channel-based approach
-	resultChan            chan *ChatCompletionStreamResponse // Channel for async results (parsed, for disableFFIPostprocess)
-	resultJSONChan        chan string                        // Channel for raw JSON strings (lazy parsing to avoid blocking readLoop)
-	errChan               chan error                         // Channel for errors
-	readLoopDone          chan struct{}                      // Signal when read loop is done
-	disableFFIPostprocess bool                               // Skip FFI postprocessing for performance testing
-	disableFFIPreprocess  bool                               // Skip FFI preprocessing (for debug logging)
-	requestID             string                             // Request ID for responses
-	model                 string                             // Model name for responses
-	tokenizerHandle       *ffi.TokenizerHandle               // Cached tokenizer for direct decoding when FFI disabled
+	closed             int32         // Atomic flag for closed state
+	resultJSONChan     chan string   // Channel for processed JSON responses (from FFI)
+	errChan            chan error    // Channel for errors
+	readLoopDone       chan struct{} // Signal when read loop is done
+	requestID          string
+	model              string
 }
 
 // readLoop runs in a background goroutine to continuously read from gRPC stream
 // and process chunks asynchronously, eliminating blocking delays
 func (s *GrpcChatCompletionStream) readLoop() {
 	defer close(s.readLoopDone)
+	defer close(s.resultJSONChan)
 
-	// Track TPOT metrics for gRPC responses
-	var firstTokenTime time.Time
-	var tokenCount int
+	// CRITICAL: Use a channel to make Recv() cancelable
+	// Use a dedicated goroutine for Recv() to avoid goroutine leaks
+	// Increased buffer to prevent blocking when readLoop is processing
+	recvChan := make(chan recvResult, 1000) // Increased from 1 to 10 to prevent blocking
+	recvDone := make(chan struct{})
 
-	// CRITICAL: Use goroutine + channel to handle blocking Recv()
-	// Similar to Rust's async stream.next().await pattern
-	// This allows us to check context cancellation while Recv() is blocking
-	// Buffer size 10 allows goroutine to send multiple responses even if main loop is slow
-	grpcRespChan := make(chan struct {
-		resp *proto.GenerateResponse
-		err  error
-	}, 2048)
-
-	// Start goroutine to read from gRPC stream (blocking operation)
-	// CRITICAL: Use goroutine + channel to handle blocking Recv()
-	// Similar to Rust's async stream.next().await pattern
-	// This allows us to check context cancellation while Recv() is blocking
-	// Rust doesn't use explicit timeout, it relies on async runtime and context cancellation
-	recvGoroutineDone := make(chan struct{})
+	// Start a single dedicated goroutine for Recv() calls
+	// CRITICAL: This goroutine will be unblocked when stream is closed (via CloseSend())
 	go func() {
-		defer close(grpcRespChan)
-		defer close(recvGoroutineDone)
+		defer close(recvDone)
 		for {
-			// Check context before Recv()
+			// Check if context is cancelled before calling Recv()
 			select {
 			case <-s.ctx.Done():
 				return
 			default:
 			}
 
-			// CRITICAL: Recv() is blocking - this goroutine will block here
-			// Similar to Rust's stream.next().await, which blocks but can be cancelled via context
-			// We rely on gRPC stream's context cancellation to handle this
+			// Check if stream is closed
+			if atomic.LoadInt32(&s.closed) == 1 {
+				return
+			}
+
+			// Call Recv() - this is blocking, but we're in a dedicated goroutine
+			// When stream is closed (via CloseSend()), Recv() will return an error
 			protoResp, err := s.stream.Recv()
 
-			// Send result to channel
-			select {
-			case grpcRespChan <- struct {
-				resp *proto.GenerateResponse
-				err  error
-			}{protoResp, err}:
-				// Successfully sent
-			case <-s.ctx.Done():
-				return
-			}
-
-			// If error or EOF, exit goroutine
+			// If Recv() returned an error (including EOF or stream closed), exit the goroutine
+			// This happens when:
+			// 1. Stream ends normally (EOF)
+			// 2. Stream is closed via CloseSend() (context cancellation or Close())
+			// 3. Stream error
 			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// CRITICAL: Use separate goroutine to send to resultJSONChan to avoid deadlock
-	// Main loop reads from grpcRespChan, processing goroutine sends to resultJSONChan
-	// This prevents main loop from blocking when resultJSONChan is full
-	processChan := make(chan struct {
-		protoResp *proto.GenerateResponse
-		err       error
-	}, 100) // Buffer to allow main loop to continue reading
-
-	// Processing goroutine: handles data conversion and sends to resultJSONChan
-	// This goroutine is responsible for closing resultChan and resultJSONChan (where it sends)
-	go func() {
-		defer close(s.resultChan)
-		defer close(s.resultJSONChan)
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			case item, ok := <-processChan:
-				if !ok {
-					// processChan closed by main loop, exit and close result channels
+				// Try to send error result, but don't block if context is cancelled
+				select {
+				case recvChan <- recvResult{resp: protoResp, err: err}:
+					// Successfully sent error result
+				case <-s.ctx.Done():
+					// Context cancelled while trying to send - exit
+					return
+				default:
+					// recvChan is full and context not cancelled - exit anyway
+					// This should be rare since recvChan has buffer size 1
 					return
 				}
-				if item.err != nil {
-					// Error already handled in main loop
-					continue
-				}
-				if item.protoResp == nil {
-					continue
-				}
+				return
+			}
 
-				// Process and send to resultJSONChan (may block, but doesn't affect main loop)
-				s.processAndSendResponse(item.protoResp)
+			// Try to send result, but respect context cancellation
+			select {
+			case recvChan <- recvResult{resp: protoResp, err: err}:
+				// Successfully sent result
+			case <-s.ctx.Done():
+				// Context cancelled while trying to send - exit
+				return
 			}
 		}
 	}()
 
 	for {
-		// Check if stream is closed (use atomic read to avoid lock contention)
+		// Check if stream is closed
 		if atomic.LoadInt32(&s.closed) == 1 {
-			// Close processChan to signal processing goroutine to exit
-			close(processChan)
 			return
 		}
 
 		// Wait for Recv() result or context cancellation
-		var protoResp *proto.GenerateResponse
-		var err error
-
 		select {
 		case <-s.ctx.Done():
-			// Close processChan to signal processing goroutine to exit
-			close(processChan)
+			// CRITICAL: When context is cancelled, close the stream to unblock Recv()
+			// This ensures the Recv() goroutine can exit
+			_ = s.stream.CloseSend()
 			return
-		case result, ok := <-grpcRespChan:
+		case result, ok := <-recvChan:
 			if !ok {
-				// Channel closed - goroutine exited
-				// Close processChan to signal processing goroutine to exit
-				close(processChan)
+				// recvChan closed - Recv() goroutine exited
 				return
 			}
-			protoResp = result.resp
-			err = result.err
-		}
-
-		if err != nil {
-			if err == io.EOF {
-				// Stream ended - flush remaining chunks and exit immediately
-				if !s.disableFFIPostprocess {
-					// Flush remaining chunks - this is critical for getting the final complete message with usage
+			if result.err != nil {
+				if result.err == io.EOF {
+					// Stream ended - flush remaining chunks and exit
 					results, flushErr := s.flushBatch()
 					if flushErr != nil {
 						select {
 						case s.errChan <- fmt.Errorf("failed to flush batch: %w", flushErr):
 						default:
 						}
-						// Close processChan to signal processing goroutine to exit
-						close(processChan)
 						return
 					}
-					// Send all flushed results as raw JSON (parse in Recv())
-					// CRITICAL: Must wait for channel space to avoid deadlock
-					// If we skip sending when channel is full, Recv() will wait forever
+					// Send all flushed results as raw JSON
 					for _, resultJSON := range results {
 						select {
 						case s.resultJSONChan <- resultJSON:
 							// Successfully sent
 						case <-s.ctx.Done():
-							// Close processChan to signal processing goroutine to exit
-							close(processChan)
 							return
-							// Removed default case - must wait for channel space to prevent deadlock
-							// If channel is consistently full, it means Recv() is not consuming fast enough
-							// In that case, we should wait rather than skip, to maintain data flow
 						}
 					}
+					return
 				}
-				// Log TPOT metrics before exit
-				if tokenCount > 1 {
-					avgTPOT := time.Since(firstTokenTime) / time.Duration(tokenCount-1)
-					fmt.Printf("[GRPC_TPOT] request_id=%s tokens=%d avg_tpot=%v\n", s.requestID, tokenCount, avgTPOT)
-				}
-				// CRITICAL: Exit immediately after EOF - don't continue loop
-				// This prevents readLoop from calling Recv() again after stream is closed
-				// If we continue, Recv() may block indefinitely waiting for data that will never arrive
-				// Close processChan to signal processing goroutine to exit
-				close(processChan)
-				return
-			}
-			select {
-			case s.errChan <- err:
-			default:
-			}
-			// Close processChan to signal processing goroutine to exit
-			close(processChan)
-			return
-		}
-
-		// Track TPOT: record time when we receive each response from gRPC
-		if err == nil && protoResp != nil {
-			if tokenCount == 0 {
-				firstTokenTime = time.Now()
-			}
-			tokenCount++
-
-			// Send to processing goroutine (non-blocking, allows main loop to continue)
-			select {
-			case processChan <- struct {
-				protoResp *proto.GenerateResponse
-				err       error
-			}{protoResp, err}:
-				// Successfully sent to processing goroutine
-			case <-s.ctx.Done():
-				return
-			default:
-				// Processing goroutine is slow, but we continue reading from grpcRespChan
-				// This prevents deadlock: main loop can continue even if processing is slow
-				// Note: This may cause some data to be dropped, but prevents deadlock
+				// Send error to errChan
 				select {
-				case s.errChan <- fmt.Errorf("processChan full, dropping response"):
+				case s.errChan <- result.err:
 				default:
 				}
+				return
+			}
+
+			// Process and send to resultJSONChan
+			if result.resp != nil {
+				s.processAndSendResponse(result.resp)
 			}
 		}
-
-		// Continue loop to read next response (don't process here to avoid blocking)
-		continue
 	}
 }
 
 // processAndSendResponse processes proto response and sends to resultJSONChan
-// This is called from processing goroutine, so blocking here doesn't affect main loop
+// This is called from the readLoop goroutine
 func (s *GrpcChatCompletionStream) processAndSendResponse(protoResp *proto.GenerateResponse) {
-	// Check if context is cancelled or stream is closed
-	select {
-	case <-s.ctx.Done():
-		return
-	default:
-	}
+	// Check if stream is closed
 	if atomic.LoadInt32(&s.closed) == 1 {
 		return
 	}
 
-	// Check if protoResp is nil (shouldn't happen, but be defensive)
+	// Check if protoResp is nil
 	if protoResp == nil {
 		return
 	}
 
-	// Convert proto response directly to OpenAI format (skip FFI postprocessing if disabled)
-	if s.disableFFIPostprocess {
-		// Direct conversion without FFI - for performance testing
-		response := protoToOpenAIResponse(protoResp, s.requestID, s.model, s.tokenizerHandle)
-		if response == nil {
-			// This shouldn't happen anymore since protoToOpenAIResponse now always returns a response
-			// But keep this check for safety
-			return
-		}
-
-		// Send response to channel
-		// CRITICAL: Must wait for channel space to avoid deadlock
-		// If we skip sending when channel is full, Recv() will wait forever
-		// Check context and closed flag before sending
+	// Convert proto response to JSON for FFI postprocessing
+	protoJSON, err := protoToJSON(protoResp)
+	if err != nil {
 		select {
-		case <-s.ctx.Done():
-			return
+		case s.errChan <- fmt.Errorf("failed to convert proto to JSON: %w", err):
 		default:
 		}
+		return
+	}
+
+	// Use batch postprocessor to process chunk
+	if s.batchPostprocessor == nil {
+		select {
+		case s.errChan <- fmt.Errorf("batch postprocessor is nil"):
+		default:
+		}
+		return
+	}
+
+	results, _, err := s.batchPostprocessor.AddChunk(protoJSON)
+	if err != nil {
+		select {
+		case s.errChan <- fmt.Errorf("batch postprocessing failed: %w", err):
+		default:
+		}
+		return
+	}
+
+	// Send processed JSON strings to resultJSONChan
+	// The JSON is already in OpenAI format from Rust FFI
+	for _, resultJSON := range results {
 		if atomic.LoadInt32(&s.closed) == 1 {
 			return
 		}
 		select {
-		case s.resultChan <- response:
-			// Successfully sent to channel
+		case s.resultJSONChan <- resultJSON:
+			// Successfully sent
 		case <-s.ctx.Done():
+			// Context cancelled - exit
 			return
-			// Removed default case - must wait for channel space to prevent deadlock
-			// If channel is consistently full, it means Recv() is not consuming fast enough
-			// In that case, we should wait rather than skip, to maintain data flow
-		}
-	} else {
-		// Use FFI postprocessing (normal path)
-		// Convert proto response to JSON for postprocessing
-		protoJSON, err := protoToJSON(protoResp)
-
-		if err != nil {
-			select {
-			case s.errChan <- fmt.Errorf("failed to convert proto to JSON: %w", err):
-			default:
-			}
-			return
-		}
-
-		// Use batch postprocessor for all cases (batchSize > 1)
-		// This reduces FFI call frequency and improves throughput
-		if s.batchPostprocessor == nil {
-			select {
-			case s.errChan <- fmt.Errorf("batch postprocessor is nil"):
-			default:
-			}
-			return
-		}
-		results, _, err := s.batchPostprocessor.AddChunk(protoJSON)
-
-		if err != nil {
-			select {
-			case s.errChan <- fmt.Errorf("batch postprocessing failed: %w", err):
-			default:
-			}
-			return
-		}
-
-		// CRITICAL: Send raw JSON strings to avoid parsing in readLoop
-		// Parse JSON only when Recv() is called (lazy parsing)
-		// This reduces readLoop blocking time and improves TPOT significantly
-		// The JSON string is already in OpenAI format from Rust FFI
-		// CRITICAL: Must wait for channel space to avoid deadlock
-		// If we skip sending when channel is full, Recv() will wait forever
-		if len(results) > 0 {
-			for _, resultJSON := range results {
-				// Check context and closed flag before sending
-				select {
-				case <-s.ctx.Done():
-					return
-				default:
-				}
-				if atomic.LoadInt32(&s.closed) == 1 {
-					return
-				}
-				// CRITICAL: Must wait for channel space, cannot skip
-				// If we skip, Recv() will wait forever for data that never arrives
-				// This causes deadlock: readLoop continues but doesn't send, Recv() waits forever
-				select {
-				case s.resultJSONChan <- resultJSON:
-					// Successfully sent raw JSON - parsing deferred to Recv()
-				case <-s.ctx.Done():
-					return
-					// Removed default case - must wait for channel space to prevent deadlock
-					// If channel is consistently full, it means Recv() is not consuming fast enough
-					// In that case, we should wait rather than skip, to maintain data flow
-				}
-			}
 		}
 	}
 }
 
 // Recv receives the next chunk from the stream
-// Now uses async channel-based approach for low latency
-// CRITICAL: Parse JSON here (lazy parsing) to avoid blocking readLoop
+// Uses lazy parsing - JSON is parsed here instead of in readLoop to reduce blocking
 func (s *GrpcChatCompletionStream) Recv() (*ChatCompletionStreamResponse, error) {
-	// Always block waiting for data - no default case to avoid busy-waiting
-	// This ensures proper synchronization and avoids CPU spinning
 	select {
 	case resultJSON, ok := <-s.resultJSONChan:
-		// Channel closed - stream ended
 		if !ok {
 			return nil, io.EOF
 		}
-		// Empty string means invalid JSON - skip it
+		// Skip empty JSON
 		if resultJSON == "" {
-			// Try next item or return EOF
 			return s.Recv()
 		}
-		// Parse JSON here (lazy parsing) - moved from readLoop to reduce blocking
+		// Parse JSON (lazy parsing - moved from readLoop)
 		var response ChatCompletionStreamResponse
 		if err := json.Unmarshal([]byte(resultJSON), &response); err != nil {
 			return nil, fmt.Errorf("failed to parse response: %w", err)
 		}
-
 		return &response, nil
-	case result, ok := <-s.resultChan:
-		// Channel closed - stream ended
-		if !ok {
-			return nil, io.EOF
-		}
-		// Fallback: direct response (for disableFFIPostprocess path)
-		if result == nil {
-			return nil, io.EOF
-		}
-		return result, nil
 	case err, ok := <-s.errChan:
-		// Channel closed - stream ended
 		if !ok {
 			return nil, io.EOF
 		}
@@ -745,40 +522,20 @@ func (s *GrpcChatCompletionStream) Recv() (*ChatCompletionStreamResponse, error)
 	}
 }
 
-// RecvJSON receives the next chunk as raw JSON string (optimized path to avoid parsing/serialization)
-// This is much faster than Recv() because it avoids JSON unmarshal/marshal overhead
+// RecvJSON receives the next chunk as raw JSON string
+// This avoids JSON unmarshal/marshal overhead compared to Recv()
 func (s *GrpcChatCompletionStream) RecvJSON() (string, error) {
-	// Always block waiting for data - no default case to avoid busy-waiting
 	select {
 	case resultJSON, ok := <-s.resultJSONChan:
-		// Channel closed - stream ended
 		if !ok {
 			return "", io.EOF
 		}
-		// Empty string means invalid JSON - skip it
+		// Skip empty JSON
 		if resultJSON == "" {
-			// Try next item or return EOF
 			return s.RecvJSON()
 		}
-		// Return raw JSON string directly - no parsing needed!
 		return resultJSON, nil
-	case result, ok := <-s.resultChan:
-		// Channel closed - stream ended
-		if !ok {
-			return "", io.EOF
-		}
-		// Fallback: direct response (for disableFFIPostprocess path) - need to serialize
-		if result == nil {
-			return "", io.EOF
-		}
-		// Serialize to JSON (only for disableFFIPostprocess path)
-		jsonData, err := json.Marshal(result)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal response: %w", err)
-		}
-		return string(jsonData), nil
 	case err, ok := <-s.errChan:
-		// Channel closed - stream ended
 		if !ok {
 			return "", io.EOF
 		}
@@ -916,105 +673,6 @@ func protoToJSON(resp *proto.GenerateResponse) (string, error) {
 
 	sb.WriteString(`}`)
 	return sb.String(), nil
-}
-
-// protoToOpenAIResponse converts proto.GenerateResponse directly to ChatCompletionStreamResponse
-// This bypasses FFI postprocessing for performance testing
-// Note: This is a simplified conversion and may not handle all cases (e.g., tool calls, reasoning)
-// For performance testing, we skip token decoding and use placeholder content
-func protoToOpenAIResponse(resp *proto.GenerateResponse, requestID, model string, tokenizerHandle *ffi.TokenizerHandle) *ChatCompletionStreamResponse {
-	response := &ChatCompletionStreamResponse{
-		ID:      requestID,
-		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
-		Model:   model,
-		Choices: []StreamChoice{},
-		Usage:   nil,
-	}
-
-	switch r := resp.Response.(type) {
-	case *proto.GenerateResponse_Chunk:
-		// For streaming chunks, we skip token decoding for performance testing
-		// Return token IDs as JSON array string directly
-		content := ""
-		if len(r.Chunk.TokenIds) > 0 {
-			// Convert token IDs to JSON array string
-			tokenIDsJSON, err := json.Marshal(r.Chunk.TokenIds)
-			if err == nil {
-				content = string(tokenIDsJSON)
-			}
-		}
-
-		response.Choices = []StreamChoice{
-			{
-				Index:        int(r.Chunk.Index),
-				FinishReason: "",
-				Delta: MessageDelta{
-					Role:    "assistant",
-					Content: content,
-				},
-			},
-		}
-
-		// Set usage if available
-		if r.Chunk.PromptTokens > 0 || r.Chunk.CompletionTokens > 0 {
-			response.Usage = &Usage{
-				PromptTokens:     int(r.Chunk.PromptTokens),
-				CompletionTokens: int(r.Chunk.CompletionTokens),
-				TotalTokens:      int(r.Chunk.PromptTokens + r.Chunk.CompletionTokens),
-			}
-		}
-
-	case *proto.GenerateResponse_Complete:
-		// For complete message, set finish_reason
-		finishReason := r.Complete.FinishReason
-		if finishReason == "" {
-			finishReason = "stop"
-		}
-
-		response.Object = "chat.completion.chunk"
-		response.Choices = []StreamChoice{
-			{
-				Index:        0,
-				FinishReason: finishReason,
-				Delta: MessageDelta{
-					Role:    "assistant",
-					Content: "", // Complete message doesn't have delta content
-				},
-			},
-		}
-
-		// Set usage
-		if r.Complete.PromptTokens > 0 || r.Complete.CompletionTokens > 0 {
-			response.Usage = &Usage{
-				PromptTokens:     int(r.Complete.PromptTokens),
-				CompletionTokens: int(r.Complete.CompletionTokens),
-				TotalTokens:      int(r.Complete.PromptTokens + r.Complete.CompletionTokens),
-			}
-		}
-
-	case *proto.GenerateResponse_Error:
-		// Error handling - create error response instead of returning nil
-		// This ensures the error is properly sent to the client
-		// Create an error response that will be sent to the client
-		// The client can check for error in the response
-		response.Object = "error"
-		response.Choices = []StreamChoice{
-			{
-				Index:        0,
-				FinishReason: "error",
-				Delta: MessageDelta{
-					Role:    "assistant",
-					Content: "", // Error doesn't have content
-				},
-			},
-		}
-		// Note: We still return the response, but the client should check for error
-		// For now, we'll send it and let the client handle it
-		return response
-	}
-
-	return response
 }
 
 // ChatCompletionStreamResponse represents a streaming chat completion response
