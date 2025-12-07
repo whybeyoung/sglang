@@ -1,14 +1,11 @@
 #!/bin/bash
 
 # OpenAI-compatible server runner
-# Usage: ./run.sh [tokenizer_path] [endpoint] [port] [--profile] [--pprof-port PORT] [--grpc] [--no-ffi-postprocess] [--no-ffi-preprocess]
+# Usage: ./run.sh [tokenizer_path] [endpoint] [port] [--profile] [--pprof-port PORT]
 #
 # Options:
 #   --profile          Enable pprof profiling (default port: 6060)
 #   --pprof-port PORT  Set pprof port (default: 6060, requires --profile)
-#   --grpc             Enable optimized gRPC client mode (reduces FFI overhead by 90%+)
-#   --no-ffi-postprocess  Disable FFI postprocessing for performance testing (skips token decoding)
-#   --no-ffi-preprocess   Disable FFI preprocessing for performance testing (skips chat_template and tokenization)
 
 # Set library path for Rust FFI library
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,9 +36,6 @@ fi
 # Parse arguments
 ENABLE_PROFILE=false
 PPROF_PORT="6060"
-USE_GRPC_CLIENT=false
-DISABLE_FFI_POSTPROCESS=false
-DISABLE_FFI_PREPROCESS=false
 TOKENIZER_PATH=""
 ENDPOINT=""
 PORT=""
@@ -56,18 +50,6 @@ while [[ $# -gt 0 ]]; do
 			ENABLE_PROFILE=true
 			PPROF_PORT="$2"
 			shift 2
-			;;
-		--grpc)
-			USE_GRPC_CLIENT=true
-			shift
-			;;
-		--no-ffi-postprocess)
-			DISABLE_FFI_POSTPROCESS=true
-			shift
-			;;
-		--no-ffi-preprocess)
-			DISABLE_FFI_PREPROCESS=true
-			shift
 			;;
 		*)
 			if [[ -z "$TOKENIZER_PATH" ]]; then
@@ -96,29 +78,9 @@ echo "Library path: ${LIB_DIR}"
 echo "Tokenizer: $TOKENIZER_PATH"
 echo "Endpoint: $ENDPOINT"
 echo "Port: $PORT"
-if [[ "$USE_GRPC_CLIENT" == "true" ]]; then
-	echo "Client Mode: gRPC (optimized, reduces FFI overhead by 90%+)"
-	export USE_GRPC_CLIENT=true
-else
-	echo "Client Mode: FFI (default, backward compatible)"
-	export USE_GRPC_CLIENT=false
-fi
-
-if [[ "$DISABLE_FFI_POSTPROCESS" == "true" ]]; then
-	echo "FFI Postprocessing: DISABLED (performance testing mode - token decoding skipped)"
-	export DISABLE_FFI_POSTPROCESS=true
-else
-	echo "FFI Postprocessing: ENABLED (normal mode)"
-	export DISABLE_FFI_POSTPROCESS=false
-fi
-
-if [[ "$DISABLE_FFI_PREPROCESS" == "true" ]]; then
-	echo "FFI Preprocessing: DISABLED (performance testing mode - chat_template and tokenization skipped)"
-	export DISABLE_FFI_PREPROCESS=true
-else
-	echo "FFI Preprocessing: ENABLED (normal mode)"
-	export DISABLE_FFI_PREPROCESS=false
-fi
+echo "Client Mode: gRPC (default)"
+echo "FFI Postprocessing: ENABLED (normal mode)"
+echo "FFI Preprocessing: ENABLED (normal mode)"
 if [[ "$ENABLE_PROFILE" == "true" ]]; then
 	echo "Profiling: enabled (port: $PPROF_PORT)"
 	echo "  pprof endpoint: http://localhost:$PPROF_PORT/debug/pprof/"
@@ -130,4 +92,4 @@ fi
 echo ""
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
-SGL_TOKENIZER_PATH="$TOKENIZER_PATH" SGL_GRPC_ENDPOINT="$ENDPOINT" PORT="$PORT" USE_GRPC_CLIENT="$USE_GRPC_CLIENT" DISABLE_FFI_POSTPROCESS="$DISABLE_FFI_POSTPROCESS" DISABLE_FFI_PREPROCESS="$DISABLE_FFI_PREPROCESS" go run main.go
+SGL_TOKENIZER_PATH="$TOKENIZER_PATH" SGL_GRPC_ENDPOINT="$ENDPOINT" PORT="$PORT" go run main.go

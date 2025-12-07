@@ -32,7 +32,7 @@ import (
 	"io"
 	"strings"
 	"sync"
-	"sync/atomic"
+	"time"
 
 	grpcclient "github.com/sglang/sglang-go-grpc-sdk/internal/grpc"
 )
@@ -59,6 +59,41 @@ type ClientConfig struct {
 	// tokenizer configuration files (e.g., tokenizer.json, vocab.json).
 	// Required field.
 	TokenizerPath string
+
+	// ChannelBufferSizes configures buffer sizes for internal channels.
+	// If nil, default values will be used (optimized for high concurrency).
+	ChannelBufferSizes *ChannelBufferSizes
+
+	// Timeouts configures timeout values for various operations.
+	// If nil, default values will be used.
+	Timeouts *Timeouts
+}
+
+// ChannelBufferSizes configures buffer sizes for internal channels.
+// These affect concurrency and memory usage. Larger buffers allow more
+// concurrent operations but use more memory.
+type ChannelBufferSizes = grpcclient.ChannelBufferSizes
+
+// Timeouts configures timeout values for various operations.
+type Timeouts = grpcclient.Timeouts
+
+// defaultChannelBufferSizes returns default channel buffer sizes optimized for high concurrency (10k+).
+// These values are designed to handle thousands of concurrent requests without blocking.
+func defaultChannelBufferSizes() ChannelBufferSizes {
+	return ChannelBufferSizes{
+		ResultJSONChan: 10000, // Increased for high concurrency: each request may produce 200-500 chunks
+		ErrChan:        100,   // Errors are rare, 100 is sufficient
+		RecvChan:       2000,  // Increased for high concurrency: more gRPC responses to buffer
+	}
+}
+
+// defaultTimeouts returns default timeout values.
+func defaultTimeouts() Timeouts {
+	return Timeouts{
+		KeepaliveTime:    120 * time.Second,
+		KeepaliveTimeout: 20 * time.Second,
+		CloseTimeout:     5 * time.Second,
+	}
 }
 
 // NewClient creates a new SGLang client with the given configuration.
@@ -78,7 +113,33 @@ func NewClient(config ClientConfig) (*Client, error) {
 		return nil, errors.New("tokenizer path is required")
 	}
 
-	grpcClient, err := grpcclient.NewGrpcClient(config.Endpoint, config.TokenizerPath)
+	bufferSizes := defaultChannelBufferSizes()
+	if config.ChannelBufferSizes != nil {
+		if config.ChannelBufferSizes.ResultJSONChan > 0 {
+			bufferSizes.ResultJSONChan = config.ChannelBufferSizes.ResultJSONChan
+		}
+		if config.ChannelBufferSizes.ErrChan > 0 {
+			bufferSizes.ErrChan = config.ChannelBufferSizes.ErrChan
+		}
+		if config.ChannelBufferSizes.RecvChan > 0 {
+			bufferSizes.RecvChan = config.ChannelBufferSizes.RecvChan
+		}
+	}
+
+	timeouts := defaultTimeouts()
+	if config.Timeouts != nil {
+		if config.Timeouts.KeepaliveTime > 0 {
+			timeouts.KeepaliveTime = config.Timeouts.KeepaliveTime
+		}
+		if config.Timeouts.KeepaliveTimeout > 0 {
+			timeouts.KeepaliveTimeout = config.Timeouts.KeepaliveTimeout
+		}
+		if config.Timeouts.CloseTimeout > 0 {
+			timeouts.CloseTimeout = config.Timeouts.CloseTimeout
+		}
+	}
+
+	grpcClient, err := grpcclient.NewGrpcClient(config.Endpoint, config.TokenizerPath, bufferSizes, timeouts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC client: %w", err)
 	}
@@ -232,7 +293,7 @@ type MessageDelta struct {
 //
 // Context Support:
 // The ctx parameter is fully supported for cancellation and timeouts:
-// - If ctx is cancelled, the request will be interrupted on the next stream.Recv() call
+// - If ctx is cancelled, the request will be interrupted on the next stream.RecvJSON() call
 // - If ctx times out, the request will return context.DeadlineExceeded
 //
 // Example with timeout:
@@ -341,63 +402,23 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 
 // ChatCompletionStream represents a streaming chat completion
 type ChatCompletionStream struct {
-	grpcStream *grpcclient.GrpcChatCompletionStream // gRPC stream
-	done       int32
+	grpcStream *grpcclient.GrpcChatCompletionStream
 	ctx        context.Context
 	cancel     context.CancelFunc
-	closed     chan struct{}
-	chunks     chan chunkResult
-}
-
-type chunkResult struct {
-	chunk *ChatCompletionStreamResponse
-	err   error
 }
 
 func (s *ChatCompletionStream) RecvJSON() (string, error) {
-	if s.grpcStream != nil {
-		return s.grpcStream.RecvJSON()
-	}
-
-	select {
-	case <-s.ctx.Done():
-		return "", s.ctx.Err()
-	case result, ok := <-s.chunks:
-		if !ok {
-			return "", io.EOF
-		}
-		if result.err != nil {
-			return "", result.err
-		}
-		jsonData, err := json.Marshal(result.chunk)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal response: %w", err)
-		}
-		return string(jsonData), nil
-	}
+	return s.grpcStream.RecvJSON()
 }
 
 // Close closes the stream and cancels any pending operations.
 func (s *ChatCompletionStream) Close() error {
-	atomic.StoreInt32(&s.done, 1)
-
 	if s.cancel != nil {
 		s.cancel()
 	}
-
-	select {
-	case <-s.closed:
-	default:
-		close(s.closed)
-	}
-
 	if s.grpcStream != nil {
-		if err := s.grpcStream.Close(); err != nil {
-			return err
-		}
-		s.grpcStream = nil
+		return s.grpcStream.Close()
 	}
-
 	return nil
 }
 
@@ -405,8 +426,8 @@ func (s *ChatCompletionStream) Close() error {
 //
 // Context Support:
 // The ctx parameter is now fully supported for cancellation and timeouts:
-// - If ctx is cancelled, stream.Recv() will return context.Canceled on the next call
-// - If ctx times out (WithTimeout), stream.Recv() will return context.DeadlineExceeded
+// - If ctx is cancelled, stream.RecvJSON() will return context.Canceled on the next call
+// - If ctx times out (WithTimeout), stream.RecvJSON() will return context.DeadlineExceeded
 // - Calling stream.Close() also cancels the context
 //
 // Example with timeout:
@@ -425,9 +446,6 @@ func (s *ChatCompletionStream) Close() error {
 //	    cancel()  // Cancel after 5 seconds
 //	}()
 func (c *Client) CreateChatCompletionStream(ctx context.Context, req ChatCompletionRequest) (*ChatCompletionStream, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	reqJSON, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -456,80 +474,10 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req ChatComplet
 		return nil, fmt.Errorf("failed to create gRPC stream: %w", err)
 	}
 
-	return wrapGrpcStream(grpcStream, ctx), nil
-}
-
-// wrapGrpcStream wraps a gRPC stream to match ChatCompletionStream interface
-func wrapGrpcStream(grpcStream *grpcclient.GrpcChatCompletionStream, ctx context.Context) *ChatCompletionStream {
 	streamCtx, cancel := context.WithCancel(ctx)
-	chunksChan := make(chan chunkResult, 200) // Larger buffer for 20 concurrent requests (was 100)
-
-	stream := &ChatCompletionStream{
+	return &ChatCompletionStream{
 		grpcStream: grpcStream,
 		ctx:        streamCtx,
 		cancel:     cancel,
-		closed:     make(chan struct{}),
-		chunks:     chunksChan,
-	}
-
-	// Start background goroutine to read from gRPC stream
-	go stream.readGrpcLoop(grpcStream)
-
-	return stream
-}
-
-// readGrpcLoop reads from gRPC stream and sends chunks to channel
-func (s *ChatCompletionStream) readGrpcLoop(grpcStream *grpcclient.GrpcChatCompletionStream) {
-	defer close(s.chunks)
-
-	for {
-		// Check if context was cancelled or stream was closed
-		select {
-		case <-s.ctx.Done():
-			// Send error through channel (no need to store separately)
-			select {
-			case s.chunks <- chunkResult{err: s.ctx.Err()}:
-			case <-s.closed:
-			}
-			return
-		case <-s.closed:
-			return
-		default:
-		}
-
-		chunkJSON, err := grpcStream.RecvJSON()
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			select {
-			case s.chunks <- chunkResult{err: err}:
-			case <-s.ctx.Done():
-			case <-s.closed:
-			}
-			return
-		}
-
-		if chunkJSON == "" {
-			continue
-		}
-
-		var response ChatCompletionStreamResponse
-		if err := json.Unmarshal([]byte(chunkJSON), &response); err != nil {
-			select {
-			case s.chunks <- chunkResult{err: fmt.Errorf("failed to parse response: %w", err)}:
-			case <-s.ctx.Done():
-			case <-s.closed:
-			}
-			return
-		}
-
-		select {
-		case s.chunks <- chunkResult{chunk: &response}:
-		case <-s.ctx.Done():
-			return
-		case <-s.closed:
-			return
-		}
-	}
+	}, nil
 }

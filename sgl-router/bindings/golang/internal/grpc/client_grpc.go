@@ -37,17 +37,31 @@ type GrpcClient struct {
 	client          proto.SglangSchedulerClient
 	tokenizerPath   string
 	tokenizerHandle *ffi.TokenizerHandle
+	bufferSizes     ChannelBufferSizes
+	timeouts        Timeouts
 }
 
-func NewGrpcClient(endpoint, tokenizerPath string) (*GrpcClient, error) {
+type ChannelBufferSizes struct {
+	ResultJSONChan int
+	ErrChan        int
+	RecvChan       int
+}
+
+type Timeouts struct {
+	KeepaliveTime    time.Duration
+	KeepaliveTimeout time.Duration
+	CloseTimeout     time.Duration
+}
+
+func NewGrpcClient(endpoint, tokenizerPath string, bufferSizes ChannelBufferSizes, timeouts Timeouts) (*GrpcClient, error) {
 	endpoint = strings.TrimPrefix(endpoint, "grpc://")
 	if !strings.Contains(endpoint, ":") {
 		return nil, fmt.Errorf("invalid endpoint format: %s (expected grpc://host:port)", endpoint)
 	}
 
 	keepaliveParams := keepalive.ClientParameters{
-		Time:                120 * time.Second,
-		Timeout:             20 * time.Second,
+		Time:                timeouts.KeepaliveTime,
+		Timeout:             timeouts.KeepaliveTimeout,
 		PermitWithoutStream: false,
 	}
 
@@ -74,6 +88,8 @@ func NewGrpcClient(endpoint, tokenizerPath string) (*GrpcClient, error) {
 		client:          client,
 		tokenizerPath:   tokenizerPath,
 		tokenizerHandle: tokenizerHandle,
+		bufferSizes:     bufferSizes,
+		timeouts:        timeouts,
 	}, nil
 }
 
@@ -237,11 +253,14 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		batchSize:          batchSize,
 		ctx:                streamCtx,
 		cancel:             cancel,
-		resultJSONChan:     make(chan string, 2000),
-		errChan:            make(chan error, 100),
+		resultJSONChan:     make(chan string, c.bufferSizes.ResultJSONChan),
+		errChan:            make(chan error, c.bufferSizes.ErrChan),
 		readLoopDone:       make(chan struct{}),
 		requestID:          generateReq.RequestId,
 		model:              model,
+		processWg:          sync.WaitGroup{},
+		closeTimeout:       c.timeouts.CloseTimeout,
+		bufferSizes:        c.bufferSizes,
 	}
 
 	go grpcStream.readLoop()
@@ -264,6 +283,8 @@ type GrpcChatCompletionStream struct {
 	requestID          string
 	model              string
 	processWg          sync.WaitGroup
+	closeTimeout       time.Duration
+	bufferSizes        ChannelBufferSizes
 }
 
 func (s *GrpcChatCompletionStream) readLoop() {
@@ -277,53 +298,42 @@ func (s *GrpcChatCompletionStream) readLoop() {
 		close(s.readLoopDone)
 	}()
 
-	recvChan := make(chan recvResult, 1000)
-	recvDone := make(chan struct{})
+	recvChan := make(chan recvResult, s.bufferSizes.RecvChan)
 
 	go func() {
-		defer close(recvDone)
+		defer close(recvChan)
 		for {
 			if atomic.LoadInt32(&s.closed) == 1 {
 				return
 			}
 
-			recvResultChan := make(chan recvResult, 1)
-			go func() {
-				protoResp, err := s.stream.Recv()
+			select {
+			case <-s.ctx.Done():
+				_ = s.stream.CloseSend()
+				return
+			default:
+			}
+
+			protoResp, err := s.stream.Recv()
+			if err != nil {
 				select {
-				case recvResultChan <- recvResult{resp: protoResp, err: err}:
+				case recvChan <- recvResult{resp: nil, err: err}:
 				case <-s.ctx.Done():
+					return
 				}
-			}()
+				return
+			}
 
 			select {
 			case <-s.ctx.Done():
 				_ = s.stream.CloseSend()
 				return
-			case result := <-recvResultChan:
-				if result.err != nil {
-					select {
-					case recvChan <- result:
-					case <-s.ctx.Done():
-						return
-					}
-					return
-				}
-
-				select {
-				case recvChan <- result:
-				case <-s.ctx.Done():
-					return
-				}
+			case recvChan <- recvResult{resp: protoResp, err: nil}:
 			}
 		}
 	}()
 
 	for {
-		if atomic.LoadInt32(&s.closed) == 1 {
-			return
-		}
-
 		select {
 		case <-s.ctx.Done():
 			_ = s.stream.CloseSend()
@@ -338,7 +348,7 @@ func (s *GrpcChatCompletionStream) readLoop() {
 					if flushErr != nil {
 						select {
 						case s.errChan <- fmt.Errorf("failed to flush batch: %w", flushErr):
-						default:
+						case <-s.ctx.Done():
 						}
 						return
 					}
@@ -353,17 +363,17 @@ func (s *GrpcChatCompletionStream) readLoop() {
 				}
 				select {
 				case s.errChan <- result.err:
-				default:
+				case <-s.ctx.Done():
 				}
 				return
 			}
 
 			if result.resp != nil {
 				s.processWg.Add(1)
-				go func() {
+				go func(resp *proto.GenerateResponse) {
 					defer s.processWg.Done()
-					s.processAndSendResponse(result.resp)
-				}()
+					s.processAndSendResponse(resp)
+				}(result.resp)
 			}
 		}
 	}
@@ -461,7 +471,7 @@ func (s *GrpcChatCompletionStream) Close() error {
 
 	select {
 	case <-s.readLoopDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(s.closeTimeout):
 	}
 
 	_, _ = s.flushBatch()
