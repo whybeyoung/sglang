@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	sglang "github.com/sglang/sglang-go-grpc-sdk"
 	"github.com/valyala/fasthttp"
@@ -41,11 +40,15 @@ func (h *ChatHandler) HandleChatCompletion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.logger.Info("Chat completion request received",
-		zap.String("model", req.Model),
-		zap.Int("messages", len(req.Messages)),
-		zap.Bool("stream", req.Stream),
-	)
+	path := string(ctx.Path())
+
+	defer func() {
+		statusCode := ctx.Response.StatusCode()
+		if statusCode == 0 {
+			statusCode = 200
+		}
+		h.logHTTPResponse(statusCode, path)
+	}()
 
 	// Convert to SGLang format
 	messages := make([]sglang.ChatMessage, len(req.Messages))
@@ -70,7 +73,7 @@ func (h *ChatHandler) HandleChatCompletion(ctx *fasthttp.RequestCtx) {
 
 		messages[i] = sglang.ChatMessage{
 			Role:    role,
-			Content: contentStr, // Always use string, never null
+			Content: contentStr,
 		}
 	}
 
@@ -88,18 +91,12 @@ func (h *ChatHandler) HandleChatCompletion(ctx *fasthttp.RequestCtx) {
 		topP := float32(*req.TopP)
 		sglReq.TopP = &topP
 	}
-	// CRITICAL: Support both max_tokens and max_completion_tokens
-	// OpenAI API uses max_tokens, but bench_serving.py uses max_completion_tokens
 	if req.MaxCompletionTokens != nil {
 		sglReq.MaxCompletionTokens = req.MaxCompletionTokens
 	} else if req.MaxTokens != nil {
 		sglReq.MaxCompletionTokens = req.MaxTokens
 	}
 
-	// Create context without timeout for streaming requests
-	// Note: fasthttp doesn't use standard context.Context, but we create one for the SGLang client
-	// Streaming requests should not have a timeout as they can run for a long time
-	// The context will be cancelled when the client disconnects or the handler returns
 	requestCtx := context.Background()
 
 	if req.Stream {
@@ -121,43 +118,54 @@ func isBrokenPipeError(err error) bool {
 		strings.Contains(errStr, "write: connection closed")
 }
 
-func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, requestCtx context.Context, req sglang.ChatCompletionRequest) {
-	h.logger.Info("Streaming chat completion started", zap.String("model", req.Model))
+// logHTTPResponse logs HTTP response with colored output
+func (h *ChatHandler) logHTTPResponse(statusCode int, path string) {
+	var statusText string
+	var colorCode string
 
-	// Setup SSE headers
+	switch {
+	case statusCode >= 200 && statusCode < 300:
+		colorCode = "\033[32m" // Green
+		statusText = "OK"
+	case statusCode >= 300 && statusCode < 400:
+		colorCode = "\033[33m" // Yellow
+		statusText = "Redirect"
+	case statusCode >= 400 && statusCode < 500:
+		colorCode = "\033[33m" // Yellow
+		statusText = "Client Error"
+	case statusCode >= 500:
+		colorCode = "\033[31m" // Red
+		statusText = "Server Error"
+	default:
+		colorCode = "\033[37m" // White
+		statusText = "Unknown"
+	}
+
+	resetCode := "\033[0m"
+	msg := fmt.Sprintf("%s[%d %s]%s %s", colorCode, statusCode, statusText, resetCode, path)
+	h.logger.Info(msg)
+}
+
+func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, requestCtx context.Context, req sglang.ChatCompletionRequest) {
+
 	ctx.SetContentType("text/event-stream")
 	ctx.Response.Header.Set("Cache-Control", "no-cache")
 	ctx.Response.Header.Set("Connection", "keep-alive")
-	ctx.Response.Header.Set("X-Accel-Buffering", "no") // Disable nginx buffering
-
-	// Set status code
+	ctx.Response.Header.Set("X-Accel-Buffering", "no")
 	ctx.SetStatusCode(200)
 
-	// CRITICAL: Use SetBodyStreamWriter for true streaming
-	// This is the recommended way to implement streaming in fasthttp
-	// The callback runs after handler returns, so we need to:
-	// 1. Create stream INSIDE the callback to avoid premature cancellation
-	// 2. Use independent context (streamCtx) for stream operations
-	// 3. Check requestCtx.Done() to detect client disconnection
-
-	// Track metrics
-	var chunkCount int
 	var clientDisconnected bool
 
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-		// CRITICAL: Create independent context for stream operations INSIDE callback
-		// This ensures the context is not cancelled when handler returns
 		streamCtx, cancel := context.WithCancel(context.Background())
-		defer cancel() // Clean up context when callback finishes
+		defer cancel()
 
-		// Create stream INSIDE callback to avoid premature cancellation
 		stream, err := h.service.Client().CreateChatCompletionStream(streamCtx, req)
 		if err != nil {
 			h.logger.Error("Failed to create chat completion stream",
 				zap.Error(err),
 				zap.String("model", req.Model),
 			)
-			// Write error response
 			w.WriteString("data: {\"error\":{\"message\":\"Failed to create stream\"}}\n\n")
 			if flushErr := w.Flush(); flushErr != nil {
 				h.logger.Warn("Failed to flush error response", zap.Error(flushErr))
@@ -170,75 +178,58 @@ func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, reques
 			}
 		}()
 
-		defer func() {
-			if clientDisconnected {
-				h.logger.Info("Streaming chat completion interrupted",
-					zap.Int("chunks", chunkCount),
-				)
-			} else {
-				h.logger.Info("Streaming chat completion completed",
-					zap.Int("chunks", chunkCount),
-				)
-			}
-		}()
-
 		for {
-			// Check if stream context is cancelled (client disconnected or error)
+			if clientDisconnected {
+				cancel()
+				return
+			}
+
+			var chunkJSON string
+			var err error
+
+			recvDone := make(chan struct{})
+			go func() {
+				defer close(recvDone)
+				chunkJSON, err = stream.RecvJSON()
+			}()
+
 			select {
 			case <-streamCtx.Done():
 				return
-			default:
-			}
-
-			// OPTIMIZATION: Use RecvJSON() to get raw JSON string directly from Rust FFI
-			// This avoids JSON parsing and re-serialization overhead, matching Rust performance
-			// Rust FFI already returns complete OpenAI-format JSON, we just need to add SSE prefix/suffix
-			chunkJSON, err := stream.RecvJSON()
-
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				h.logger.Error("Stream error",
-					zap.Error(err),
-					zap.Int("chunks_sent", chunkCount),
-				)
-				break
-			}
-			if chunkJSON == "" {
-				continue
-			}
-			chunkCount++
-
-			// OPTIMIZATION: Directly use Rust FFI JSON string - no parsing/serialization needed!
-			// Just add SSE prefix and suffix
-			w.WriteString("data: ")
-			w.WriteString(chunkJSON)
-			w.WriteString("\n\n")
-
-			// CRITICAL: Flush immediately after each chunk
-			// This ensures data is sent immediately, reducing TTFT
-			// If flush fails, cancel streamCtx to stop readLoop
-			if err := w.Flush(); err != nil {
-				if isBrokenPipeError(err) {
-					// Client disconnected - silently handle (normal case)
-					clientDisconnected = true
-					cancel() // Cancel streamCtx to stop readLoop
+			case <-recvDone:
+				if err == io.EOF {
+					if !clientDisconnected {
+						w.WriteString("data: [DONE]\n\n")
+						if flushErr := w.Flush(); flushErr != nil {
+							if !isBrokenPipeError(flushErr) {
+								h.logger.Warn("Final flush error", zap.Error(flushErr))
+							}
+						}
+					}
 					return
 				}
-				// Only log non-disconnection errors (should be rare)
-				h.logger.Warn("Flush error", zap.Error(err))
-			}
-		}
+				if err != nil {
+					if err == context.Canceled || err == context.DeadlineExceeded {
+						return
+					}
+					h.logger.Error("Stream error", zap.Error(err))
+					return
+				}
+				if chunkJSON == "" {
+					continue
+				}
 
-		// Send done message
-		if !clientDisconnected {
-			w.WriteString("data: [DONE]\n\n")
-			if err := w.Flush(); err != nil {
-				// Silently ignore client disconnection errors
-				if !isBrokenPipeError(err) {
-					// Only log non-disconnection errors (should be rare)
-					h.logger.Warn("Final flush error", zap.Error(err))
+				w.WriteString("data: ")
+				w.WriteString(chunkJSON)
+				w.WriteString("\n\n")
+
+				if err := w.Flush(); err != nil {
+					if isBrokenPipeError(err) {
+						clientDisconnected = true
+						cancel()
+						return
+					}
+					h.logger.Warn("Flush error", zap.Error(err))
 				}
 			}
 		}
@@ -246,7 +237,6 @@ func (h *ChatHandler) handleStreamingCompletion(ctx *fasthttp.RequestCtx, reques
 }
 
 func (h *ChatHandler) handleNonStreamingCompletion(ctx *fasthttp.RequestCtx, requestCtx context.Context, req sglang.ChatCompletionRequest) {
-	startTime := time.Now()
 	resp, err := h.service.Client().CreateChatCompletion(requestCtx, req)
 	if err != nil {
 		h.logger.Error("Failed to create chat completion",
@@ -256,13 +246,6 @@ func (h *ChatHandler) handleNonStreamingCompletion(ctx *fasthttp.RequestCtx, req
 		utils.RespondError(ctx, 500, fmt.Sprintf("Failed to create completion: %v", err), "server_error")
 		return
 	}
-
-	duration := time.Since(startTime)
-	h.logger.Info("Chat completion completed",
-		zap.String("model", req.Model),
-		zap.Duration("duration", duration),
-		zap.Int("choices", len(resp.Choices)),
-	)
 
 	// Convert to OpenAI format
 	response := utils.BuildResponseBase(resp.ID, resp.Created, resp.Model)

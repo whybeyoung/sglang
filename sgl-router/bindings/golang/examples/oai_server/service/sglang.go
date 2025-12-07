@@ -1,8 +1,6 @@
 package service
 
 import (
-	"os"
-
 	sglang "github.com/sglang/sglang-go-grpc-sdk"
 )
 
@@ -11,15 +9,10 @@ type SGLangService struct {
 	client *sglang.Client
 }
 
-// NewSGLangService creates a new SGLang service
 func NewSGLangService(endpoint, tokenizerPath string) (*SGLangService, error) {
-	// Check if gRPC client mode is enabled via environment variable
-	useGrpcClient := os.Getenv("USE_GRPC_CLIENT") == "true"
-
 	client, err := sglang.NewClient(sglang.ClientConfig{
 		Endpoint:      endpoint,
 		TokenizerPath: tokenizerPath,
-		UseGrpcClient: useGrpcClient, // Enable optimized gRPC client if requested
 	})
 	if err != nil {
 		return nil, err

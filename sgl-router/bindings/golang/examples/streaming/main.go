@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -73,12 +74,17 @@ func main() {
 	firstTokenReceived := false
 
 	for {
-		chunk, err := stream.Recv()
+		chunkJSON, err := stream.RecvJSON()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			log.Fatalf("Stream error: %v", err)
+		}
+
+		var chunk sglang.ChatCompletionStreamResponse
+		if err := json.Unmarshal([]byte(chunkJSON), &chunk); err != nil {
+			log.Fatalf("Failed to parse chunk: %v", err)
 		}
 
 		chunkCount++

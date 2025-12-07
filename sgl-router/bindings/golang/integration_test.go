@@ -11,6 +11,7 @@ package sglang
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"testing"
@@ -116,13 +117,18 @@ func TestIntegrationStreamingCompletion(t *testing.T) {
 	totalContent := ""
 
 	for {
-		chunk, err := stream.Recv()
+		chunkJSON, err := stream.RecvJSON()
 		if err == io.EOF {
 			// io.EOF is expected at end of stream
 			break
 		}
 		if err != nil {
 			t.Fatalf("Stream error: %v", err)
+		}
+
+		var chunk ChatCompletionStreamResponse
+		if err := json.Unmarshal([]byte(chunkJSON), &chunk); err != nil {
+			t.Fatalf("Failed to parse chunk: %v", err)
 		}
 
 		chunkCount++
