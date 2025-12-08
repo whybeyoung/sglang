@@ -290,8 +290,12 @@ type GrpcChatCompletionStream struct {
 func (s *GrpcChatCompletionStream) readLoop() {
 	defer func() {
 		atomic.StoreInt32(&s.closed, 1)
+		if s.cancel != nil {
+			s.cancel()
+		}
 		s.processWg.Wait()
 		close(s.resultJSONChan)
+		close(s.errChan)
 		close(s.readLoopDone)
 	}()
 
@@ -300,6 +304,13 @@ func (s *GrpcChatCompletionStream) readLoop() {
 	go func() {
 		defer close(recvChan)
 		for {
+			select {
+			case <-s.ctx.Done():
+				_ = s.stream.CloseSend()
+				return
+			default:
+			}
+
 			protoResp, err := s.stream.Recv()
 			if err != nil {
 				select {
@@ -366,8 +377,10 @@ func (s *GrpcChatCompletionStream) readLoop() {
 }
 
 func (s *GrpcChatCompletionStream) processAndSendResponse(protoResp *proto.GenerateResponse) {
-	if atomic.LoadInt32(&s.closed) == 1 {
+	select {
+	case <-s.ctx.Done():
 		return
+	default:
 	}
 
 	if protoResp == nil {
@@ -434,11 +447,11 @@ func (s *GrpcChatCompletionStream) Close() error {
 		return nil
 	}
 
-	_ = s.stream.CloseSend()
-
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	_ = s.stream.CloseSend()
 
 	select {
 	case <-s.readLoopDone:
