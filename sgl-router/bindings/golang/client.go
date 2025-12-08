@@ -90,7 +90,7 @@ func defaultChannelBufferSizes() ChannelBufferSizes {
 // defaultTimeouts returns default timeout values.
 func defaultTimeouts() Timeouts {
 	return Timeouts{
-		KeepaliveTime:    120 * time.Second,
+		KeepaliveTime:    300 * time.Second, // Increased to reduce ping frequency and avoid "too many pings" errors
 		KeepaliveTimeout: 20 * time.Second,
 		CloseTimeout:     5 * time.Second,
 	}

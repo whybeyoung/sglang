@@ -290,9 +290,6 @@ type GrpcChatCompletionStream struct {
 func (s *GrpcChatCompletionStream) readLoop() {
 	defer func() {
 		atomic.StoreInt32(&s.closed, 1)
-		if s.cancel != nil {
-			s.cancel()
-		}
 		s.processWg.Wait()
 		close(s.resultJSONChan)
 		close(s.readLoopDone)
@@ -303,17 +300,6 @@ func (s *GrpcChatCompletionStream) readLoop() {
 	go func() {
 		defer close(recvChan)
 		for {
-			if atomic.LoadInt32(&s.closed) == 1 {
-				return
-			}
-
-			select {
-			case <-s.ctx.Done():
-				_ = s.stream.CloseSend()
-				return
-			default:
-			}
-
 			protoResp, err := s.stream.Recv()
 			if err != nil {
 				select {
@@ -390,46 +376,31 @@ func (s *GrpcChatCompletionStream) processAndSendResponse(protoResp *proto.Gener
 
 	protoJSON, err := protoToJSON(protoResp)
 	if err != nil {
-		if atomic.LoadInt32(&s.closed) == 1 {
-			return
-		}
 		select {
 		case s.errChan <- fmt.Errorf("failed to convert proto to JSON: %w", err):
 		case <-s.ctx.Done():
-		default:
 		}
 		return
 	}
 
 	if s.batchPostprocessor == nil {
-		if atomic.LoadInt32(&s.closed) == 1 {
-			return
-		}
 		select {
 		case s.errChan <- fmt.Errorf("batch postprocessor is nil"):
 		case <-s.ctx.Done():
-		default:
 		}
 		return
 	}
 
 	results, _, err := s.batchPostprocessor.AddChunk(protoJSON)
 	if err != nil {
-		if atomic.LoadInt32(&s.closed) == 1 {
-			return
-		}
 		select {
 		case s.errChan <- fmt.Errorf("batch postprocessing failed: %w", err):
 		case <-s.ctx.Done():
-		default:
 		}
 		return
 	}
 
 	for _, resultJSON := range results {
-		if atomic.LoadInt32(&s.closed) == 1 {
-			return
-		}
 		select {
 		case s.resultJSONChan <- resultJSON:
 		case <-s.ctx.Done():
@@ -463,11 +434,11 @@ func (s *GrpcChatCompletionStream) Close() error {
 		return nil
 	}
 
+	_ = s.stream.CloseSend()
+
 	if s.cancel != nil {
 		s.cancel()
 	}
-
-	_ = s.stream.CloseSend()
 
 	select {
 	case <-s.readLoopDone:
