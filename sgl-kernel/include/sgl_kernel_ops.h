@@ -117,6 +117,62 @@ void cutlass_mla_decode(
     torch::Tensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+// Masked MHA kernel functions
+void prepare_mask_masked_mha(
+    torch::Tensor& coarse_mask,
+    torch::Tensor& fine_mask,
+    const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& cu_seqlens_k,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& page_table,
+    const torch::Tensor& page_table_lens,
+    int64_t batch_size,
+    int64_t max_seq_q,
+    int64_t max_seq_k,
+    int64_t page_size,
+    int64_t tile_size);
+
+void masked_mha_attn(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& v,
+    torch::Tensor& out,
+    const torch::Tensor& coarse_mask,
+    const torch::Tensor& fine_mask,
+    const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& cu_seqlens_k,
+    const torch::Tensor& page_table,
+    const torch::Tensor& page_table_lens,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    int64_t v_head_dim,
+    int64_t max_seq_q,
+    int64_t max_seq_k,
+    double sm_scale);
+
+// TMA-based implementation (internal)
+void masked_mha_attn_tma_impl(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& v,
+    torch::Tensor& out,
+    const torch::Tensor& coarse_mask,
+    const torch::Tensor& fine_mask,
+    const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& cu_seqlens_k,
+    const torch::Tensor& page_table,
+    const torch::Tensor& page_table_lens,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    int64_t v_head_dim,
+    int64_t max_seq_q,
+    int64_t max_seq_k,
+    double sm_scale);
+
 int64_t cutlass_mla_get_workspace_size(
     int64_t max_seq_len,
     int64_t num_batches,

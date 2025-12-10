@@ -18,6 +18,41 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
+// Forward declarations for masked MHA functions
+void prepare_mask_masked_mha(
+    torch::Tensor& coarse_mask,
+    torch::Tensor& fine_mask,
+    const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& cu_seqlens_k,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& page_table,
+    const torch::Tensor& page_table_lens,
+    int64_t batch_size,
+    int64_t max_seq_q,
+    int64_t max_seq_k,
+    int64_t page_size,
+    int64_t tile_size);
+
+void masked_mha_attn(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& v,
+    torch::Tensor& out,
+    const torch::Tensor& coarse_mask,
+    const torch::Tensor& fine_mask,
+    const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& cu_seqlens_k,
+    const torch::Tensor& page_table,
+    const torch::Tensor& page_table_lens,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    int64_t v_head_dim,
+    int64_t max_seq_q,
+    int64_t max_seq_k,
+    double sm_scale);
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/allreduce
@@ -59,6 +94,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
+
+  /*
+   * From csrc/attention - Masked MHA
+   */
+  m.def(
+      "prepare_mask_masked_mha(Tensor! coarse_mask, Tensor! fine_mask, "
+      "Tensor cu_seqlens_q, Tensor cu_seqlens_k, Tensor seq_lens, "
+      "Tensor page_table, Tensor page_table_lens, "
+      "int batch_size, int max_seq_q, int max_seq_k, int page_size, int tile_size) -> ()");
+  m.impl("prepare_mask_masked_mha", torch::kCUDA, &prepare_mask_masked_mha);
+
+  m.def(
+      "masked_mha_attn(Tensor! q, Tensor! k, Tensor! v, Tensor! out, "
+      "Tensor coarse_mask, Tensor fine_mask, "
+      "Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
+      "Tensor page_table, Tensor page_table_lens, "
+      "int batch_size, int num_heads, int num_kv_heads, "
+      "int head_dim, int v_head_dim, int max_seq_q, int max_seq_k, float sm_scale) -> ()");
+  m.impl("masked_mha_attn", torch::kCUDA, &masked_mha_attn);
 
   /*
    * From csrc/elementwise

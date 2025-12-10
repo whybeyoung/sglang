@@ -907,6 +907,23 @@ class NativeSparseAttnBackend(AttentionBackend):
                 metadata=metadata,
             )
 
+        # Use masked MHA kernel for sequences > 2048
+        if getattr(self, 'use_masked_mha', False):
+            assert k is not None and v is not None
+            assert q_rope is None, "Masked MHA path should not pass q_rope"
+            assert (
+                layer.tp_k_head_num == layer.tp_q_head_num > 1
+            ), "Masked MHA requires dense multi-head config"
+            from sglang.srt.layers.attention.nsa_backend_masked_mha import _forward_masked_mha
+            return _forward_masked_mha(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+            )
+
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1432,7 +1449,10 @@ class NativeSparseAttnBackend(AttentionBackend):
         """
         from sglang.srt.utils import get_device_sm, is_blackwell
 
-        # Decide MHA vs MLA
+        # Initialize masked MHA flag
+        self.use_masked_mha = False
+
+        # Decide MHA vs Masked MHA vs MLA
         if forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
@@ -1440,22 +1460,52 @@ class NativeSparseAttnBackend(AttentionBackend):
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # Check if we can use masked MHA for sequences > 2048
+            try:
+                from sgl_kernel.masked_mha import prepare_mask
+                masked_mha_available = True
+            except ImportError:
+                masked_mha_available = False
+
+            # Requirements for standard MHA: H200/B200, short sequences (<= 2048), supported dtype, fits in chunk
             self.use_mha = (
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
-                and max_kv_len <= self.nsa_index_topk  # Short enough for MHA
+                and max_kv_len <= self.nsa_index_topk  # Short enough for MHA (<= 2048)
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_nsa_enable_prefill_cp())  # CP not enabled
             )
+
+            # Check if we should use masked MHA for sequences > 2048
+            # Note: Currently uses Flash Attention 3 fallback until full TMA kernel is implemented
+            # When enabled, this will allow sequences > 2048 to use MHA path
+            # Flash Attention 3 works but doesn't optimally apply fine-grained masks
+            if not self.use_mha and masked_mha_available:
+                # Use masked MHA if:
+                # 1. Sequence length > 2048 (requires masking)
+                # 2. Masked MHA kernel is available
+                # 3. Device supports it (Hopper/H200 or Blackwell/B200)
+                # 4. Supported dtype
+                self.use_masked_mha = (
+                    max_kv_len > self.nsa_index_topk  # > 2048, requires masking
+                    and (device_sm == 90 or (device_sm >= 100 and device_sm < 110))  # SM90/SM100
+                    and forward_batch.token_to_kv_pool.dtype
+                    in [torch.bfloat16, torch.float8_e4m3fn]
+                    and sum_seq_lens
+                    <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
+                    and (not is_nsa_enable_prefill_cp())  # CP not enabled
+                )
+            else:
+                self.use_masked_mha = False
         else:
             self.use_mha = False  # Decode/verify always use MLA
+            self.use_masked_mha = False
 
-        # Set MLA implementation only if not using MHA
+        # Set MLA implementation only if not using MHA or masked MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.nsa_kv_cache_store_fp8:
                 if (

@@ -269,6 +269,8 @@ set(SOURCES
     "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
+    "csrc/attention/masked_mha_kernel.cu"
+    "csrc/attention/masked_mha_kernel_tma.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
