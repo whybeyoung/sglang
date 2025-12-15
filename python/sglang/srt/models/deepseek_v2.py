@@ -2025,12 +2025,28 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         topk_indices = None
         if q_lora is not None:
+            # Debug: log shapes before indexer call
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"[Indexer Debug] Before indexer call: "
+                f"hidden_states.shape={hidden_states.shape}, "
+                f"positions.shape={positions.shape}, "
+                f"out_cache_loc.shape={forward_batch.out_cache_loc.shape}, "
+                f"seq_lens_cpu={forward_batch.seq_lens_cpu}, "
+                f"enable_prefill_cp={enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)}, "
+                f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}"
+            )
             topk_indices = self.indexer(
                 x=hidden_states,
                 q_lora=q_lora,
                 positions=positions,
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
+            )
+            logger.debug(
+                f"[Indexer Debug] After indexer call: "
+                f"topk_indices={'set' if topk_indices is not None else 'None'}"
             )
 
         return (
@@ -3463,18 +3479,29 @@ class DeepseekV2ForCausalLM(nn.Module):
                         f"cp_rank={self.cp_rank}, cp_size={self.cp_size}"
                     )
                 else:
-                    logger.warning(
-                        f"[CP Debug] Rank {self.cp_rank}: can_cp_split returned False! "
-                        f"This may cause allgather deadlock if other ranks have CP enabled."
+                    # Log detailed reason why can_cp_split returned False
+                    # This is normal when sequence is too short (cur_cp_seq_len == 0)
+                    # CP will be disabled for this batch, which is fine
+                    logger.debug(
+                        f"[CP Debug] Rank {self.cp_rank} (PP0): can_cp_split returned False "
+                        f"(CP disabled for this batch, likely sequence too short). "
+                        f"cur_cp_seq_len={cur_cp_seq_len}, cp_size={self.cp_size}, "
+                        f"use_nsa={self.use_nsa}, is_context_parallel_extend={is_context_parallel_extend}, "
+                        f"is_nsa_enable_prefill_cp={is_cp_enabled}, forward_mode={forward_batch.forward_mode}, "
+                        f"seq_len={len(input_ids)}, segment_num={segment_num}. "
+                        f"CP-related code will be skipped (this is normal)."
                     )
             else:
                 # PP1: metadata should have been set by PP0, but it's missing
-                # This should not happen if forward_batch is correctly passed between PP stages
+                # This can happen if PP0's can_cp_split returned False (e.g., sequence too short)
+                # In this case, CP is not enabled for this batch, which is fine
+                # enable_prefill_cp will return False, so CP-related code won't execute
                 import logging
                 logger = logging.getLogger(__name__)
-                logger.warning(
+                logger.debug(
                     f"[CP Debug] Rank {self.cp_rank} (PP stage {pp_group.rank_in_group}): "
-                    f"nsa_cp_metadata is None! This may cause CP allgather deadlock. "
+                    f"nsa_cp_metadata is None (CP not enabled for this batch, likely sequence too short). "
+                    f"This is normal and CP-related code will be skipped. "
                     f"forward_mode={forward_batch.forward_mode}, "
                     f"seq_lens_cpu={forward_batch.seq_lens_cpu}"
                 )

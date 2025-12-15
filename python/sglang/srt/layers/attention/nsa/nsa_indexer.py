@@ -548,6 +548,20 @@ class Indexer(CustomOp):
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+        
+        # Debug: log shapes before set_index_k_scale_buffer (MHA path)
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(
+            f"[Indexer Debug MHA] Before set_index_k_scale_buffer: "
+            f"loc.shape={forward_batch.out_cache_loc.shape}, "
+            f"index_k.shape={k_fp8.shape}, "
+            f"index_k_scale.shape={k_scale.shape}, "
+            f"x.shape={x.shape}, "
+            f"seq_lens_cpu={forward_batch.seq_lens_cpu}, "
+            f"enable_prefill_cp={forward_batch.nsa_cp_metadata is not None if hasattr(forward_batch, 'nsa_cp_metadata') else False}"
+        )
+        
         forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
@@ -876,6 +890,20 @@ class Indexer(CustomOp):
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+        
+        # Debug: log shapes before set_index_k_scale_buffer
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(
+            f"[Indexer Debug] Before set_index_k_scale_buffer: "
+            f"loc.shape={forward_batch.out_cache_loc.shape}, "
+            f"index_k.shape={k_fp8.shape}, "
+            f"index_k_scale.shape={k_scale.shape}, "
+            f"x.shape={x.shape}, "
+            f"seq_lens_cpu={forward_batch.seq_lens_cpu}, "
+            f"enable_prefill_cp={forward_batch.nsa_cp_metadata is not None if hasattr(forward_batch, 'nsa_cp_metadata') else False}"
+        )
+        
         forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,

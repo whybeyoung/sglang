@@ -349,7 +349,24 @@ def _set_k_and_s_triton(
         )
 
     assert buf_numel_per_page == 64 * (128 + 4)
-    assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
+    
+    # Debug: log shapes before assertion
+    if num_tokens_to_write != num_tokens_to_write_ or num_tokens_to_write != num_tokens_to_write__:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(
+            f"[Indexer Shape Mismatch] Shape mismatch detected! "
+            f"loc.shape={loc.shape} (num_tokens_to_write={num_tokens_to_write}), "
+            f"index_k.shape={index_k.shape} (num_tokens_to_write_={num_tokens_to_write_}), "
+            f"index_k_scale.shape={index_k_scale.shape} (num_tokens_to_write__={num_tokens_to_write__}), "
+            f"index_head_dim={index_head_dim}, scale_dim={scale_dim}"
+        )
+    
+    assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__, (
+        f"Shape mismatch: loc.shape={loc.shape} (num_tokens_to_write={num_tokens_to_write}), "
+        f"index_k.shape={index_k.shape} (num_tokens_to_write_={num_tokens_to_write_}), "
+        f"index_k_scale.shape={index_k_scale.shape} (num_tokens_to_write__={num_tokens_to_write__})"
+    )
     assert index_head_dim == 128
     assert scale_dim == 1
     assert page_size == 64
