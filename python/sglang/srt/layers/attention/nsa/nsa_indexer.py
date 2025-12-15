@@ -228,12 +228,22 @@ class Indexer(CustomOp):
         key[..., : self.rope_head_dim] = k_rope
 
         # allgather+rerrange
-        if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
+        # Use enable_prefill_cp to check if CP is actually enabled for this batch
+        # This ensures we only allgather when forward_mode is context_parallel_extend
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp, cp_all_gather_rerange_output
+        key_before_allgather_shape = key.shape
+        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             key = cp_all_gather_rerange_output(
                 key.contiguous(),
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
+            )
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"[Indexer CP Allgather] _get_q_k_bf16: key shape before={key_before_allgather_shape}, "
+                f"after={key.shape}, forward_mode={forward_batch.forward_mode}"
             )
 
         if enable_dual_stream:
@@ -268,12 +278,10 @@ class Indexer(CustomOp):
         key[..., : self.rope_head_dim] = k_rope
         
         # CP mode: allgather key (same as in _get_q_k_bf16)
+        # Use enable_prefill_cp to check if CP is actually enabled for this batch
         if forward_batch is not None:
-            if (
-                forward_batch.nsa_cp_metadata is not None
-                and self.nsa_enable_prefill_cp
-            ):
-                from sglang.srt.layers.attention.nsa.utils import cp_all_gather_rerange_output
+            from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp, cp_all_gather_rerange_output
+            if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
                 key = cp_all_gather_rerange_output(
                     key.contiguous(),
                     self.cp_size,
@@ -568,6 +576,7 @@ class Indexer(CustomOp):
         # Debug: log shapes before set_index_k_scale_buffer (MHA path)
         import logging
         logger = logging.getLogger(__name__)
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
         logger.debug(
             f"[Indexer Debug MHA] Before set_index_k_scale_buffer: "
             f"loc.shape={forward_batch.out_cache_loc.shape}, "
@@ -575,7 +584,9 @@ class Indexer(CustomOp):
             f"index_k_scale.shape={k_scale.shape}, "
             f"x.shape={x.shape}, "
             f"seq_lens_cpu={forward_batch.seq_lens_cpu}, "
-            f"enable_prefill_cp={forward_batch.nsa_cp_metadata is not None if hasattr(forward_batch, 'nsa_cp_metadata') else False}"
+            f"enable_prefill_cp={enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)}, "
+            f"forward_mode={forward_batch.forward_mode}, "
+            f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}"
         )
         
         # CP mode: adjust out_cache_loc to match allgathered key shape
@@ -583,10 +594,10 @@ class Indexer(CustomOp):
         # So in CP mode, key shape is full sequence length after allgather
         # But out_cache_loc might be based on CP split sequence length
         # We need to adjust out_cache_loc to match the allgathered key shape
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
         loc_to_use = forward_batch.out_cache_loc
         if (
-            forward_batch.nsa_cp_metadata is not None
-            and self.nsa_enable_prefill_cp
+            enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
             and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
             # Key has been allgathered, so it has full sequence length
@@ -936,6 +947,7 @@ class Indexer(CustomOp):
         # Debug: log shapes before set_index_k_scale_buffer
         import logging
         logger = logging.getLogger(__name__)
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
         logger.debug(
             f"[Indexer Debug] Before set_index_k_scale_buffer: "
             f"loc.shape={forward_batch.out_cache_loc.shape}, "
@@ -943,17 +955,19 @@ class Indexer(CustomOp):
             f"index_k_scale.shape={k_scale.shape}, "
             f"x.shape={x.shape}, "
             f"seq_lens_cpu={forward_batch.seq_lens_cpu}, "
-            f"enable_prefill_cp={forward_batch.nsa_cp_metadata is not None if hasattr(forward_batch, 'nsa_cp_metadata') else False}"
+            f"enable_prefill_cp={enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)}, "
+            f"forward_mode={forward_batch.forward_mode}, "
+            f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}"
         )
         
         # CP mode: adjust out_cache_loc to match allgathered key shape
         # In CP mode, key is allgathered in _get_q_k_bf16, so it has full sequence length
         # But out_cache_loc is based on original sequence length before CP split
         # We need to adjust out_cache_loc to match the allgathered key shape
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
         loc_to_use = forward_batch.out_cache_loc
         if (
-            forward_batch.nsa_cp_metadata is not None
-            and self.nsa_enable_prefill_cp
+            enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
             and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
             # Key has been allgathered, so it has full sequence length
@@ -1137,11 +1151,9 @@ class Indexer(CustomOp):
         )  # [bs, 1, d]
         k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
 
-        if (
-            is_prefill
-            and self.nsa_enable_prefill_cp
-            and forward_batch.nsa_cp_metadata is not None
-        ):
+        # Use enable_prefill_cp to check if CP is actually enabled for this batch
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
+        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             k = cp_all_gather_rerange_output(
                 k.contiguous().view(-1, self.head_dim),
                 self.cp_size,
@@ -1152,9 +1164,7 @@ class Indexer(CustomOp):
         # CP mode: adjust out_cache_loc to match allgathered key shape (NPU path)
         loc_to_use = forward_batch.out_cache_loc
         if (
-            is_prefill
-            and self.nsa_enable_prefill_cp
-            and forward_batch.nsa_cp_metadata is not None
+            enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
             and k.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
             # Key has been allgathered, so it has full sequence length
