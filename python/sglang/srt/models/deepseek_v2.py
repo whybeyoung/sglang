@@ -2939,6 +2939,37 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
+        # CP mode: If CP is disabled for this batch (e.g., decode/idle mode) but hidden_states
+        # is still split (from previous PP stage), we need to allgather it before MoE layer.
+        # DeepEP MoE expects full sequence, not split sequence.
+        # Check if hidden_states shape suggests it's split (shape[0] < total_seq_lens)
+        if (
+            forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
+            and not enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+        ):
+            # CP metadata exists but CP is disabled (e.g., decode/idle mode)
+            # Check if hidden_states is actually split by comparing shape with total_seq_lens
+            total_seq_len = forward_batch.nsa_cp_metadata.total_seq_lens
+            if isinstance(total_seq_len, torch.Tensor):
+                total_seq_len = total_seq_len.item() if total_seq_len.numel() == 1 else total_seq_len[0].item()
+            
+            if hidden_states.shape[0] < total_seq_len:
+                # hidden_states is split, need to allgather before MoE layer
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(
+                    f"[CP Debug] Rank {self.cp_rank}: CP disabled but hidden_states is split "
+                    f"(shape={hidden_states.shape[0]}, expected={total_seq_len}). "
+                    f"Allgathering before MoE layer. forward_mode={forward_batch.forward_mode}"
+                )
+                hidden_states = cp_all_gather_rerange_output(
+                    hidden_states,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
