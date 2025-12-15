@@ -255,6 +255,7 @@ class Indexer(CustomOp):
         x: torch.Tensor,
         positions: torch.Tensor,
         enable_dual_stream: bool,
+        forward_batch: ForwardBatch = None,
     ):
         # Compute only key, skip query
         key, _ = self.wk(x)
@@ -265,6 +266,21 @@ class Indexer(CustomOp):
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         key[..., : self.rope_head_dim] = k_rope
+        
+        # CP mode: allgather key (same as in _get_q_k_bf16)
+        if forward_batch is not None:
+            if (
+                forward_batch.nsa_cp_metadata is not None
+                and self.nsa_enable_prefill_cp
+            ):
+                from sglang.srt.layers.attention.nsa.utils import cp_all_gather_rerange_output
+                key = cp_all_gather_rerange_output(
+                    key.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+        
         key = rotate_activation(key)
 
         return key
@@ -543,7 +559,7 @@ class Indexer(CustomOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         # Fast path: only compute and store k cache, skip all q and weights ops
-        key = self._get_k_bf16(x, positions, enable_dual_stream)
+        key = self._get_k_bf16(x, positions, enable_dual_stream, forward_batch=forward_batch)
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not forward_batch.out_cache_loc.is_contiguous():
@@ -562,9 +578,31 @@ class Indexer(CustomOp):
             f"enable_prefill_cp={forward_batch.nsa_cp_metadata is not None if hasattr(forward_batch, 'nsa_cp_metadata') else False}"
         )
         
+        # CP mode: adjust out_cache_loc to match key shape
+        # Note: _get_k_bf16 does NOT do allgather (unlike _get_q_k_bf16)
+        # So in CP mode, key shape matches x shape (CP split后的形状)
+        # But out_cache_loc might be based on original sequence length
+        loc_to_use = forward_batch.out_cache_loc
+        if (
+            forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
+            and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
+        ):
+            # Key shape matches x shape (CP split后), so use matching length
+            actual_seq_len = k_fp8.shape[0]
+            if forward_batch.out_cache_loc.shape[0] != actual_seq_len:
+                logger.warning(
+                    f"[Indexer CP Fix MHA] Adjusting out_cache_loc: "
+                    f"loc.shape={forward_batch.out_cache_loc.shape}, "
+                    f"key.shape={k_fp8.shape}, "
+                    f"actual_seq_len={actual_seq_len}. "
+                    f"Using first {actual_seq_len} elements of out_cache_loc."
+                )
+                loc_to_use = forward_batch.out_cache_loc[:actual_seq_len]
+        
         forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
+            loc=loc_to_use,
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
@@ -904,9 +942,34 @@ class Indexer(CustomOp):
             f"enable_prefill_cp={forward_batch.nsa_cp_metadata is not None if hasattr(forward_batch, 'nsa_cp_metadata') else False}"
         )
         
+        # CP mode: adjust out_cache_loc to match allgathered key shape
+        # In CP mode, key is allgathered in _get_q_k_bf16, so it has full sequence length
+        # But out_cache_loc is based on original sequence length before CP split
+        # We need to adjust out_cache_loc to match the allgathered key shape
+        loc_to_use = forward_batch.out_cache_loc
+        if (
+            forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
+            and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
+        ):
+            # Key has been allgathered, so it has full sequence length
+            # out_cache_loc should match the allgathered key shape
+            total_seq_len = k_fp8.shape[0]
+            if forward_batch.out_cache_loc.shape[0] != total_seq_len:
+                logger.warning(
+                    f"[Indexer CP Fix] Adjusting out_cache_loc: "
+                    f"loc.shape={forward_batch.out_cache_loc.shape}, "
+                    f"key.shape={k_fp8.shape}, "
+                    f"total_seq_len={total_seq_len}. "
+                    f"Using first {total_seq_len} elements of out_cache_loc."
+                )
+                # Use the first total_seq_len elements of out_cache_loc
+                # This assumes out_cache_loc contains the full sequence indices
+                loc_to_use = forward_batch.out_cache_loc[:total_seq_len]
+        
         forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
+            loc=loc_to_use,
             index_k=k_fp8,
             index_k_scale=k_scale,
         )

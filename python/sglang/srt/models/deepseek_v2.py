@@ -1009,7 +1009,7 @@ class DeepseekV2MoE(nn.Module):
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
                 else:
-                    shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1307,9 +1307,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             cp_size_config = get_cp_size_from_config()
             if cp_size_config is None:
                 # Backward compatibility: original mode (weights duplicated, CP=atten_tp_size)
-                attn_tp_rank = 0
-                attn_tp_size = 1
-                self.cp_size = get_attention_tp_size()
+            attn_tp_rank = 0
+            attn_tp_size = 1
+            self.cp_size = get_attention_tp_size()
                 self.cp_use_true_tp = False  # Original mode: weights duplicated
             else:
                 # True TP+CP mode: weights sharded, CP size from config
@@ -3048,7 +3048,7 @@ class DeepseekV2Model(nn.Module):
             cp_size_config = get_cp_size_from_config()
             if cp_size_config is None:
                 # Backward compatibility: use atten_tp_size
-                self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_tp_size()
             else:
                 self.cp_size = cp_size_config
         else:
@@ -3344,8 +3344,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             cp_size_config = get_cp_size_from_config()
             if cp_size_config is None:
                 # Backward compatibility: use atten_tp_size
-                self.cp_rank = get_attention_tp_rank()
-                self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attention_tp_size()
             else:
                 # True TP+CP mode: use CP group functions
                 self.cp_size = cp_size_config
@@ -3466,11 +3466,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                     f"[CP Debug] Rank {self.cp_rank}: can_cp_split={can_split}"
                 )
                 if can_split:
-                    forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                        torch.tensor(len(input_ids)),
-                        self.cp_rank,
-                        self.cp_size,
-                        forward_batch.seq_lens_cpu.tolist(),
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    torch.tensor(len(input_ids)),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
                         atten_tp_size=atten_tp_size if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
                         atten_tp_rank=atten_tp_rank if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
                     )
