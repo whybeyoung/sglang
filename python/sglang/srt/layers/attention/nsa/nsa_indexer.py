@@ -578,27 +578,31 @@ class Indexer(CustomOp):
             f"enable_prefill_cp={forward_batch.nsa_cp_metadata is not None if hasattr(forward_batch, 'nsa_cp_metadata') else False}"
         )
         
-        # CP mode: adjust out_cache_loc to match key shape
-        # Note: _get_k_bf16 does NOT do allgather (unlike _get_q_k_bf16)
-        # So in CP mode, key shape matches x shape (CP split后的形状)
-        # But out_cache_loc might be based on original sequence length
+        # CP mode: adjust out_cache_loc to match allgathered key shape
+        # Note: _get_k_bf16 does allgather in CP mode (same as _get_q_k_bf16)
+        # So in CP mode, key shape is full sequence length after allgather
+        # But out_cache_loc might be based on CP split sequence length
+        # We need to adjust out_cache_loc to match the allgathered key shape
         loc_to_use = forward_batch.out_cache_loc
         if (
             forward_batch.nsa_cp_metadata is not None
             and self.nsa_enable_prefill_cp
             and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
-            # Key shape matches x shape (CP split后), so use matching length
-            actual_seq_len = k_fp8.shape[0]
-            if forward_batch.out_cache_loc.shape[0] != actual_seq_len:
+            # Key has been allgathered, so it has full sequence length
+            # out_cache_loc should match the allgathered key shape
+            total_seq_len = k_fp8.shape[0]
+            if forward_batch.out_cache_loc.shape[0] != total_seq_len:
                 logger.warning(
                     f"[Indexer CP Fix MHA] Adjusting out_cache_loc: "
                     f"loc.shape={forward_batch.out_cache_loc.shape}, "
                     f"key.shape={k_fp8.shape}, "
-                    f"actual_seq_len={actual_seq_len}. "
-                    f"Using first {actual_seq_len} elements of out_cache_loc."
+                    f"total_seq_len={total_seq_len}. "
+                    f"Using first {total_seq_len} elements of out_cache_loc."
                 )
-                loc_to_use = forward_batch.out_cache_loc[:actual_seq_len]
+                # Use the first total_seq_len elements of out_cache_loc
+                # This assumes out_cache_loc contains indices for the full sequence
+                loc_to_use = forward_batch.out_cache_loc[:total_seq_len]
         
         forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
@@ -1144,9 +1148,34 @@ class Indexer(CustomOp):
                 forward_batch,
                 torch.npu.current_stream(),
             )
+        
+        # CP mode: adjust out_cache_loc to match allgathered key shape (NPU path)
+        loc_to_use = forward_batch.out_cache_loc
+        if (
+            is_prefill
+            and self.nsa_enable_prefill_cp
+            and forward_batch.nsa_cp_metadata is not None
+            and k.shape[0] != forward_batch.out_cache_loc.shape[0]
+        ):
+            # Key has been allgathered, so it has full sequence length
+            # out_cache_loc should match the allgathered key shape
+            total_seq_len = k.shape[0]
+            if forward_batch.out_cache_loc.shape[0] != total_seq_len:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"[Indexer CP Fix NPU] Adjusting out_cache_loc: "
+                    f"loc.shape={forward_batch.out_cache_loc.shape}, "
+                    f"key.shape={k.shape}, "
+                    f"total_seq_len={total_seq_len}. "
+                    f"Using first {total_seq_len} elements of out_cache_loc."
+                )
+                # Use the first total_seq_len elements of out_cache_loc
+                # This assumes out_cache_loc contains indices for the full sequence
+                loc_to_use = forward_batch.out_cache_loc[:total_seq_len]
 
         forward_batch.token_to_kv_pool.set_index_k_buffer(
-            layer_id, forward_batch.out_cache_loc, k
+            layer_id, loc_to_use, k
         )
         if is_prefill:
             if self.nsa_enable_prefill_cp and forward_batch.nsa_cp_metadata is not None:
