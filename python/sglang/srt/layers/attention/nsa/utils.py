@@ -6,8 +6,15 @@ from typing import List
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group, get_attention_tp_size
 from sglang.srt.server_args import get_global_server_args
+
+# Import CP group functions (will be used when true TP+CP mode is enabled)
+from sglang.srt.layers.attention.nsa.cp_group import (
+    get_cp_group as get_cp_comm_group,
+    get_cp_rank as get_cp_comm_rank,
+    get_cp_size as get_cp_comm_size,
+)
 from sglang.srt.utils import get_bool_env_var
 
 NSA_DUAL_STREAM = get_bool_env_var("SGLANG_NSA_DUAL_STREAM", "true")
@@ -34,6 +41,14 @@ def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
 
 def is_nsa_enable_prefill_cp():
     return get_global_server_args().enable_nsa_prefill_context_parallel
+
+
+def get_cp_size():
+    """Get CP size from server args. If not set, returns None (will use atten_tp_size)."""
+    server_args = get_global_server_args()
+    if not server_args.enable_nsa_prefill_context_parallel:
+        return None
+    return server_args.nsa_prefill_context_parallel_size
 
 
 @dataclass
@@ -102,7 +117,7 @@ def enable_prefill_cp(forward_batch, nsa_enable_prefill_cp):
 
 
 def cp_attn_tp_all_gather_reorganazied_into_tensor(
-    input_: torch.Tensor, total_len, attn_tp_size, forward_batch, stream_op
+    input_: torch.Tensor, total_len, cp_size_param, forward_batch, stream_op
 ):
     """
     Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
@@ -110,23 +125,40 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     Step 1, padding the input shape to unify the shape for allgather communication (the shape must be the same).
     Step 2, allgather communication(async).
     Step 3, removing the padding and reassembling the data according to the actual tokens.
+    
+    Args:
+        cp_size_param: CP size to use. In true TP+CP mode, this is the configured CP size.
+                      In original mode, this equals atten_tp_size.
     """
+    # Determine communication group based on CP size
+    # If cp_size_param != atten_tp_size, we're in true TP+CP mode and should use CP group
+    atten_tp_size = get_attention_tp_size()
+    if cp_size_param != atten_tp_size:
+        # True TP+CP mode: use CP group
+        cp_size = cp_size_param
+        cp_group = get_cp_comm_group()
+    else:
+        # Original mode: use atten_tp_group
+        cp_size = cp_size_param
+        cp_group = get_attention_tp_group()
+    
     # step1
-    max_len = (total_len + attn_tp_size - 1) // attn_tp_size
+    max_len = (total_len + cp_size - 1) // cp_size
     pad_size = max_len - input_.shape[0]
     if pad_size > 0:
         input_ = F.pad(input_, (0, 0, 0, pad_size), mode="constant", value=0)
     input_tensor_all = torch.empty(
-        max_len * attn_tp_size,
+        max_len * cp_size,
         input_.shape[1],
         device=input_.device,
         dtype=input_.dtype,
     )
     # step2
-    get_attention_tp_group().cp_all_gather_into_tensor_async(
+    cp_group.cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
     # step3
+    # Note: In true TP+CP mode, max_rank_len and per_rank_actual_token are based on CP size, not atten_tp_size
     outputs_list_max = list(
         torch.split(input_tensor_all, forward_batch.nsa_cp_metadata.max_rank_len, dim=0)
     )
@@ -230,6 +262,8 @@ def prepare_input_dp_with_cp_dsa(
     cp_rank,
     cp_size,
     seqs_len,
+    atten_tp_size=None,
+    atten_tp_rank=None,
 ):
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4):
@@ -240,65 +274,100 @@ def prepare_input_dp_with_cp_dsa(
         load across different DP ranks.
     4. Assign the rearranged blocks to different DP attention
         time points (dp_atten_tp0 to dp_atten_tp3).
-    +---------------------------------+
-    |        cp_split_tokens         |
-    +---------------------------------+
-    |                                 |
-    |   request_with_full_length     |
-    |             | split (cp_size * 2) |
-    |   +-------------------------+  |
-    |   | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
-    |   +-------------------------+  |
-    |             | rerange          |
-    |   +---------------------------------+
-    |   | block0 | block7 | block1 | block6 | block2 | block5 | block3 | block4 |
-    |   +---------------------------------+
-    |             |
-    |   +-------------------------+
-    |   | dp_atten_tp0: block0, block7 |
-    |   | dp_atten_tp1: block1, block6 |
-    |   | dp_atten_tp2: block2, block5 |
-    |   | dp_atten_tp3: block3, block4 |
-    |   +-------------------------+
 
-    Why zigzag rearrange?
-    - Attention calculations must follow causal attention principles.
-    - Simply slicing by rank order can lead to computational load imbalance:
-        * First rank may focus on fewer historical key-value tokens (less computation)
-        * Last rank may focus on more tokens (more computation)
-    - To mitigate uneven load, the input hissenstate needs to be sliced by cp_size*2 and rearranged.
+    In true TP+CP mode (cp_size < atten_tp_size):
+    - Sequence is split into atten_tp_size * 2 blocks
+    - Each CP group processes different blocks based on atten_tp_rank
+    - zigzag_index is calculated based on atten_tp_rank, not cp_rank
+
+    Args:
+        kv_len: Total sequence length
+        cp_rank: CP rank within CP group (0 to cp_size-1)
+        cp_size: CP size (number of ranks in CP group)
+        seqs_len: List of sequence lengths
+        atten_tp_size: Attention TP size (if None, use cp_size for backward compatibility)
+        atten_tp_rank: Attention TP rank (if None, use cp_rank for backward compatibility)
     """
     # just support batch = 1
     bs_per_cp_group = 1
     kv_len_origin = kv_len
-    # get zigzag index
-    cp_segment_num = cp_size * 2
+    
+    # Determine segment number and rank for zigzag calculation
+    # In true TP+CP mode, use atten_tp_size and atten_tp_rank
+    # In original mode (cp_size == atten_tp_size), use cp_size and cp_rank
+    if atten_tp_size is not None and atten_tp_size != cp_size:
+        # True TP+CP mode: split sequence based on atten_tp_size
+        cp_segment_num = atten_tp_size * 2
+        zigzag_rank = atten_tp_rank if atten_tp_rank is not None else cp_rank
+    else:
+        # Original mode: split sequence based on cp_size
+        cp_segment_num = cp_size * 2
+        zigzag_rank = cp_rank
     seq_per_batch = kv_len // cp_segment_num  # seq_len for each batch and segment
     split_list = seq_per_batch.repeat_interleave(cp_segment_num).int().tolist()
     remainder = kv_len % (cp_segment_num)
     if remainder > 0:
         split_list[:remainder] = [x + 1 for x in split_list[:remainder]]
 
+    # Calculate max_rank_len based on cp_size (for CP group)
+    # In true TP+CP mode, this is still based on cp_size because each CP group processes cp_size ranks
     seq_max_rank_len = (kv_len + cp_size - 1) // cp_size
     max_rank_len = seq_max_rank_len.repeat_interleave(cp_size).int().tolist()
+    
+    # Calculate zigzag_index based on zigzag_rank (atten_tp_rank in true TP+CP mode)
     zigzag_index = list(
-        range(cp_rank, cp_rank + bs_per_cp_group * cp_segment_num, cp_segment_num)
+        range(zigzag_rank, zigzag_rank + bs_per_cp_group * cp_segment_num, cp_segment_num)
     ) + list(
         range(
-            cp_segment_num - cp_rank - 1,
+            cp_segment_num - zigzag_rank - 1,
             bs_per_cp_group * cp_segment_num,
             cp_segment_num,
         )
     )
 
-    per_rank_actual_token = list(
-        split_list[i] + split_list[cp_size * 2 - i - 1] for i in range(cp_size)
-    )
-    reverse_split_len = [
-        element
-        for i in range(cp_size)
-        for element in (split_list[i], split_list[cp_size * 2 - i - 1])
-    ]
+    # Calculate per_rank_actual_token
+    # In true TP+CP mode, each CP group processes different blocks
+    # zigzag_index determines which blocks this rank processes
+    # For CP group, we need to calculate based on the blocks assigned to this CP group
+    if atten_tp_size is not None and atten_tp_size != cp_size:
+        # True TP+CP mode: calculate based on zigzag_rank's blocks
+        # zigzag_rank determines which blocks this rank processes
+        # For CP group, calculate based on cp_rank's position within the CP group's block range
+        cp_group_id = zigzag_rank // cp_size
+        cp_group_block_start = cp_group_id * cp_size
+        cp_group_block_end = cp_group_block_start + cp_size
+        # Calculate per_rank_actual_token for this CP group
+        per_rank_actual_token = [
+            split_list[cp_group_block_start + i] + split_list[cp_segment_num - (cp_group_block_start + i) - 1]
+            for i in range(cp_size)
+        ]
+    else:
+        # Original mode: calculate based on cp_rank
+        per_rank_actual_token = list(
+            split_list[i] + split_list[cp_segment_num - i - 1] for i in range(cp_size)
+        )
+    
+    # Calculate reverse_split_len
+    # This should be based on the blocks processed by this CP group
+    if atten_tp_size is not None and atten_tp_size != cp_size:
+        # True TP+CP mode: reverse_split_len for this CP group's blocks
+        cp_group_id = zigzag_rank // cp_size
+        cp_group_block_start = cp_group_id * cp_size
+        reverse_split_len = [
+            element
+            for i in range(cp_size)
+            for element in (
+                split_list[cp_group_block_start + i],
+                split_list[cp_segment_num - (cp_group_block_start + i) - 1]
+            )
+        ]
+    else:
+        # Original mode
+        reverse_split_len = [
+            element
+            for i in range(cp_size)
+            for element in (split_list[i], split_list[cp_segment_num - i - 1])
+        ]
     # get zigzag reverse index
     cp_reverse_index = []
     for batch_id in range(bs_per_cp_group):
@@ -316,10 +385,11 @@ def prepare_input_dp_with_cp_dsa(
 
     # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
     # cp_seq_index = calculate_cp_seq_idx(split_list[:], seqs_len[:])
-    kv_len_prev = prefix_sum_list[cp_rank]
-    kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
-    actual_seq_q_prev = split_list[cp_rank]
-    actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
+    # Calculate kv_len based on zigzag_rank, not cp_rank
+    kv_len_prev = prefix_sum_list[zigzag_rank]
+    kv_len_next = prefix_sum_list[cp_segment_num - zigzag_rank - 1]
+    actual_seq_q_prev = split_list[zigzag_rank]
+    actual_seq_q_next = split_list[cp_segment_num - zigzag_rank - 1]
     kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device="cuda", dtype=torch.int32)
     kv_len_next_tensor = torch.tensor(kv_len_next).to(device="cuda", dtype=torch.int32)
     actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(

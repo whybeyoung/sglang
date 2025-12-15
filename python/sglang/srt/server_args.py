@@ -571,6 +571,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    nsa_prefill_context_parallel_size: Optional[int] = None  # CP size, if None, use atten_tp_size
     enable_fused_qk_norm_rope: bool = False
 
     # Dynamic batch tokenizer
@@ -1024,18 +1025,43 @@ class ServerArgs:
                     self.enable_dp_attention = True
                     logger.warning("DP attention is enabled for DeepSeek NSA.")
                     if self.enable_nsa_prefill_context_parallel:
-                        # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
-                        self.moe_dense_tp_size = 1
-                        self.moe_a2a_backend = "deepep"
-                        self.ep_size = self.tp_size
-                        self.kv_cache_dtype = "bf16"
-                        assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
-
-                        logger.warning(
-                            f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
+                        # Set CP size: if not specified, use atten_tp_size (backward compatibility)
+                        if self.nsa_prefill_context_parallel_size is None:
+                            # Backward compatibility: use atten_tp_size
+                            atten_tp_size = self.tp_size // self.dp_size if self.enable_dp_attention else self.tp_size
+                            self.nsa_prefill_context_parallel_size = atten_tp_size
+                            logger.info(
+                                f"CP size not specified, using atten_tp_size={atten_tp_size} for backward compatibility"
+                            )
+                        
+                        cp_size = self.nsa_prefill_context_parallel_size
+                        atten_tp_size = self.tp_size // self.dp_size if self.enable_dp_attention else self.tp_size
+                        
+                        # Validate CP size
+                        assert cp_size > 0, f"CP size must be > 0, got {cp_size}"
+                        assert atten_tp_size % cp_size == 0, (
+                            f"CP size ({cp_size}) must divide atten_tp_size ({atten_tp_size}). "
+                            f"TP={self.tp_size}, DP={self.dp_size}, atten_tp_size={atten_tp_size}"
                         )
+                        
+                        # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
+                        # Only set moe_dense_tp_size=1 if CP size equals atten_tp_size (original behavior)
+                        if cp_size == atten_tp_size:
+                            self.moe_dense_tp_size = 1
+                            self.moe_a2a_backend = "deepep"
+                            self.ep_size = self.tp_size
+                            self.kv_cache_dtype = "bf16"
+                            logger.warning(
+                                f"Enable Context Parallel opt for deeeseekv3.2-DSA (CP={cp_size}, TP={self.tp_size}, PP={self.pp_size}). "
+                                f"Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, "
+                                f"ep_size == {self.ep_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend}"
+                            )
+                        else:
+                            # True TP + CP mode: weights will be sharded
+                            logger.info(
+                                f"Enable Context Parallel with True TP (CP={cp_size}, TP={self.tp_size}, PP={self.pp_size}). "
+                                f"Weights will be sharded (TP), sequences will be parallelized (CP)."
+                            )
                     else:
                         # Pure TP and partial DP Attention mode is active for NSA, logging a warning
                         if self.dp_size < self.tp_size:
@@ -4036,6 +4062,13 @@ class ServerArgs:
             "--enable-nsa-prefill-context-parallel",
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
+        )
+        parser.add_argument(
+            "--nsa-prefill-context-parallel-size",
+            type=int,
+            default=ServerArgs.nsa_prefill_context_parallel_size,
+            help="Context parallelism size. If not specified, uses atten_tp_size for backward compatibility. "
+                 "For true TP+CP mode, set this to a value that divides atten_tp_size (e.g., TP=8, CP=4).",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",

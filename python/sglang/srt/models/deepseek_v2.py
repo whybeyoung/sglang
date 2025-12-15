@@ -1299,11 +1299,32 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
-        # cp reuse the attn_tp comm group but need to duplicate the weights
+        
+        # CP configuration: support both original mode (weights duplicated) and true TP+CP mode (weights sharded)
         if self.nsa_enable_prefill_cp and self.use_nsa:
-            attn_tp_rank = 0
-            attn_tp_size = 1
-            self.cp_size = get_attention_tp_size()
+            from sglang.srt.layers.attention.nsa.utils import get_cp_size as get_cp_size_from_config
+            
+            cp_size_config = get_cp_size_from_config()
+            if cp_size_config is None:
+                # Backward compatibility: original mode (weights duplicated, CP=atten_tp_size)
+                attn_tp_rank = 0
+                attn_tp_size = 1
+                self.cp_size = get_attention_tp_size()
+                self.cp_use_true_tp = False  # Original mode: weights duplicated
+            else:
+                # True TP+CP mode: weights sharded, CP size from config
+                # Keep original attn_tp_rank and attn_tp_size for weights sharding
+                self.cp_size = cp_size_config
+                self.cp_use_true_tp = True  # True TP mode: weights sharded
+                
+                # Validate CP size divides atten_tp_size
+                assert attn_tp_size % self.cp_size == 0, (
+                    f"CP size ({self.cp_size}) must divide atten_tp_size ({attn_tp_size}). "
+                    f"This ensures CP groups are subsets of TP groups."
+                )
+        else:
+            self.cp_size = None
+            self.cp_use_true_tp = False
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -3007,7 +3028,13 @@ class DeepseekV2Model(nn.Module):
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            from sglang.srt.layers.attention.nsa.utils import get_cp_size as get_cp_size_from_config
+            cp_size_config = get_cp_size_from_config()
+            if cp_size_config is None:
+                # Backward compatibility: use atten_tp_size
+                self.cp_size = get_attention_tp_size()
+            else:
+                self.cp_size = cp_size_config
         else:
             self.cp_size = None
 
@@ -3293,8 +3320,20 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            from sglang.srt.layers.attention.nsa.utils import (
+                get_cp_size as get_cp_size_from_config,
+            )
+            from sglang.srt.layers.attention.nsa.cp_group import get_cp_rank as get_cp_comm_rank
+            
+            cp_size_config = get_cp_size_from_config()
+            if cp_size_config is None:
+                # Backward compatibility: use atten_tp_size
+                self.cp_rank = get_attention_tp_rank()
+                self.cp_size = get_attention_tp_size()
+            else:
+                # True TP+CP mode: use CP group functions
+                self.cp_size = cp_size_config
+                self.cp_rank = get_cp_comm_rank()
         else:
             self.cp_rank = self.cp_size = None
 
@@ -3363,13 +3402,31 @@ class DeepseekV2ForCausalLM(nn.Module):
             # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
             # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
             # the seq data needs to be divided and recombined at twice the size of cp_size.
-            cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
+            # Determine segment number for sequence splitting
+            # In true TP+CP mode, use atten_tp_size; otherwise use cp_size
+            from sglang.srt.layers.attention.nsa.utils import get_cp_size as get_cp_size_from_config
+            from sglang.srt.layers.dp_attention import get_attention_tp_size, get_attention_tp_rank
+            
+            cp_size_config = get_cp_size_from_config()
+            atten_tp_size = get_attention_tp_size()
+            atten_tp_rank = get_attention_tp_rank()
+            
+            if cp_size_config is not None and cp_size_config != atten_tp_size:
+                # True TP+CP mode: split based on atten_tp_size
+                segment_num = atten_tp_size * 2
+            else:
+                # Original mode: split based on cp_size
+                segment_num = self.cp_size * 2
+            
+            cur_cp_seq_len = len(input_ids) // segment_num
             if can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     torch.tensor(len(input_ids)),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
+                    atten_tp_size=atten_tp_size if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
+                    atten_tp_rank=atten_tp_rank if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
