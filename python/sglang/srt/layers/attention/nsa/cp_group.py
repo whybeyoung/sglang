@@ -60,7 +60,8 @@ def init_cp_group():
     # This is already computed as tp_rank % atten_tp_size in compute_dp_attention_world_info
     atten_tp_rank = get_attention_tp_rank()  # PP stage 内的 atten_tp_rank (0 到 atten_tp_size - 1)
     pp_rank = get_pipeline_model_parallel_rank()
-    tp_rank_global = get_tensor_model_parallel_rank()  # 全局 TP rank，用于计算 base_rank
+    tp_rank_in_pp = get_tensor_model_parallel_rank()  # TP group 内的 rank (0 到 tp_size - 1)
+    current_rank = torch.distributed.get_rank()  # 当前全局 rank
     
     # Calculate CP group ID within current PP stage
     cp_group_id = atten_tp_rank // _CP_SIZE
@@ -68,22 +69,37 @@ def init_cp_group():
     # Calculate CP rank within CP group
     _CP_RANK = atten_tp_rank % _CP_SIZE
     
-    # Calculate global ranks for this CP group
-    # base_rank is the starting rank of current PP stage
-    base_rank = pp_rank * tp_size
-    # cp_group_ranks are the ranks within the CP group in current PP stage
-    cp_group_ranks = [
-        base_rank + cp_group_id * _CP_SIZE + i
-        for i in range(_CP_SIZE)
-    ]
+    # Get the atten_tp_group to find the actual global ranks
+    atten_tp_group = get_attention_tp_group()
+    # atten_tp_group.ranks contains the global ranks for the current atten_tp group
+    # We need to extract the CP group's ranks from the atten_tp_group.ranks
+    
+    # Calculate the starting atten_tp_rank for this CP group within the atten_tp group
+    cp_group_start_atten_tp_rank = cp_group_id * _CP_SIZE
+    
+    # Get the global ranks for this CP group from the atten_tp_group.ranks
+    # The atten_tp_group.ranks contains all ranks in the current atten_tp group (sorted)
+    cp_group_ranks = atten_tp_group.ranks[cp_group_start_atten_tp_rank:cp_group_start_atten_tp_rank + _CP_SIZE]
+    
+    # Verify current rank is in this CP group
+    assert current_rank in cp_group_ranks, (
+        f"Current rank {current_rank} not in CP group ranks {cp_group_ranks}. "
+        f"PP={pp_rank}, TP={tp_rank_in_pp}, atten_tp_rank={atten_tp_rank}, "
+        f"cp_group_id={cp_group_id}, cp_rank={_CP_RANK}, "
+        f"atten_tp_group.ranks={atten_tp_group.ranks}"
+    )
     
     # Get TP group for backend configuration
     tp_group = get_attention_tp_group()
     
+    # Get local_rank from tp_group (CP group uses same device assignment as TP group)
+    # All ranks in CP group should use their own local_rank from tp_group
+    local_rank = tp_group.local_rank
+    
     # Create CP group coordinator
     _CP_GROUP = GroupCoordinator(
         [cp_group_ranks],
-        tp_group.local_rank if _CP_RANK == 0 else -1,  # Only first rank in CP group has valid local_rank
+        local_rank,  # Use local_rank from tp_group (same device assignment)
         torch.distributed.get_backend(tp_group.device_group),
         use_pynccl=tp_group.use_pynccl,
         use_pymscclpp=tp_group.use_pymscclpp,
