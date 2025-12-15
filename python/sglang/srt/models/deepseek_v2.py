@@ -3418,7 +3418,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                 segment_num = self.cp_size * 2
             
             cur_cp_seq_len = len(input_ids) // segment_num
-            if can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch):
+            can_split = can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch)
+            # Debug: log CP split decision
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"[CP Debug] Rank {self.cp_rank}: can_cp_split={can_split}, "
+                f"cur_cp_seq_len={cur_cp_seq_len}, cp_size={self.cp_size}, "
+                f"use_nsa={self.use_nsa}, seq_len={len(input_ids)}, "
+                f"segment_num={segment_num}, forward_mode={forward_batch.forward_mode}"
+            )
+            if can_split:
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     torch.tensor(len(input_ids)),
                     self.cp_rank,
@@ -3426,6 +3436,15 @@ class DeepseekV2ForCausalLM(nn.Module):
                     forward_batch.seq_lens_cpu.tolist(),
                     atten_tp_size=atten_tp_size if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
                     atten_tp_rank=atten_tp_rank if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
+                )
+                logger.debug(
+                    f"[CP Debug] Rank {self.cp_rank}: nsa_cp_metadata set, "
+                    f"cp_rank={self.cp_rank}, cp_size={self.cp_size}"
+                )
+            else:
+                logger.warning(
+                    f"[CP Debug] Rank {self.cp_rank}: can_cp_split returned False! "
+                    f"This may cause allgather deadlock if other ranks have CP enabled."
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
