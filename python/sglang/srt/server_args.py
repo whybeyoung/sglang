@@ -1048,14 +1048,36 @@ class ServerArgs:
                         # Only set moe_dense_tp_size=1 if CP size equals atten_tp_size (original behavior)
                         if cp_size == atten_tp_size:
                             self.moe_dense_tp_size = 1
-                            self.moe_a2a_backend = "deepep"
-                            self.ep_size = self.tp_size
                             self.kv_cache_dtype = "bf16"
-                            logger.warning(
-                                f"Enable Context Parallel opt for deeeseekv3.2-DSA (CP={cp_size}, TP={self.tp_size}, PP={self.pp_size}). "
-                                f"Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, "
-                                f"ep_size == {self.ep_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend}"
-                            )
+                            
+                            # EP (Expert Parallelism) configuration:
+                            # - Do NOT automatically enable EP when CP is enabled
+                            # - Only enable EP if user explicitly set moe_a2a_backend to a backend that requires EP
+                            #   or if user explicitly set ep_size > 1
+                            # Note: ep_size will be set by _handle_a2a_moe() if moe_a2a_backend requires EP
+                            if self.moe_a2a_backend in ["deepep", "mooncake", "ascend_fuseep"]:
+                                # User explicitly set an EP backend, EP will be enabled by _handle_a2a_moe()
+                                logger.warning(
+                                    f"Enable Context Parallel opt for deeeseekv3.2-DSA (CP={cp_size}, TP={self.tp_size}, PP={self.pp_size}). "
+                                    f"Setting moe_dense_tp_size == {self.moe_dense_tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, "
+                                    f"moe_a2a_backend == {self.moe_a2a_backend}. EP will be enabled (ep_size will be set to {self.tp_size})."
+                                )
+                            elif self.ep_size > 1:
+                                # User explicitly set ep_size > 1, need to set backend
+                                # EP size will be set by _handle_a2a_moe() after backend is set
+                                self.moe_a2a_backend = "deepep"
+                                logger.warning(
+                                    f"Enable Context Parallel opt for deeeseekv3.2-DSA (CP={cp_size}, TP={self.tp_size}, PP={self.pp_size}). "
+                                    f"Setting moe_dense_tp_size == {self.moe_dense_tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, "
+                                    f"moe_a2a_backend == {self.moe_a2a_backend}. EP will be enabled (ep_size will be set to {self.tp_size})."
+                                )
+                            else:
+                                # User wants pure TP+PP+CP+DP without EP, keep EP disabled
+                                logger.info(
+                                    f"Enable Context Parallel opt for deeeseekv3.2-DSA (CP={cp_size}, TP={self.tp_size}, PP={self.pp_size}). "
+                                    f"Setting moe_dense_tp_size == {self.moe_dense_tp_size}, kv_cache_dtype == {self.kv_cache_dtype}. "
+                                    f"EP is disabled (ep_size=1, moe_a2a_backend=none) as requested."
+                                )
                         else:
                             # True TP + CP mode: weights will be sharded
                             logger.info(
