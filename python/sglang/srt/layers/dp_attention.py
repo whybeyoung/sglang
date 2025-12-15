@@ -315,7 +315,7 @@ def initialize_dp_attention(
         dtype=model_config.dtype,
         device=torch.device(server_args.device),
     )
-    
+
     # Initialize CP group if CP is enabled
     # CP group creation depends on atten_tp_group, so we create it here after atten_tp_group is ready
     if is_nsa_enable_prefill_cp():

@@ -52,6 +52,13 @@ def init_cp_group():
         f"CP size ({_CP_SIZE}) must divide atten_tp_size ({atten_tp_size})"
     )
     
+    # Special case: if CP size equals atten_tp_size, reuse atten_tp_group
+    if _CP_SIZE == atten_tp_size:
+        # Each atten_tp_group is exactly one CP group
+        _CP_GROUP = get_attention_tp_group()  # Reuse atten_tp_group
+        _CP_RANK = get_attention_tp_group().rank_in_group
+        return
+    
     # Calculate number of CP groups per PP stage
     num_cp_groups_per_pp = atten_tp_size // _CP_SIZE
     
