@@ -9,9 +9,12 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.distributed import get_pipeline_model_parallel_rank, get_tensor_model_parallel_rank
+from sglang.srt.distributed import (
+    GroupCoordinator,
+    get_pipeline_model_parallel_rank,
+    get_tensor_model_parallel_rank,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_group, get_attention_tp_size
-from sglang.srt.layers.group_coordinator import GroupCoordinator
 from sglang.srt.server_args import get_global_server_args
 
 

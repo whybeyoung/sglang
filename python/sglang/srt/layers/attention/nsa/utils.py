@@ -326,19 +326,19 @@ def prepare_input_dp_with_cp_dsa(
     )
 
     # Calculate per_rank_actual_token
-    # In true TP+CP mode, each CP group processes different blocks
+    # In true TP+CP mode, each rank processes blocks based on its atten_tp_rank
     # zigzag_index determines which blocks this rank processes
-    # For CP group, we need to calculate based on the blocks assigned to this CP group
     if atten_tp_size is not None and atten_tp_size != cp_size:
-        # True TP+CP mode: calculate based on zigzag_rank's blocks
-        # zigzag_rank determines which blocks this rank processes
-        # For CP group, calculate based on cp_rank's position within the CP group's block range
+        # True TP+CP mode: calculate based on zigzag_rank (atten_tp_rank)
+        # Each rank processes 2 blocks: split_list[zigzag_rank] and split_list[cp_segment_num - zigzag_rank - 1]
+        # per_rank_actual_token should list tokens for all ranks in the CP group
+        # Get the CP group's atten_tp_rank range
         cp_group_id = zigzag_rank // cp_size
-        cp_group_block_start = cp_group_id * cp_size
-        cp_group_block_end = cp_group_block_start + cp_size
-        # Calculate per_rank_actual_token for this CP group
+        cp_group_atten_tp_start = cp_group_id * cp_size
+        cp_group_atten_tp_end = cp_group_atten_tp_start + cp_size
+        # Calculate per_rank_actual_token for all ranks in this CP group
         per_rank_actual_token = [
-            split_list[cp_group_block_start + i] + split_list[cp_segment_num - (cp_group_block_start + i) - 1]
+            split_list[cp_group_atten_tp_start + i] + split_list[cp_segment_num - (cp_group_atten_tp_start + i) - 1]
             for i in range(cp_size)
         ]
     else:
@@ -351,14 +351,15 @@ def prepare_input_dp_with_cp_dsa(
     # This should be based on the blocks processed by this CP group
     if atten_tp_size is not None and atten_tp_size != cp_size:
         # True TP+CP mode: reverse_split_len for this CP group's blocks
+        # Get the CP group's atten_tp_rank range
         cp_group_id = zigzag_rank // cp_size
-        cp_group_block_start = cp_group_id * cp_size
+        cp_group_atten_tp_start = cp_group_id * cp_size
         reverse_split_len = [
             element
             for i in range(cp_size)
             for element in (
-                split_list[cp_group_block_start + i],
-                split_list[cp_segment_num - (cp_group_block_start + i) - 1]
+                split_list[cp_group_atten_tp_start + i],
+                split_list[cp_segment_num - (cp_group_atten_tp_start + i) - 1]
             )
         ]
     else:

@@ -3405,7 +3405,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # Determine segment number for sequence splitting
             # In true TP+CP mode, use atten_tp_size; otherwise use cp_size
             from sglang.srt.layers.attention.nsa.utils import get_cp_size as get_cp_size_from_config
-            from sglang.srt.layers.dp_attention import get_attention_tp_size, get_attention_tp_rank
             
             cp_size_config = get_cp_size_from_config()
             atten_tp_size = get_attention_tp_size()
