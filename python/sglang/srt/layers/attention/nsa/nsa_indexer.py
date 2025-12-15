@@ -228,11 +228,17 @@ class Indexer(CustomOp):
         key[..., : self.rope_head_dim] = k_rope
 
         # allgather+rerrange
-        # Use enable_prefill_cp to check if CP is actually enabled for this batch
-        # This ensures we only allgather when forward_mode is context_parallel_extend
+        # In CP mode, we need to allgather key to get the full sequence
+        # This is needed even in PP1 stage where hidden_states are already split from PP0
         from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp, cp_all_gather_rerange_output
         key_before_allgather_shape = key.shape
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        # Check if CP metadata exists and CP is enabled
+        # In PP mode, we need to allgather even if forward_mode is not EXTEND
+        # because hidden_states from PP0 are already split
+        if (
+            forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
+        ):
             key = cp_all_gather_rerange_output(
                 key.contiguous(),
                 self.cp_size,
@@ -243,7 +249,8 @@ class Indexer(CustomOp):
             logger = logging.getLogger(__name__)
             logger.debug(
                 f"[Indexer CP Allgather] _get_q_k_bf16: key shape before={key_before_allgather_shape}, "
-                f"after={key.shape}, forward_mode={forward_batch.forward_mode}"
+                f"after={key.shape}, forward_mode={forward_batch.forward_mode}, "
+                f"enable_prefill_cp={enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)}"
             )
 
         if enable_dual_stream:
@@ -594,10 +601,12 @@ class Indexer(CustomOp):
         # So in CP mode, key shape is full sequence length after allgather
         # But out_cache_loc might be based on CP split sequence length
         # We need to adjust out_cache_loc to match the allgathered key shape
-        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
         loc_to_use = forward_batch.out_cache_loc
+        # Check if CP metadata exists and CP is enabled
+        # In PP mode, we need to adjust even if forward_mode is not EXTEND
         if (
-            enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+            forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
             and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
             # Key has been allgathered, so it has full sequence length
@@ -964,10 +973,12 @@ class Indexer(CustomOp):
         # In CP mode, key is allgathered in _get_q_k_bf16, so it has full sequence length
         # But out_cache_loc is based on original sequence length before CP split
         # We need to adjust out_cache_loc to match the allgathered key shape
-        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
         loc_to_use = forward_batch.out_cache_loc
+        # Check if CP metadata exists and CP is enabled
+        # In PP mode, we need to adjust even if forward_mode is not EXTEND
         if (
-            enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+            forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
             and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
             # Key has been allgathered, so it has full sequence length
@@ -1151,9 +1162,14 @@ class Indexer(CustomOp):
         )  # [bs, 1, d]
         k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
 
-        # Use enable_prefill_cp to check if CP is actually enabled for this batch
-        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        # In CP mode, we need to allgather key to get the full sequence
+        # This is needed even in PP1 stage where hidden_states are already split from PP0
+        # Check if CP metadata exists and CP is enabled
+        # In PP mode, we need to allgather even if forward_mode is not EXTEND
+        if (
+            forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
+        ):
             k = cp_all_gather_rerange_output(
                 k.contiguous().view(-1, self.head_dim),
                 self.cp_size,
@@ -1163,8 +1179,11 @@ class Indexer(CustomOp):
         
         # CP mode: adjust out_cache_loc to match allgathered key shape (NPU path)
         loc_to_use = forward_batch.out_cache_loc
+        # Check if CP metadata exists and CP is enabled
+        # In PP mode, we need to adjust even if forward_mode is not EXTEND
         if (
-            enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+            forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
             and k.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
             # Key has been allgathered, so it has full sequence length
