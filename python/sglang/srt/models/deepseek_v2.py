@@ -3409,42 +3409,74 @@ class DeepseekV2ForCausalLM(nn.Module):
             cp_size_config = get_cp_size_from_config()
             atten_tp_size = get_attention_tp_size()
             atten_tp_rank = get_attention_tp_rank()
+            pp_group = get_pp_group()
             
-            if cp_size_config is not None and cp_size_config != atten_tp_size:
-                # True TP+CP mode: split based on atten_tp_size
-                segment_num = atten_tp_size * 2
-            else:
-                # Original mode: split based on cp_size
-                segment_num = self.cp_size * 2
-            
-            cur_cp_seq_len = len(input_ids) // segment_num
-            can_split = can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch)
-            # Debug: log CP split decision
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.debug(
-                f"[CP Debug] Rank {self.cp_rank}: can_cp_split={can_split}, "
-                f"cur_cp_seq_len={cur_cp_seq_len}, cp_size={self.cp_size}, "
-                f"use_nsa={self.use_nsa}, seq_len={len(input_ids)}, "
-                f"segment_num={segment_num}, forward_mode={forward_batch.forward_mode}"
-            )
-            if can_split:
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    torch.tensor(len(input_ids)),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    atten_tp_size=atten_tp_size if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
-                    atten_tp_rank=atten_tp_rank if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
-                )
+            # Check if nsa_cp_metadata already exists (from PP0)
+            # In PP mode, PP0 sets nsa_cp_metadata, and it should be passed to PP1 via forward_batch
+            if forward_batch.nsa_cp_metadata is not None:
+                # PP1: reuse metadata from PP0
+                import logging
+                logger = logging.getLogger(__name__)
                 logger.debug(
-                    f"[CP Debug] Rank {self.cp_rank}: nsa_cp_metadata set, "
-                    f"cp_rank={self.cp_rank}, cp_size={self.cp_size}"
+                    f"[CP Debug] Rank {self.cp_rank} (PP stage {pp_group.rank_in_group}): "
+                    f"Reusing nsa_cp_metadata from PP0, cp_rank={self.cp_rank}, cp_size={self.cp_size}"
                 )
+            elif pp_group.is_first_rank:
+                # PP0: create metadata based on input_ids
+                if cp_size_config is not None and cp_size_config != atten_tp_size:
+                    # True TP+CP mode: split based on atten_tp_size
+                    segment_num = atten_tp_size * 2
+                else:
+                    # Original mode: split based on cp_size
+                    segment_num = self.cp_size * 2
+                
+                cur_cp_seq_len = len(input_ids) // segment_num
+                # Debug: check each condition of can_cp_split
+                import logging
+                logger = logging.getLogger(__name__)
+                from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+                is_cp_enabled = is_nsa_enable_prefill_cp()
+                is_context_parallel_extend = forward_batch.forward_mode.is_context_parallel_extend()
+                logger.debug(
+                    f"[CP Debug] Rank {self.cp_rank}: Checking can_cp_split conditions: "
+                    f"cur_cp_seq_len={cur_cp_seq_len} (seq_len={len(input_ids)}, segment_num={segment_num}), "
+                    f"cp_size={self.cp_size}, use_nsa={self.use_nsa}, "
+                    f"is_context_parallel_extend={is_context_parallel_extend}, "
+                    f"is_nsa_enable_prefill_cp={is_cp_enabled}, "
+                    f"forward_mode={forward_batch.forward_mode}"
+                )
+                can_split = can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch)
+                logger.debug(
+                    f"[CP Debug] Rank {self.cp_rank}: can_cp_split={can_split}"
+                )
+                if can_split:
+                    forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                        torch.tensor(len(input_ids)),
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        atten_tp_size=atten_tp_size if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
+                        atten_tp_rank=atten_tp_rank if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
+                    )
+                    logger.debug(
+                        f"[CP Debug] Rank {self.cp_rank}: nsa_cp_metadata set, "
+                        f"cp_rank={self.cp_rank}, cp_size={self.cp_size}"
+                    )
+                else:
+                    logger.warning(
+                        f"[CP Debug] Rank {self.cp_rank}: can_cp_split returned False! "
+                        f"This may cause allgather deadlock if other ranks have CP enabled."
+                    )
             else:
+                # PP1: metadata should have been set by PP0, but it's missing
+                # This should not happen if forward_batch is correctly passed between PP stages
+                import logging
+                logger = logging.getLogger(__name__)
                 logger.warning(
-                    f"[CP Debug] Rank {self.cp_rank}: can_cp_split returned False! "
-                    f"This may cause allgather deadlock if other ranks have CP enabled."
+                    f"[CP Debug] Rank {self.cp_rank} (PP stage {pp_group.rank_in_group}): "
+                    f"nsa_cp_metadata is None! This may cause CP allgather deadlock. "
+                    f"forward_mode={forward_batch.forward_mode}, "
+                    f"seq_lens_cpu={forward_batch.seq_lens_cpu}"
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
