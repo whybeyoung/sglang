@@ -582,6 +582,7 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_context_parallel_size: Optional[int] = None  # CP size, if None, use atten_tp_size
+    nsa_prefill_cp_mode: int = 0  # Token splitting mode: 0 (zigzag, original), 1 (token_idx % cp_size, new)
     enable_fused_qk_norm_rope: bool = False
 
     # Dynamic batch tokenizer
@@ -1048,6 +1049,29 @@ class ServerArgs:
                         assert atten_tp_size % cp_size == 0, (
                             f"CP size ({cp_size}) must divide atten_tp_size ({atten_tp_size}). "
                             f"TP={self.tp_size}, DP={self.dp_size}, atten_tp_size={atten_tp_size}"
+                        )
+                        
+                        # Configure MoE backend based on CP mode
+                        # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
+                        self.moe_dense_tp_size = 1
+                        if self.nsa_prefill_cp_mode != 1:
+                            # Mode 0 (zigzag): use DeepEP backend
+                            self.moe_a2a_backend = "deepep"
+                            self.ep_size = self.tp_size
+                            self.kv_cache_dtype = "bf16"
+                        # Mode 1 supports fused_moe backend (can be set by user)
+                        
+                        # Multi-machine CP validation (only for mode 0 currently)
+                        if self.nsa_prefill_cp_mode == 0:
+                            assert (
+                                self.tp_size == 8
+                            ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                        
+                        logger.warning(
+                            f"Enable Context Parallel opt for deeeseekv3.2-DSA (CP={cp_size}, TP={self.tp_size}, PP={self.pp_size}, CP_mode={self.nsa_prefill_cp_mode}), "
+                            f"Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, "
+                            f"ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, "
+                            f"moe_a2a_backend {self.moe_a2a_backend}"
                         )
                         
                         # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
@@ -4182,6 +4206,15 @@ class ServerArgs:
             default=ServerArgs.nsa_prefill_context_parallel_size,
             help="Context parallelism size. If not specified, uses atten_tp_size for backward compatibility. "
                  "For true TP+CP mode, set this to a value that divides atten_tp_size (e.g., TP=8, CP=4).",
+        )
+        parser.add_argument(
+            "--nsa-prefill-cp-mode",
+            type=int,
+            default=ServerArgs.nsa_prefill_cp_mode,
+            choices=[0, 1],
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. "
+                 "0 (default): zigzag mode, original token splitting scheme. "
+                 "1: token_idx % cp_size mode, supports multi-batch prefill and fused MoE.",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",

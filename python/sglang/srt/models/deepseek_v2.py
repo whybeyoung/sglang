@@ -66,6 +66,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
+from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -1854,12 +1855,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
 
-    def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
+    def rebuild_cp_kv_cache(self, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
-        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
-        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        latent_cache = _concat_mla_absorb_q_general(k_nope, k_pe).squeeze(1)
         latent_cache_output = cp_all_gather_rerange_output(
-            latent_cache.contiguous(),
+            latent_cache,
             self.cp_size,
             forward_batch,
             torch.cuda.current_stream(),
@@ -2019,8 +2019,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
@@ -2030,9 +2028,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             # support allgather+rerrange
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
+            k_nope, k_pe = self.rebuild_cp_kv_cache(forward_batch, k_nope, k_pe)
         topk_indices = None
         if q_lora is not None:
             # Debug: log shapes before indexer call
@@ -3242,6 +3238,7 @@ class DeepseekV2Model(nn.Module):
 
         if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
@@ -3510,11 +3507,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                     f"[CP Debug] Rank {self.cp_rank}: can_cp_split={can_split}"
                 )
                 if can_split:
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    torch.tensor(len(input_ids)),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
+                    forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                        len(input_ids),
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
                         atten_tp_size=atten_tp_size if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
                         atten_tp_rank=atten_tp_rank if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
                     )
