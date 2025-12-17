@@ -140,10 +140,10 @@ class NSAContextParallelMetadata:
 
 def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if is_nsa_prefill_cp_mode1():
+        # Mode 1: seq_len must be divisible by cp_size
+        if seq_len % cp_size != 0:
+            return False
         cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is 1"
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
