@@ -1,7 +1,7 @@
 # temp NSA debugging environ
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -74,6 +74,38 @@ def can_nsa_prefill_cp_mode1(forward_batch: "ForwardBatch"):
     cp_size = get_attention_tp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
     return is_nsa_prefill_cp_mode1() and seq_len > 0 and cp_size > 1
+
+
+def enable_prefill_cp(forward_batch: "ForwardBatch", nsa_enable_prefill_cp: Optional[bool] = None) -> bool:
+    """Check if context parallelism should be enabled for a forward batch.
+    
+    Args:
+        forward_batch: The forward batch to check
+        nsa_enable_prefill_cp: Optional flag indicating if CP is enabled globally.
+                              If None, uses is_nsa_enable_prefill_cp() to check.
+    
+    Returns:
+        True if CP should be enabled for this batch, False otherwise.
+    """
+    if forward_batch is None:
+        return False
+    
+    # Check if CP is enabled globally
+    if nsa_enable_prefill_cp is None:
+        nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+    
+    if not nsa_enable_prefill_cp:
+        return False
+    
+    # Check if forward mode supports CP
+    if not forward_batch.forward_mode.is_context_parallel_extend():
+        return False
+    
+    # Check if CP metadata exists (indicates CP is active for this batch)
+    if forward_batch.nsa_cp_metadata is None:
+        return False
+    
+    return True
 
 
 def nsa_cp_mode1_split_data(input_: Union[torch.Tensor, List]):
@@ -163,3 +195,73 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         dim=-1,
     )
     return positions
+
+
+def cp_all_gather_rerange_output(
+    input_: torch.Tensor,
+    cp_size: int,
+    forward_batch: "ForwardBatch",
+    stream: Optional[torch.cuda.Stream] = None,
+) -> torch.Tensor:
+    """Allgather and rerange output for context parallelism.
+    
+    This function performs allgather across CP ranks and then reranges the output
+    according to CP metadata to restore the original sequence order.
+    
+    Args:
+        input_: Input tensor split across CP ranks (shape: [split_seq_len, ...])
+        cp_size: Context parallelism size
+        forward_batch: Forward batch containing CP metadata
+        stream: Optional CUDA stream for async operations
+    
+    Returns:
+        Reranged output tensor with full sequence (shape: [full_seq_len, ...])
+    """
+    from sglang.srt.layers.attention.nsa.cp_group import get_cp_group
+    
+    if forward_batch.nsa_cp_metadata is None:
+        # No CP metadata, just do regular allgather
+        cp_group = get_cp_group()
+        output = torch.empty(
+            (input_.shape[0] * cp_size, *input_.shape[1:]),
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+        if stream is not None:
+            cp_group.cp_all_gather_into_tensor_async(output, input_, stream=stream)
+            stream.synchronize()
+        else:
+            cp_group.all_gather_into_tensor(output, input_)
+        return output
+    
+    # Get CP group for allgather
+    cp_group = get_cp_group()
+    
+    # Allgather: collect data from all CP ranks
+    output = torch.empty(
+        (input_.shape[0] * cp_size, *input_.shape[1:]),
+        dtype=input_.dtype,
+        device=input_.device,
+    )
+    
+    if stream is not None:
+        cp_group.cp_all_gather_into_tensor_async(output, input_, stream=stream)
+        stream.synchronize()
+    else:
+        cp_group.all_gather_into_tensor(output, input_)
+    
+    # Rerange according to CP metadata
+    if is_nsa_prefill_cp_mode1():
+        # Mode 1: simple split, no rerange needed (already in correct order after allgather)
+        return output
+    else:
+        # Mode 0: zigzag mode, need to rerange using reverse_index
+        if forward_batch.nsa_cp_metadata.cp_reverse_index is not None:
+            # Use reverse_index to restore original order
+            reverse_index = forward_batch.nsa_cp_metadata.cp_reverse_index
+            if isinstance(reverse_index, list):
+                reverse_index = torch.tensor(reverse_index, device=input_.device)
+            return output[reverse_index]
+        else:
+            # Fallback: if no reverse_index, return as-is
+            return output
