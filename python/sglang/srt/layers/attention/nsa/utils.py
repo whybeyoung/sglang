@@ -197,6 +197,128 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
+def prepare_input_dp_with_cp_dsa(
+    kv_len: int,
+    cp_rank: int,
+    cp_size: int,
+    seqs_len: List[int],
+    atten_tp_size: Optional[int] = None,
+    atten_tp_rank: Optional[int] = None,
+) -> NSAContextParallelMetadata:
+    """Prepare input for DP with CP DSA (zigzag mode, mode 0).
+    
+    This function creates metadata for context parallelism using zigzag token splitting.
+    In zigzag mode, tokens are split into chunks of size `cp_size * 2` and distributed
+    in a zigzag pattern across CP ranks for load balancing.
+    
+    Args:
+        kv_len: Total sequence length (KV length)
+        cp_rank: Current CP rank
+        cp_size: Total CP size
+        seqs_len: List of sequence lengths per batch item
+        atten_tp_size: Optional attention TP size (for compatibility)
+        atten_tp_rank: Optional attention TP rank (for compatibility)
+    
+    Returns:
+        NSAContextParallelMetadata object containing CP splitting information
+    """
+    kv_len_origin = kv_len
+    
+    # Zigzag mode: split into chunks of size cp_size * 2
+    chunk_size = cp_size * 2
+    num_chunks = kv_len // chunk_size
+    remainder = kv_len % chunk_size
+    
+    # Calculate split_list: tokens assigned to each segment in zigzag pattern
+    # Each chunk of size chunk_size is split into cp_size segments of 2 tokens each
+    tokens_per_segment = 2  # chunk_size // cp_size
+    
+    split_list = []
+    zigzag_index = []
+    
+    # Process full chunks
+    for chunk_idx in range(num_chunks):
+        # Within each chunk, create cp_size segments, each assigned to a rank
+        for rank_idx in range(cp_size):
+            split_list.append(tokens_per_segment)
+            zigzag_index.append(rank_idx)
+    
+    # Process remainder
+    if remainder > 0:
+        # Distribute remainder tokens across ranks
+        remainder_per_rank = remainder // cp_size
+        remainder_extra = remainder % cp_size
+        
+        for rank_idx in range(cp_size):
+            tokens_for_rank = remainder_per_rank + (1 if rank_idx < remainder_extra else 0)
+            if tokens_for_rank > 0:
+                split_list.append(tokens_for_rank)
+                zigzag_index.append(rank_idx)
+    
+    # Calculate tokens per rank
+    rank_token_counts = [0] * cp_size
+    for i, rank_idx in enumerate(zigzag_index):
+        rank_token_counts[rank_idx] += split_list[i]
+    
+    max_rank_len = rank_token_counts
+    per_rank_actual_token = max_rank_len.copy()
+    reverse_split_len = split_list.copy()
+    
+    # Build cp_reverse_index: map original position to position in allgathered output
+    # First, determine which rank each original token belongs to
+    original_pos_to_rank = []
+    current_pos = 0
+    for i, rank_idx in enumerate(zigzag_index):
+        for _ in range(split_list[i]):
+            original_pos_to_rank.append(rank_idx)
+            current_pos += 1
+    
+    # Build reverse index: for each original position, find its position after allgather
+    cp_reverse_index = []
+    rank_counters = [0] * cp_size
+    
+    for orig_pos in range(kv_len):
+        rank = original_pos_to_rank[orig_pos]
+        # Position in rank's output
+        rank_pos = rank_counters[rank]
+        rank_counters[rank] += 1
+        # Position in allgathered output (concatenated by rank)
+        allgather_pos = sum(per_rank_actual_token[:rank]) + rank_pos
+        cp_reverse_index.append(allgather_pos)
+    
+    # Calculate kv_len_prev and kv_len_next for current rank
+    kv_len_prev = sum(per_rank_actual_token[:cp_rank])
+    kv_len_next = kv_len_prev + per_rank_actual_token[cp_rank]
+    
+    actual_seq_q_prev = per_rank_actual_token[cp_rank]
+    actual_seq_q_next = per_rank_actual_token[(cp_rank + 1) % cp_size] if cp_size > 1 else 0
+    
+    # Create tensors
+    kv_len_prev_tensor = torch.tensor(kv_len_prev, device="cuda", dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor(kv_len_next, device="cuda", dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev, device="cuda", dtype=torch.int32)
+    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next, device="cuda", dtype=torch.int32)
+    total_seq_lens = torch.tensor(kv_len_origin, device="cuda", dtype=torch.int32)
+    
+    return NSAContextParallelMetadata(
+        split_list=split_list,
+        max_rank_len=max_rank_len,
+        zigzag_index=zigzag_index,
+        per_rank_actual_token=per_rank_actual_token,
+        reverse_split_len=reverse_split_len,
+        cp_reverse_index=cp_reverse_index,
+        kv_len_prev=kv_len_prev,
+        kv_len_next=kv_len_next,
+        actual_seq_q_prev=actual_seq_q_prev,
+        actual_seq_q_next=actual_seq_q_next,
+        kv_len_prev_tensor=kv_len_prev_tensor,
+        kv_len_next_tensor=kv_len_next_tensor,
+        actual_seq_q_prev_tensor=actual_seq_q_prev_tensor,
+        actual_seq_q_next_tensor=actual_seq_q_next_tensor,
+        total_seq_lens=total_seq_lens,
+    )
+
+
 def cp_all_gather_rerange_output(
     input_: torch.Tensor,
     cp_size: int,

@@ -1010,7 +1010,7 @@ class DeepseekV2MoE(nn.Module):
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
                 else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1308,9 +1308,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             cp_size_config = get_cp_size_from_config()
             if cp_size_config is None:
                 # Backward compatibility: original mode (weights duplicated, CP=atten_tp_size)
-            attn_tp_rank = 0
-            attn_tp_size = 1
-            self.cp_size = get_attention_tp_size()
+                attn_tp_rank = 0
+                attn_tp_size = 1
+                self.cp_size = get_attention_tp_size()
                 self.cp_use_true_tp = False  # Original mode: weights duplicated
             else:
                 # True TP+CP mode: weights sharded, CP size from config
@@ -3088,7 +3088,7 @@ class DeepseekV2Model(nn.Module):
             cp_size_config = get_cp_size_from_config()
             if cp_size_config is None:
                 # Backward compatibility: use atten_tp_size
-            self.cp_size = get_attention_tp_size()
+                self.cp_size = get_attention_tp_size()
             else:
                 self.cp_size = cp_size_config
         else:
@@ -3385,8 +3385,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             cp_size_config = get_cp_size_from_config()
             if cp_size_config is None:
                 # Backward compatibility: use atten_tp_size
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+                self.cp_rank = get_attention_tp_rank()
+                self.cp_size = get_attention_tp_size()
             else:
                 # True TP+CP mode: use CP group functions
                 self.cp_size = cp_size_config

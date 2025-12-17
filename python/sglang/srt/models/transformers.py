@@ -24,7 +24,12 @@ from torch import nn
 from transformers import AutoModel, PretrainedConfig, PreTrainedModel
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from sglang.srt.distributed import divide, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    divide,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -33,6 +38,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -153,6 +159,19 @@ class TransformersForCausalLM(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.unpadded_vocab_size = config.vocab_size
+        
+        # Get PP group info
+        self.pp_group = get_pp_group()
+        pp_size = self.pp_group.world_size if self.pp_group.world_size > 1 else None
+        pp_rank = self.pp_group.rank_in_group if pp_size else None
+        
+        # Calculate PP layer indices
+        if pp_size and pp_rank is not None:
+            self.start_layer, self.end_layer = get_pp_indices(
+                config.num_hidden_layers, pp_rank, pp_size
+            )
+        else:
+            self.start_layer, self.end_layer = 0, config.num_hidden_layers
 
         # model is loaded under set_default_torch_dtype(model_config.dtype)
         self.model: PreTrainedModel = AutoModel.from_config(
@@ -161,6 +180,41 @@ class TransformersForCausalLM(nn.Module):
             attn_implementation="sglang",
             trust_remote_code=True,
         )
+        
+        # For PP mode: remove layers not needed for current PP stage to save memory
+        if pp_size and pp_rank is not None and hasattr(self.model, "layers"):
+            # Keep only layers for current PP stage
+            layers_to_keep = list(range(self.start_layer, self.end_layer))
+            layers_to_remove = [
+                i for i in range(config.num_hidden_layers) if i not in layers_to_keep
+            ]
+            
+            # Remove layers not in current PP stage
+            if layers_to_remove:
+                logger.info(
+                    f"PP mode: Removing {len(layers_to_remove)} layers "
+                    f"(keeping layers {self.start_layer}-{self.end_layer-1})"
+                )
+                # Create new ModuleList with only needed layers
+                original_layers = self.model.layers
+                new_layers = nn.ModuleList()
+                for i in range(config.num_hidden_layers):
+                    if i in layers_to_keep:
+                        new_layers.append(original_layers[i])
+                    else:
+                        # Replace with placeholder to maintain indexing
+                        new_layers.append(PPMissingLayer())
+                self.model.layers = new_layers
+                
+                # Free memory by moving removed layers to CPU and deleting
+                for i in layers_to_remove:
+                    if i < len(original_layers):
+                        layer = original_layers[i]
+                        # Move to CPU to free GPU memory
+                        for param in layer.parameters():
+                            param.data = param.data.cpu()
+                        del layer
+                torch.cuda.empty_cache()
 
         # Attention modifications (assumes 1 attention op per hidden layer)
         tp_size = get_tensor_model_parallel_world_size()
@@ -173,6 +227,7 @@ class TransformersForCausalLM(nn.Module):
             if not hasattr(config, "head_dim")
             else config.head_dim
         )
+        # Only create attention instances for layers in current PP stage
         self.attention_instances = [
             RadixAttention(
                 num_heads=divide(config.num_attention_heads, tp_size),
@@ -185,21 +240,24 @@ class TransformersForCausalLM(nn.Module):
                 quant_config=self.quant_config,
                 prefix=f"{i}.attn",
             )
-            for i in range(config.num_hidden_layers)
+            for i in range(self.start_layer, self.end_layer)
         ]
 
         # Model modifications
         self.replace_vocab_embed_class(self.model)
 
-        # ForCausalLM modifications
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-        if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.get_input_embeddings().weight
+        # ForCausalLM modifications - only on last PP rank
+        if pp_size and not self.pp_group.is_last_rank:
+            self.lm_head = PPMissingLayer()
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if config.tie_word_embeddings:
+                self.lm_head.weight = self.model.get_input_embeddings().weight
 
         self.logits_processor = LogitsProcessor(config)
 
