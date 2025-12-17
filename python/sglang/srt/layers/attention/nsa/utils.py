@@ -197,6 +197,25 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
+def compute_nsa_seqlens(
+    original_seq_lens: torch.Tensor,
+    nsa_index_topk: int,
+) -> torch.Tensor:
+    """Compute NSA sequence lengths by clipping original sequence lengths to topk.
+    
+    Args:
+        original_seq_lens: Original sequence lengths tensor (int32)
+        nsa_index_topk: Topk value to clip sequence lengths to
+    
+    Returns:
+        Clipped sequence lengths tensor (int32)
+    """
+    if original_seq_lens.dtype != torch.int32:
+        original_seq_lens = original_seq_lens.to(torch.int32)
+    # Clip each sequence length to topk
+    return torch.clamp(original_seq_lens, max=nsa_index_topk)
+
+
 def prepare_input_dp_with_cp_dsa(
     kv_len: int,
     cp_rank: int,
