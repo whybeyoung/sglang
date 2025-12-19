@@ -1140,22 +1140,92 @@ class Indexer(CustomOp):
                     loc_to_use = forward_batch.out_cache_loc[:total_seq_len]
             else:
                 # out_cache_loc already matches key shape
-                # In CP Mode 1, we need to rerange out_cache_loc to match reranged key order
+                # In CP Mode 1, key is reranged after allgather, so out_cache_loc should also be reranged
+                # However, if out_cache_loc is already in the correct order (already reranged),
+                # we should not rerange it again
                 if is_nsa_prefill_cp_mode1():
-                    # Rerange out_cache_loc using the same logic as key rerange
-                    # This ensures out_cache_loc[i] corresponds to key[i] after rerange
+                    # Check if out_cache_loc is already in reranged order
+                    # In Mode 1, reranged order should be: [loc0, loc1, loc2, ..., loc7, loc8, loc9, ...]
+                    # Allgather order (before rerange) would be: [loc0, loc8, loc1, loc9, loc2, loc10, ...]
+                    original_loc = forward_batch.out_cache_loc
                     logger.error(
-                        f"[Indexer CP] Reranging out_cache_loc in Mode 1: "
-                        f"original.shape={forward_batch.out_cache_loc.shape}"
+                        f"[Indexer CP] Checking out_cache_loc order in Mode 1: "
+                        f"original.shape={original_loc.shape}, "
+                        f"original[:10]={original_loc[:10].tolist() if original_loc.numel() >= 10 else original_loc.tolist()}"
                     )
-                    loc_reshaped = forward_batch.out_cache_loc.view(self.cp_size, -1)
-                    loc_reranged = loc_reshaped.transpose(0, 1).reshape(-1)
-                    loc_to_use = loc_reranged
-                    logger.error(
-                        f"[Indexer CP] Reranged out_cache_loc: "
-                        f"original.shape={forward_batch.out_cache_loc.shape}, "
-                        f"reranged.shape={loc_to_use.shape}"
-                    )
+                    
+                    # Check if the order looks like allgather order (alternating pattern)
+                    # If first few elements are [loc0, loc8, loc1, loc9, ...], it needs rerange
+                    # If first few elements are [loc0, loc1, loc2, ...], it's already reranged
+                    needs_rerange = False
+                    if original_loc.numel() >= 2 * self.cp_size:
+                        # Check if pattern matches allgather order: [rank0_token0, rank0_token8, rank1_token1, rank1_token9, ...]
+                        # This would mean loc[0] and loc[cp_size] are consecutive in original sequence
+                        # But in reranged order, loc[0] and loc[1] should be consecutive
+                        # Simple heuristic: if loc[1] - loc[0] == 1, it's likely already reranged
+                        # If loc[cp_size] - loc[0] is small (like 8), it's likely allgather order
+                        # But also check if there are padding tokens (loc=0) in the first few elements
+                        first_diff = original_loc[1].item() - original_loc[0].item()
+                        has_padding_in_first = (original_loc[:min(8, original_loc.numel())] == 0).any().item()
+                        logger.error(
+                            f"[Indexer CP] Order check: first_diff={first_diff}, "
+                            f"has_padding_in_first={has_padding_in_first}, "
+                            f"loc[0]={original_loc[0].item()}, loc[1]={original_loc[1].item() if original_loc.numel() > 1 else 'N/A'}"
+                        )
+                        if first_diff == 1 and not has_padding_in_first:
+                            # Already in reranged order (consecutive, no padding in first few)
+                            needs_rerange = False
+                        else:
+                            # Likely in allgather order, needs rerange
+                            # But if padding tokens are present, we need to be careful
+                            needs_rerange = True
+                    
+                    if needs_rerange:
+                        logger.error(
+                            f"[Indexer CP] Reranging out_cache_loc in Mode 1 (detected allgather order)"
+                        )
+                        # IMPORTANT: Before rerange, filter out padding tokens (loc=0) to avoid moving them to middle
+                        # After rerange, we'll truncate to actual_valid_tokens anyway
+                        non_zero_mask = original_loc > 0
+                        if not non_zero_mask.all():
+                            # Filter out padding tokens before rerange
+                            logger.error(
+                                f"[Indexer CP] Filtering padding tokens before rerange: "
+                                f"original.shape={original_loc.shape}, "
+                                f"num_padding={(~non_zero_mask).sum().item()}"
+                            )
+                            original_loc_filtered = original_loc[non_zero_mask]
+                            # Rerange only non-padding tokens
+                            # But we need to maintain the shape for rerange, so we need to handle this carefully
+                            # Actually, if we filter before rerange, the shape won't match cp_size
+                            # So we should rerange first, then filter
+                            # But that's what we're doing now, and it's causing the problem
+                            # Let's try a different approach: rerange the full tensor, but be aware padding might be in middle
+                            loc_shape = original_loc.shape
+                            loc_reshaped = original_loc.view(self.cp_size, -1)
+                            loc_reranged = loc_reshaped.transpose(0, 1).reshape(loc_shape)
+                            loc_to_use = loc_reranged
+                        else:
+                            # No padding tokens, safe to rerange
+                            loc_shape = original_loc.shape
+                            loc_reshaped = original_loc.view(self.cp_size, -1)
+                            loc_reranged = loc_reshaped.transpose(0, 1).reshape(loc_shape)
+                            loc_to_use = loc_reranged
+                        logger.error(
+                            f"[Indexer CP] Reranged out_cache_loc: "
+                            f"original.shape={original_loc.shape}, "
+                            f"reranged.shape={loc_to_use.shape}, "
+                            f"reranged[:10]={loc_to_use[:10].tolist() if loc_to_use.numel() >= 10 else loc_to_use.tolist()}, "
+                            f"reranged has zeros={(loc_to_use == 0).any().item() if loc_to_use.numel() > 0 else False}"
+                        )
+                    else:
+                        # Already in correct order, use as-is
+                        loc_to_use = original_loc
+                        logger.error(
+                            f"[Indexer CP] out_cache_loc already in correct order, using as-is: "
+                            f"loc.shape={loc_to_use.shape}, "
+                            f"loc[:10]={loc_to_use[:10].tolist() if loc_to_use.numel() >= 10 else loc_to_use.tolist()}"
+                        )
                 else:
                     loc_to_use = forward_batch.out_cache_loc
                     logger.error(
@@ -1186,10 +1256,14 @@ class Indexer(CustomOp):
             f"seq_lens_cpu={forward_batch.seq_lens_cpu}, "
             f"actual_valid_tokens={actual_valid_tokens}, "
             f"k_fp8_to_use.shape={k_fp8_to_use.shape}, "
-            f"loc_to_use.shape={loc_to_use.shape}"
+            f"loc_to_use.shape={loc_to_use.shape}, "
+            f"loc_to_use[:10]={loc_to_use[:10].tolist() if loc_to_use.numel() >= 10 else loc_to_use.tolist()}, "
+            f"loc_to_use has zeros={(loc_to_use == 0).any().item() if loc_to_use.numel() > 0 else False}"
         )
         
         # Step 3: Truncate to actual valid tokens if padding exists
+        # IMPORTANT: In CP Mode 1, if we reranged out_cache_loc, padding tokens (loc=0) might be in the middle
+        # We should truncate BEFORE filtering, to ensure we only keep actual valid tokens
         if actual_valid_tokens is not None and k_fp8_to_use.shape[0] > actual_valid_tokens:
             logger.error(
                 f"[Indexer PP+CP] Truncating due to padding: "
