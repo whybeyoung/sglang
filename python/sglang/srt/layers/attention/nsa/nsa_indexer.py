@@ -687,9 +687,9 @@ class Indexer(CustomOp):
         
         # Step 6: Write to KV cache
         if loc_to_use.numel() > 0:
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=loc_to_use,
+            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=loc_to_use,
                 index_k=k_fp8_to_use,
                 index_k_scale=k_scale_to_use,
             )
@@ -697,7 +697,7 @@ class Indexer(CustomOp):
             logger.warning(
                 f"[Indexer PP+CP MHA] Skipping KV cache write: all tokens filtered out "
                 f"(likely all padding tokens)"
-        )
+            )
 
         # MHA doesn't need topk_indices
         if not return_indices:
@@ -1125,9 +1125,9 @@ class Indexer(CustomOp):
         
         # Step 6: Write to KV cache
         if loc_to_use.numel() > 0:
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=loc_to_use,
+            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=loc_to_use,
                 index_k=k_fp8_to_use,
                 index_k_scale=k_scale_to_use,
             )
@@ -1135,7 +1135,7 @@ class Indexer(CustomOp):
             logger.warning(
                 f"[Indexer PP+CP] Skipping KV cache write: all tokens filtered out "
                 f"(likely all padding tokens)"
-        )
+            )
 
         weights = self._get_logits_head_gate(x, q_scale)
 
