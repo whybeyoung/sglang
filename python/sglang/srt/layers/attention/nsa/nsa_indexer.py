@@ -243,41 +243,10 @@ class Indexer(CustomOp):
         query[..., : self.rope_head_dim] = q_rope
         key[..., : self.rope_head_dim] = k_rope
 
-        # allgather+rerrange
-        # In CP mode, we need to allgather key to get the full sequence
-        # This is needed even in PP1 stage where hidden_states are already split from PP0
-        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp, cp_all_gather_rerange_output
+        # Import logger for debugging
         import logging
         logger = logging.getLogger(__name__)
-        key_before_allgather_shape = key.shape
-        # Check if CP metadata exists and CP is enabled
-        # In PP mode, we need to allgather even if forward_mode is not EXTEND
-        # because hidden_states from PP0 are already split
-        if (
-            forward_batch.nsa_cp_metadata is not None
-            and self.nsa_enable_prefill_cp
-        ):
-            key = cp_all_gather_rerange_output(
-                key.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-            logger.warning(
-                f"[Indexer CP Allgather] _get_q_k_bf16: key shape before={key_before_allgather_shape}, "
-                f"after={key.shape}, forward_mode={forward_batch.forward_mode}, "
-                f"enable_prefill_cp={enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)}, "
-                f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}, "
-                f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}, "
-                f"cp_size={self.cp_size}"
-            )
-        else:
-            logger.warning(
-                f"[Indexer CP Allgather SKIP] _get_q_k_bf16: key shape={key.shape}, "
-                f"forward_mode={forward_batch.forward_mode}, "
-                f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}, "
-                f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}"
-            )
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp, cp_all_gather_rerange_output
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -309,12 +278,30 @@ class Indexer(CustomOp):
             )
 
         # allgather+rerrange
+        # In CP mode, we need to allgather key to get the full sequence
+        # This is needed even in PP1 stage where hidden_states are already split from PP0
+        key_before_allgather_shape = key.shape
         if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
             key = cp_all_gather_rerange_output(
                 key.contiguous(),
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
+            )
+            logger.warning(
+                f"[Indexer CP Allgather] _get_q_k_bf16: key shape before={key_before_allgather_shape}, "
+                f"after={key.shape}, forward_mode={forward_batch.forward_mode}, "
+                f"enable_prefill_cp={enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)}, "
+                f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}, "
+                f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}, "
+                f"cp_size={self.cp_size}"
+            )
+        else:
+            logger.warning(
+                f"[Indexer CP Allgather SKIP] _get_q_k_bf16: key shape={key.shape}, "
+                f"forward_mode={forward_batch.forward_mode}, "
+                f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}, "
+                f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}"
             )
         return query, key
 
@@ -1071,10 +1058,11 @@ class Indexer(CustomOp):
             logger.warning(f"[Indexer Debug] After act_quant key: k_fp8.shape={k_fp8.shape}, k_scale.shape={k_scale.shape}")
         
         # Debug: log shapes after quantization
-        logger.warning(
-            f"[Indexer Debug] After act_quant: k_fp8.shape={k_fp8.shape}, "
+        logger.error(
+            f"[Indexer Debug CRITICAL] After act_quant: k_fp8.shape={k_fp8.shape}, "
             f"k_scale.shape={k_scale.shape}, key.shape={key.shape}, "
-            f"q_fp8.shape={q_fp8.shape}"
+            f"q_fp8.shape={q_fp8.shape}, k_fp8.numel()={k_fp8.numel()}, "
+            f"key.numel()={key.numel() if key is not None else 'None'}"
         )
 
         # k_fp8: (seq_len, head_dim) fp8_e4m3fn
@@ -1085,8 +1073,8 @@ class Indexer(CustomOp):
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
         
         # Debug: log shapes before set_index_k_scale_buffer (reuse existing logger)
-        logger.warning(
-            f"[Indexer Debug] Before set_index_k_scale_buffer: "
+        logger.error(
+            f"[Indexer Debug CRITICAL] Before set_index_k_scale_buffer: "
             f"loc.shape={forward_batch.out_cache_loc.shape}, "
             f"index_k.shape={k_fp8.shape}, "
             f"index_k_scale.shape={k_scale.shape}, "
@@ -1095,7 +1083,9 @@ class Indexer(CustomOp):
             f"enable_prefill_cp={enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)}, "
             f"forward_mode={forward_batch.forward_mode}, "
             f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}, "
-            f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}"
+            f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}, "
+            f"k_fp8.numel()={k_fp8.numel()}, k_fp8.dtype={k_fp8.dtype}, "
+            f"key.shape={key.shape}, q_fp8.shape={q_fp8.shape}"
         )
         
         # PP + CP Mode: Handle padding and shape mismatch
