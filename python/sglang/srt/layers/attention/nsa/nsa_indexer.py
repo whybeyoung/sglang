@@ -282,14 +282,31 @@ class Indexer(CustomOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
+            query_before_rotate = query.shape
             query = rotate_activation(query)
+            logger.warning(
+                f"[Indexer CP Rotate] _get_q_k_bf16: query shape before rotate={query_before_rotate}, "
+                f"after rotate={query.shape}"
+            )
 
             with torch.cuda.stream(self.alt_stream):
+                key_before_rotate = key.shape
                 key = rotate_activation(key)
+                logger.warning(
+                    f"[Indexer CP Rotate] _get_q_k_bf16: key shape before rotate={key_before_rotate}, "
+                    f"after rotate={key.shape}"
+                )
             current_stream.wait_stream(self.alt_stream)
         else:
+            query_before_rotate = query.shape
+            key_before_rotate = key.shape
             query = rotate_activation(query)
             key = rotate_activation(key)
+            logger.warning(
+                f"[Indexer CP Rotate] _get_q_k_bf16: query shape before rotate={query_before_rotate}, "
+                f"after rotate={query.shape}, key shape before rotate={key_before_rotate}, "
+                f"after rotate={key.shape}"
+            )
 
         # allgather+rerrange
         if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
@@ -1020,18 +1037,45 @@ class Indexer(CustomOp):
         query, key = self._get_q_k_bf16(
             q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
         )
+        
+        # Debug: log key shape before quantization
+        import logging
+        logger = logging.getLogger(__name__)
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
+        logger.warning(
+            f"[Indexer Debug] After _get_q_k_bf16: key.shape={key.shape}, "
+            f"key.is_contiguous()={key.is_contiguous()}, "
+            f"query.shape={query.shape}, x.shape={x.shape}"
+        )
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
+            logger.warning(f"[Indexer Debug] Before act_quant query: query.shape={query.shape}, query.is_contiguous()={query.is_contiguous()}")
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            logger.warning(f"[Indexer Debug] After act_quant query: q_fp8.shape={q_fp8.shape}, q_scale.shape={q_scale.shape}")
+            
             with torch.cuda.stream(self.alt_stream):
+                logger.warning(f"[Indexer Debug] Before act_quant key: key.shape={key.shape}, key.is_contiguous()={key.is_contiguous()}")
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                logger.warning(f"[Indexer Debug] After act_quant key: k_fp8.shape={k_fp8.shape}, k_scale.shape={k_scale.shape}")
             current_stream.wait_stream(self.alt_stream)
         else:
+            logger.warning(f"[Indexer Debug] Before act_quant query: query.shape={query.shape}, query.is_contiguous()={query.is_contiguous()}")
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            logger.warning(f"[Indexer Debug] After act_quant query: q_fp8.shape={q_fp8.shape}, q_scale.shape={q_scale.shape}")
+            
+            logger.warning(f"[Indexer Debug] Before act_quant key: key.shape={key.shape}, key.is_contiguous()={key.is_contiguous()}")
             k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+            logger.warning(f"[Indexer Debug] After act_quant key: k_fp8.shape={k_fp8.shape}, k_scale.shape={k_scale.shape}")
+        
+        # Debug: log shapes after quantization
+        logger.warning(
+            f"[Indexer Debug] After act_quant: k_fp8.shape={k_fp8.shape}, "
+            f"k_scale.shape={k_scale.shape}, key.shape={key.shape}, "
+            f"q_fp8.shape={q_fp8.shape}"
+        )
 
         # k_fp8: (seq_len, head_dim) fp8_e4m3fn
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
@@ -1040,10 +1084,7 @@ class Indexer(CustomOp):
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
         
-        # Debug: log shapes before set_index_k_scale_buffer
-        import logging
-        logger = logging.getLogger(__name__)
-        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
+        # Debug: log shapes before set_index_k_scale_buffer (reuse existing logger)
         logger.warning(
             f"[Indexer Debug] Before set_index_k_scale_buffer: "
             f"loc.shape={forward_batch.out_cache_loc.shape}, "
