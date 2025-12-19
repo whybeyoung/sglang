@@ -3236,9 +3236,34 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # CP split: Only split in PP0 stage, not in PP1 stage
+        # PP1 receives hidden_states from PP0 which are already CP split
+        # We need to check if hidden_states is already split to avoid double splitting
         if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
+            # Check if hidden_states is already CP split (from PP0)
+            # In PP mode, PP1 receives split hidden_states from PP0
+            # We can check by comparing hidden_states.shape[0] with expected total_seq_len
+            should_split = True
+            if pp_proxy_tensors is not None and forward_batch.nsa_cp_metadata is not None:
+                # PP1 stage: Check if hidden_states is already split
+                total_seq_len = forward_batch.nsa_cp_metadata.total_seq_lens
+                if isinstance(total_seq_len, torch.Tensor):
+                    total_seq_len = total_seq_len.item() if total_seq_len.numel() == 1 else total_seq_len[0].item()
+                
+                # If hidden_states.shape[0] < total_seq_len, it's already split
+                if hidden_states.shape[0] < total_seq_len:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug(
+                        f"[CP Debug PP1] Rank {self.cp_rank}: hidden_states already CP split "
+                        f"(shape={hidden_states.shape[0]}, expected={total_seq_len}), "
+                        f"skipping cp_split_and_rebuild_data"
+                    )
+                    should_split = False
+            
+            if should_split:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+                positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
@@ -3599,7 +3624,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         f"Cannot recreate metadata: missing extend_num_tokens or seq_lens_cpu. "
                         f"extend_num_tokens={forward_batch.extend_num_tokens}, "
                         f"seq_lens_cpu={forward_batch.seq_lens_cpu}, forward_mode={forward_batch.forward_mode}"
-                    )
+                )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
