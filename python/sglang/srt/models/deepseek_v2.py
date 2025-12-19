@@ -3085,14 +3085,19 @@ class DeepseekV2Model(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             from sglang.srt.layers.attention.nsa.utils import get_cp_size as get_cp_size_from_config
+            from sglang.srt.layers.attention.nsa.cp_group import get_cp_rank as get_cp_comm_rank
+            
             cp_size_config = get_cp_size_from_config()
             if cp_size_config is None:
                 # Backward compatibility: use atten_tp_size
+                self.cp_rank = get_attention_tp_rank()
                 self.cp_size = get_attention_tp_size()
             else:
+                # True TP+CP mode: use CP group functions
                 self.cp_size = cp_size_config
+                self.cp_rank = get_cp_comm_rank()
         else:
-            self.cp_size = None
+            self.cp_rank = self.cp_size = None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
