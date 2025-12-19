@@ -393,7 +393,16 @@ def cp_all_gather_rerange_output(
     
     # Rerange according to CP metadata
     if is_nsa_prefill_cp_mode1():
-        # Mode 1: simple split, no rerange needed (already in correct order after allgather)
+        # Mode 1: need to rerange using view + transpose to restore original token order
+        # Allgather collects data as: [rank0_token0, rank0_token8, rank1_token1, rank1_token9, ...]
+        # After rerange: [rank0_token0, rank1_token1, rank2_token2, ..., rank7_token7, rank0_token8, rank1_token9, ...]
+        # This matches the original token order [0, 1, 2, ..., 7, 8, 9, ...]
+        out_shape = output.shape
+        output = (
+            output.view(cp_size, -1, *out_shape[1:])
+            .transpose(0, 1)
+            .reshape(out_shape)
+        )
         return output
     else:
         # Mode 0: zigzag mode, need to rerange using reverse_index
