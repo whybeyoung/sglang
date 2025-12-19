@@ -1097,22 +1097,71 @@ class Indexer(CustomOp):
         k_scale_to_use = k_scale
         
         # Step 1: Adjust out_cache_loc to match allgathered key shape (CP mode)
+        # In CP Mode 1, key is reranged after allgather, so out_cache_loc also needs rerange
+        from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_mode1, cp_all_gather_rerange_output
         if (
             forward_batch.nsa_cp_metadata is not None
             and self.nsa_enable_prefill_cp
-            and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
-            # Key has been allgathered, so it has full sequence length (including padding)
-            # out_cache_loc should match the allgathered key shape
             total_seq_len = k_fp8.shape[0]
+            logger.error(
+                f"[Indexer CP] out_cache_loc shape check: "
+                f"loc.shape={forward_batch.out_cache_loc.shape}, "
+                f"key.shape={k_fp8.shape}, total_seq_len={total_seq_len}, "
+                f"is_mode1={is_nsa_prefill_cp_mode1()}"
+            )
             if forward_batch.out_cache_loc.shape[0] != total_seq_len:
-                logger.debug(
-                    f"[Indexer CP] Adjusting out_cache_loc to match allgathered key: "
-                    f"loc.shape={forward_batch.out_cache_loc.shape}, "
-                    f"key.shape={k_fp8.shape}, total_seq_len={total_seq_len}"
-                )
-                # Use the first total_seq_len elements of out_cache_loc
-                loc_to_use = forward_batch.out_cache_loc[:total_seq_len]
+                # Check if out_cache_loc is still in CP split form
+                if is_nsa_prefill_cp_mode1() and forward_batch.out_cache_loc.shape[0] == total_seq_len // self.cp_size:
+                    # out_cache_loc is still in CP split form, need to allgather and rerange
+                    logger.error(
+                        f"[Indexer CP] Reranging out_cache_loc from CP split form: "
+                        f"original.shape={forward_batch.out_cache_loc.shape}, "
+                        f"expected.shape={total_seq_len}"
+                    )
+                    loc_to_use = cp_all_gather_rerange_output(
+                        forward_batch.out_cache_loc.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    logger.error(
+                        f"[Indexer CP] Reranged out_cache_loc: "
+                        f"original.shape={forward_batch.out_cache_loc.shape}, "
+                        f"reranged.shape={loc_to_use.shape}"
+                    )
+                else:
+                    # Use the first total_seq_len elements of out_cache_loc
+                    logger.error(
+                        f"[Indexer CP] Adjusting out_cache_loc to match allgathered key: "
+                        f"loc.shape={forward_batch.out_cache_loc.shape}, "
+                        f"key.shape={k_fp8.shape}, total_seq_len={total_seq_len}"
+                    )
+                    loc_to_use = forward_batch.out_cache_loc[:total_seq_len]
+            else:
+                # out_cache_loc already matches key shape
+                # In CP Mode 1, we need to rerange out_cache_loc to match reranged key order
+                if is_nsa_prefill_cp_mode1():
+                    # Rerange out_cache_loc using the same logic as key rerange
+                    # This ensures out_cache_loc[i] corresponds to key[i] after rerange
+                    logger.error(
+                        f"[Indexer CP] Reranging out_cache_loc in Mode 1: "
+                        f"original.shape={forward_batch.out_cache_loc.shape}"
+                    )
+                    loc_reshaped = forward_batch.out_cache_loc.view(self.cp_size, -1)
+                    loc_reranged = loc_reshaped.transpose(0, 1).reshape(-1)
+                    loc_to_use = loc_reranged
+                    logger.error(
+                        f"[Indexer CP] Reranged out_cache_loc: "
+                        f"original.shape={forward_batch.out_cache_loc.shape}, "
+                        f"reranged.shape={loc_to_use.shape}"
+                    )
+                else:
+                    loc_to_use = forward_batch.out_cache_loc
+                    logger.error(
+                        f"[Indexer CP] out_cache_loc shape matches key, using as-is: "
+                        f"loc.shape={loc_to_use.shape}"
+                    )
         
         # Step 2: Get actual valid tokens count
         # extend_seq_lens_cpu contains actual valid tokens (e.g., 13), not padded length (e.g., 16)
@@ -1196,7 +1245,9 @@ class Indexer(CustomOp):
             f"k_fp8.shape={k_fp8_to_use.shape}, "
             f"k_scale.shape={k_scale_to_use.shape}, "
             f"loc.min={loc_to_use.min().item() if loc_to_use.numel() > 0 else 'N/A'}, "
-            f"loc.max={loc_to_use.max().item() if loc_to_use.numel() > 0 else 'N/A'}"
+            f"loc.max={loc_to_use.max().item() if loc_to_use.numel() > 0 else 'N/A'}, "
+            f"loc[:5]={loc_to_use[:5].tolist() if loc_to_use.numel() >= 5 else loc_to_use.tolist()}, "
+            f"loc[-5:]={loc_to_use[-5:].tolist() if loc_to_use.numel() >= 5 else loc_to_use.tolist()}"
         )
         if loc_to_use.numel() > 0:
             forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
