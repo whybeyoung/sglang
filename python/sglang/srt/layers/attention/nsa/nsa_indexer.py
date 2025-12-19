@@ -615,40 +615,89 @@ class Indexer(CustomOp):
             f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}"
         )
         
-        # CP mode: adjust out_cache_loc to match allgathered key shape
-        # Note: _get_k_bf16 does allgather in CP mode (same as _get_q_k_bf16)
-        # So in CP mode, key shape is full sequence length after allgather
-        # But out_cache_loc might be based on CP split sequence length
-        # We need to adjust out_cache_loc to match the allgathered key shape
+        # PP + CP Mode: Handle padding and shape mismatch (same logic as forward_cuda)
         loc_to_use = forward_batch.out_cache_loc
-        # Check if CP metadata exists and CP is enabled
-        # In PP mode, we need to adjust even if forward_mode is not EXTEND
+        k_fp8_to_use = k_fp8
+        k_scale_to_use = k_scale
+        
+        # Step 1: Adjust out_cache_loc to match allgathered key shape (CP mode)
         if (
             forward_batch.nsa_cp_metadata is not None
             and self.nsa_enable_prefill_cp
             and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
-            # Key has been allgathered, so it has full sequence length
-            # out_cache_loc should match the allgathered key shape
             total_seq_len = k_fp8.shape[0]
             if forward_batch.out_cache_loc.shape[0] != total_seq_len:
-                logger.warning(
-                    f"[Indexer CP Fix MHA] Adjusting out_cache_loc: "
+                logger.debug(
+                    f"[Indexer CP MHA] Adjusting out_cache_loc to match allgathered key: "
                     f"loc.shape={forward_batch.out_cache_loc.shape}, "
-                    f"key.shape={k_fp8.shape}, "
-                    f"total_seq_len={total_seq_len}. "
-                    f"Using first {total_seq_len} elements of out_cache_loc."
+                    f"key.shape={k_fp8.shape}, total_seq_len={total_seq_len}"
                 )
-                # Use the first total_seq_len elements of out_cache_loc
-                # This assumes out_cache_loc contains indices for the full sequence
                 loc_to_use = forward_batch.out_cache_loc[:total_seq_len]
         
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=loc_to_use,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
+        # Step 2: Get actual valid tokens count
+        actual_valid_tokens = None
+        if forward_batch.extend_seq_lens_cpu is not None:
+            if isinstance(forward_batch.extend_seq_lens_cpu, list):
+                actual_valid_tokens = sum(forward_batch.extend_seq_lens_cpu)
+            else:
+                actual_valid_tokens = forward_batch.extend_seq_lens_cpu.sum().item()
+        elif forward_batch.seq_lens_cpu is not None:
+            if isinstance(forward_batch.seq_lens_cpu, list):
+                actual_valid_tokens = sum(forward_batch.seq_lens_cpu)
+            else:
+                actual_valid_tokens = forward_batch.seq_lens_cpu.sum().item()
+        
+        # Step 3: Truncate to actual valid tokens if padding exists
+        if actual_valid_tokens is not None and k_fp8_to_use.shape[0] > actual_valid_tokens:
+            logger.debug(
+                f"[Indexer PP+CP MHA] Truncating due to padding: "
+                f"k_fp8.shape={k_fp8_to_use.shape}, "
+                f"actual_valid_tokens={actual_valid_tokens}, loc.shape={loc_to_use.shape}"
+            )
+            k_fp8_to_use = k_fp8_to_use[:actual_valid_tokens]
+            k_scale_to_use = k_scale_to_use[:actual_valid_tokens]
+            loc_to_use = loc_to_use[:actual_valid_tokens]
+        
+        # Step 4: Filter out loc=0 values (padding values)
+        if loc_to_use.numel() > 0:
+            valid_mask = loc_to_use > 0
+            if not valid_mask.all():
+                num_invalid = (~valid_mask).sum().item()
+                logger.warning(
+                    f"[Indexer PP+CP MHA] Filtering {num_invalid} invalid loc values "
+                    f"(<=0, padding tokens) from KV cache write. "
+                    f"loc_to_use min={loc_to_use.min().item()}, max={loc_to_use.max().item()}"
+                )
+                loc_to_use = loc_to_use[valid_mask]
+                k_fp8_to_use = k_fp8_to_use[valid_mask]
+                k_scale_to_use = k_scale_to_use[valid_mask]
+        
+        # Step 5: Final shape check
+        min_len = min(loc_to_use.shape[0], k_fp8_to_use.shape[0], k_scale_to_use.shape[0])
+        if min_len < loc_to_use.shape[0]:
+            logger.warning(
+                f"[Indexer PP+CP MHA] Shape mismatch detected, truncating to min_len={min_len}: "
+                f"loc.shape={loc_to_use.shape}, k_fp8.shape={k_fp8_to_use.shape}, "
+                f"k_scale.shape={k_scale_to_use.shape}"
+            )
+            loc_to_use = loc_to_use[:min_len]
+            k_fp8_to_use = k_fp8_to_use[:min_len]
+            k_scale_to_use = k_scale_to_use[:min_len]
+        
+        # Step 6: Write to KV cache
+        if loc_to_use.numel() > 0:
+            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=loc_to_use,
+                index_k=k_fp8_to_use,
+                index_k_scale=k_scale_to_use,
+            )
+        else:
+            logger.warning(
+                f"[Indexer PP+CP MHA] Skipping KV cache write: all tokens filtered out "
+                f"(likely all padding tokens)"
+            )
 
         # MHA doesn't need topk_indices
         if not return_indices:
@@ -989,39 +1038,104 @@ class Indexer(CustomOp):
             f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}"
         )
         
-        # CP mode: adjust out_cache_loc to match allgathered key shape
-        # In CP mode, key is allgathered in _get_q_k_bf16, so it has full sequence length
-        # But out_cache_loc is based on original sequence length before CP split
-        # We need to adjust out_cache_loc to match the allgathered key shape
+        # PP + CP Mode: Handle padding and shape mismatch
+        # In PP mode, out_cache_loc and extend_seq_lens_cpu need to be passed between stages
+        # In CP mode, padding happens before CP split, so allgathered key contains padding
+        # We must truncate based on actual valid tokens to avoid writing padding tokens
         loc_to_use = forward_batch.out_cache_loc
-        # Check if CP metadata exists and CP is enabled
-        # In PP mode, we need to adjust even if forward_mode is not EXTEND
+        k_fp8_to_use = k_fp8
+        k_scale_to_use = k_scale
+        
+        # Step 1: Adjust out_cache_loc to match allgathered key shape (CP mode)
         if (
             forward_batch.nsa_cp_metadata is not None
             and self.nsa_enable_prefill_cp
             and k_fp8.shape[0] != forward_batch.out_cache_loc.shape[0]
         ):
-            # Key has been allgathered, so it has full sequence length
+            # Key has been allgathered, so it has full sequence length (including padding)
             # out_cache_loc should match the allgathered key shape
             total_seq_len = k_fp8.shape[0]
             if forward_batch.out_cache_loc.shape[0] != total_seq_len:
-                logger.warning(
-                    f"[Indexer CP Fix] Adjusting out_cache_loc: "
+                logger.debug(
+                    f"[Indexer CP] Adjusting out_cache_loc to match allgathered key: "
                     f"loc.shape={forward_batch.out_cache_loc.shape}, "
-                    f"key.shape={k_fp8.shape}, "
-                    f"total_seq_len={total_seq_len}. "
-                    f"Using first {total_seq_len} elements of out_cache_loc."
+                    f"key.shape={k_fp8.shape}, total_seq_len={total_seq_len}"
                 )
                 # Use the first total_seq_len elements of out_cache_loc
-                # This assumes out_cache_loc contains the full sequence indices
                 loc_to_use = forward_batch.out_cache_loc[:total_seq_len]
         
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=loc_to_use,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
+        # Step 2: Get actual valid tokens count
+        # extend_seq_lens_cpu contains actual valid tokens (e.g., 13), not padded length (e.g., 16)
+        actual_valid_tokens = None
+        if forward_batch.extend_seq_lens_cpu is not None:
+            # Handle both list and tensor types
+            if isinstance(forward_batch.extend_seq_lens_cpu, list):
+                actual_valid_tokens = sum(forward_batch.extend_seq_lens_cpu)
+            else:
+                actual_valid_tokens = forward_batch.extend_seq_lens_cpu.sum().item()
+        elif forward_batch.seq_lens_cpu is not None:
+            # Fallback to seq_lens_cpu if extend_seq_lens_cpu is not available
+            if isinstance(forward_batch.seq_lens_cpu, list):
+                actual_valid_tokens = sum(forward_batch.seq_lens_cpu)
+            else:
+                actual_valid_tokens = forward_batch.seq_lens_cpu.sum().item()
+        
+        # Step 3: Truncate to actual valid tokens if padding exists
+        if actual_valid_tokens is not None and k_fp8_to_use.shape[0] > actual_valid_tokens:
+            logger.debug(
+                f"[Indexer PP+CP] Truncating due to padding: "
+                f"k_fp8.shape={k_fp8_to_use.shape}, "
+                f"actual_valid_tokens={actual_valid_tokens}, "
+                f"loc.shape={loc_to_use.shape}"
+            )
+            # Truncate to actual valid tokens
+            k_fp8_to_use = k_fp8_to_use[:actual_valid_tokens]
+            k_scale_to_use = k_scale_to_use[:actual_valid_tokens]
+            loc_to_use = loc_to_use[:actual_valid_tokens]
+        
+        # Step 4: Filter out loc=0 values (padding values)
+        # loc=0 should never be written to KV cache, as it would corrupt position 0
+        if loc_to_use.numel() > 0:
+            valid_mask = loc_to_use > 0
+            if not valid_mask.all():
+                num_invalid = (~valid_mask).sum().item()
+                logger.warning(
+                    f"[Indexer PP+CP] Filtering {num_invalid} invalid loc values "
+                    f"(<=0, padding tokens) from KV cache write. "
+                    f"loc_to_use min={loc_to_use.min().item()}, max={loc_to_use.max().item()}"
+                )
+                # Filter out invalid loc values
+                loc_to_use = loc_to_use[valid_mask]
+                k_fp8_to_use = k_fp8_to_use[valid_mask]
+                k_scale_to_use = k_scale_to_use[valid_mask]
+        
+        # Step 5: Final shape check and alignment
+        # Ensure all tensors have matching shapes
+        min_len = min(loc_to_use.shape[0], k_fp8_to_use.shape[0], k_scale_to_use.shape[0])
+        if min_len < loc_to_use.shape[0]:
+            logger.warning(
+                f"[Indexer PP+CP] Shape mismatch detected, truncating to min_len={min_len}: "
+                f"loc.shape={loc_to_use.shape}, "
+                f"k_fp8.shape={k_fp8_to_use.shape}, "
+                f"k_scale.shape={k_scale_to_use.shape}"
+            )
+            loc_to_use = loc_to_use[:min_len]
+            k_fp8_to_use = k_fp8_to_use[:min_len]
+            k_scale_to_use = k_scale_to_use[:min_len]
+        
+        # Step 6: Write to KV cache
+        if loc_to_use.numel() > 0:
+            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=loc_to_use,
+                index_k=k_fp8_to_use,
+                index_k_scale=k_scale_to_use,
+            )
+        else:
+            logger.warning(
+                f"[Indexer PP+CP] Skipping KV cache write: all tokens filtered out "
+                f"(likely all padding tokens)"
+            )
 
         weights = self._get_logits_head_gate(x, q_scale)
 

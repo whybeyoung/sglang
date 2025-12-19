@@ -3479,32 +3479,43 @@ class DeepseekV2ForCausalLM(nn.Module):
                     f"Reusing nsa_cp_metadata from PP0, cp_rank={self.cp_rank}, cp_size={self.cp_size}"
                 )
             elif pp_group.is_first_rank:
-                # PP0: create metadata based on input_ids
-                if cp_size_config is not None and cp_size_config != atten_tp_size:
-                    # True TP+CP mode: split based on atten_tp_size
-                    segment_num = atten_tp_size * 2
-                else:
-                    # Original mode: split based on cp_size
-                    segment_num = self.cp_size * 2
-                
-                cur_cp_seq_len = len(input_ids) // segment_num
-                # Debug: check each condition of can_cp_split
+                # PP0: create metadata based on input_ids (already padded to attn_tp_size multiple)
                 import logging
                 logger = logging.getLogger(__name__)
+                from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_mode1
                 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+                
+                # For Mode1: check if padded length is divisible by cp_size
+                # For Mode0: use segment_num calculation (zigzag mode)
+                if is_nsa_prefill_cp_mode1():
+                    # Mode1: token_idx % cp_size splitting
+                    # input_ids is already padded to attn_tp_size multiple
+                    # cp_split_and_rebuild_data requires input.shape[0] % cp_size == 0
+                    # So we check if padded length (len(input_ids)) is divisible by cp_size
+                    seq_len_for_cp_check = len(input_ids)
+                else:
+                    # Mode0: zigzag mode, use segment_num calculation
+                    if cp_size_config is not None and cp_size_config != atten_tp_size:
+                        # True TP+CP mode: split based on atten_tp_size
+                        segment_num = atten_tp_size * 2
+                    else:
+                        # Original mode: split based on cp_size
+                        segment_num = self.cp_size * 2
+                    seq_len_for_cp_check = len(input_ids) // segment_num
+                
                 is_cp_enabled = is_nsa_enable_prefill_cp()
                 is_context_parallel_extend = forward_batch.forward_mode.is_context_parallel_extend()
                 logger.debug(
-                    f"[CP Debug] Rank {self.cp_rank}: Checking can_cp_split conditions: "
-                    f"cur_cp_seq_len={cur_cp_seq_len} (seq_len={len(input_ids)}, segment_num={segment_num}), "
+                    f"[CP Debug PP0] Rank {self.cp_rank}: Checking can_cp_split: "
+                    f"seq_len_for_cp_check={seq_len_for_cp_check} (padded_len={len(input_ids)}), "
                     f"cp_size={self.cp_size}, use_nsa={self.use_nsa}, "
                     f"is_context_parallel_extend={is_context_parallel_extend}, "
                     f"is_nsa_enable_prefill_cp={is_cp_enabled}, "
-                    f"forward_mode={forward_batch.forward_mode}"
+                    f"is_mode1={is_nsa_prefill_cp_mode1()}, forward_mode={forward_batch.forward_mode}"
                 )
-                can_split = can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch)
+                can_split = can_cp_split(seq_len_for_cp_check, self.cp_size, self.use_nsa, forward_batch)
                 logger.debug(
-                    f"[CP Debug] Rank {self.cp_rank}: can_cp_split={can_split}"
+                    f"[CP Debug PP0] Rank {self.cp_rank}: can_cp_split={can_split}"
                 )
                 if can_split:
                     forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
@@ -3516,36 +3527,79 @@ class DeepseekV2ForCausalLM(nn.Module):
                         atten_tp_rank=atten_tp_rank if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
                     )
                     logger.debug(
-                        f"[CP Debug] Rank {self.cp_rank}: nsa_cp_metadata set, "
-                        f"cp_rank={self.cp_rank}, cp_size={self.cp_size}"
+                        f"[CP Debug PP0] Rank {self.cp_rank}: Created nsa_cp_metadata, "
+                        f"kv_len={len(input_ids)}, cp_rank={self.cp_rank}, cp_size={self.cp_size}"
                     )
                 else:
-                    # Log detailed reason why can_cp_split returned False
-                    # This is normal when sequence is too short (cur_cp_seq_len == 0)
-                    # CP will be disabled for this batch, which is fine
                     logger.debug(
-                        f"[CP Debug] Rank {self.cp_rank} (PP0): can_cp_split returned False "
-                        f"(CP disabled for this batch, likely sequence too short). "
-                        f"cur_cp_seq_len={cur_cp_seq_len}, cp_size={self.cp_size}, "
-                        f"use_nsa={self.use_nsa}, is_context_parallel_extend={is_context_parallel_extend}, "
-                        f"is_nsa_enable_prefill_cp={is_cp_enabled}, forward_mode={forward_batch.forward_mode}, "
-                        f"seq_len={len(input_ids)}, segment_num={segment_num}. "
-                        f"CP-related code will be skipped (this is normal)."
+                        f"[CP Debug PP0] Rank {self.cp_rank}: can_cp_split=False, skipping CP. "
+                        f"seq_len_for_cp_check={seq_len_for_cp_check}, padded_len={len(input_ids)}, "
+                        f"cp_size={self.cp_size}, is_mode1={is_nsa_prefill_cp_mode1()}"
                     )
             else:
-                # PP1: metadata should have been set by PP0, but it's missing
-                # This can happen if PP0's can_cp_split returned False (e.g., sequence too short)
-                # In this case, CP is not enabled for this batch, which is fine
-                # enable_prefill_cp will return False, so CP-related code won't execute
+                # PP1: Recreate metadata using extend_num_tokens (padded total length) and seq_lens_cpu
+                # This is independent from PP0, so we don't need to pass metadata between stages
                 import logging
                 logger = logging.getLogger(__name__)
-                logger.debug(
-                    f"[CP Debug] Rank {self.cp_rank} (PP stage {pp_group.rank_in_group}): "
-                    f"nsa_cp_metadata is None (CP not enabled for this batch, likely sequence too short). "
-                    f"This is normal and CP-related code will be skipped. "
-                    f"forward_mode={forward_batch.forward_mode}, "
-                    f"seq_lens_cpu={forward_batch.seq_lens_cpu}"
-                )
+                from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_mode1
+                from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+                
+                if forward_batch.extend_num_tokens is not None and forward_batch.seq_lens_cpu is not None:
+                    # Recreate metadata using the same logic as PP0
+                    kv_len = forward_batch.extend_num_tokens  # This is the padded total length
+                    seqs_len = forward_batch.seq_lens_cpu.tolist()
+                    
+                    # For Mode1: check if padded length is divisible by cp_size
+                    # For Mode0: use segment_num calculation (zigzag mode)
+                    if is_nsa_prefill_cp_mode1():
+                        # Mode1: check if extend_num_tokens is divisible by cp_size
+                        seq_len_for_cp_check = kv_len
+                    else:
+                        # Mode0: zigzag mode, use segment_num calculation
+                        if cp_size_config is not None and cp_size_config != atten_tp_size:
+                            segment_num = atten_tp_size * 2
+                        else:
+                            segment_num = self.cp_size * 2
+                        seq_len_for_cp_check = kv_len // segment_num
+                    
+                    is_cp_enabled = is_nsa_enable_prefill_cp()
+                    is_context_parallel_extend = forward_batch.forward_mode.is_context_parallel_extend()
+                    logger.debug(
+                        f"[CP Debug PP1] Rank {self.cp_rank} (PP stage {pp_group.rank_in_group}): "
+                        f"Recreating metadata: seq_len_for_cp_check={seq_len_for_cp_check} "
+                        f"(extend_num_tokens={kv_len}), cp_size={self.cp_size}, "
+                        f"is_mode1={is_nsa_prefill_cp_mode1()}, forward_mode={forward_batch.forward_mode}"
+                    )
+                    can_split = can_cp_split(seq_len_for_cp_check, self.cp_size, self.use_nsa, forward_batch)
+                    logger.debug(
+                        f"[CP Debug PP1] Rank {self.cp_rank}: can_cp_split={can_split}"
+                    )
+                    if can_split:
+                        forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                            kv_len,
+                            self.cp_rank,
+                            self.cp_size,
+                            seqs_len,
+                            atten_tp_size=atten_tp_size if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
+                            atten_tp_rank=atten_tp_rank if (cp_size_config is not None and cp_size_config != atten_tp_size) else None,
+                        )
+                        logger.debug(
+                            f"[CP Debug PP1] Rank {self.cp_rank}: Recreated nsa_cp_metadata, "
+                            f"kv_len={kv_len}, cp_rank={self.cp_rank}, cp_size={self.cp_size}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[CP Debug PP1] Rank {self.cp_rank}: can_cp_split=False, skipping CP. "
+                            f"seq_len_for_cp_check={seq_len_for_cp_check}, extend_num_tokens={kv_len}, "
+                            f"cp_size={self.cp_size}, is_mode1={is_nsa_prefill_cp_mode1()}"
+                        )
+                else:
+                    logger.debug(
+                        f"[CP Debug PP1] Rank {self.cp_rank} (PP stage {pp_group.rank_in_group}): "
+                        f"Cannot recreate metadata: missing extend_num_tokens or seq_lens_cpu. "
+                        f"extend_num_tokens={forward_batch.extend_num_tokens}, "
+                        f"seq_lens_cpu={forward_batch.seq_lens_cpu}, forward_mode={forward_batch.forward_mode}"
+                    )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
