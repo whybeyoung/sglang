@@ -1130,9 +1130,19 @@ class Indexer(CustomOp):
             else:
                 actual_valid_tokens = forward_batch.seq_lens_cpu.sum().item()
         
+        # Debug: log actual_valid_tokens calculation
+        logger.error(
+            f"[Indexer PP+CP Debug] actual_valid_tokens calculation: "
+            f"extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu}, "
+            f"seq_lens_cpu={forward_batch.seq_lens_cpu}, "
+            f"actual_valid_tokens={actual_valid_tokens}, "
+            f"k_fp8_to_use.shape={k_fp8_to_use.shape}, "
+            f"loc_to_use.shape={loc_to_use.shape}"
+        )
+        
         # Step 3: Truncate to actual valid tokens if padding exists
         if actual_valid_tokens is not None and k_fp8_to_use.shape[0] > actual_valid_tokens:
-            logger.debug(
+            logger.error(
                 f"[Indexer PP+CP] Truncating due to padding: "
                 f"k_fp8.shape={k_fp8_to_use.shape}, "
                 f"actual_valid_tokens={actual_valid_tokens}, "
@@ -1142,6 +1152,12 @@ class Indexer(CustomOp):
             k_fp8_to_use = k_fp8_to_use[:actual_valid_tokens]
             k_scale_to_use = k_scale_to_use[:actual_valid_tokens]
             loc_to_use = loc_to_use[:actual_valid_tokens]
+            logger.error(
+                f"[Indexer PP+CP] After truncation: "
+                f"k_fp8.shape={k_fp8_to_use.shape}, "
+                f"k_scale.shape={k_scale_to_use.shape}, "
+                f"loc.shape={loc_to_use.shape}"
+            )
         
         # Step 4: Filter out loc=0 values (padding values)
         # loc=0 should never be written to KV cache, as it would corrupt position 0
@@ -1174,6 +1190,14 @@ class Indexer(CustomOp):
             k_scale_to_use = k_scale_to_use[:min_len]
         
         # Step 6: Write to KV cache
+        logger.error(
+            f"[Indexer PP+CP] Final KV cache write: "
+            f"loc.shape={loc_to_use.shape}, "
+            f"k_fp8.shape={k_fp8_to_use.shape}, "
+            f"k_scale.shape={k_scale_to_use.shape}, "
+            f"loc.min={loc_to_use.min().item() if loc_to_use.numel() > 0 else 'N/A'}, "
+            f"loc.max={loc_to_use.max().item() if loc_to_use.numel() > 0 else 'N/A'}"
+        )
         if loc_to_use.numel() > 0:
             forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
