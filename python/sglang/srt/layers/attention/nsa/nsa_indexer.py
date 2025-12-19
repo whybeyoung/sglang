@@ -341,9 +341,9 @@ class Indexer(CustomOp):
                 )
                 logger.warning(
                     f"[Indexer CP Allgather] _get_k_bf16: key shape before={key_before_allgather_shape}, "
-                    f"after={key.shape}, forward_mode={forward_batch.forward_mode}, "
+                    f"after allgather={key.shape}, forward_mode={forward_batch.forward_mode}, "
                     f"nsa_cp_metadata={'set' if forward_batch.nsa_cp_metadata is not None else 'None'}, "
-                    f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}"
+                    f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}, cp_size={self.cp_size}"
                 )
             else:
                 logger.warning(
@@ -353,7 +353,12 @@ class Indexer(CustomOp):
                     f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp}"
                 )
         
+        key_before_rotate = key.shape
         key = rotate_activation(key)
+        logger.warning(
+            f"[Indexer CP Rotate] _get_k_bf16: key shape before rotate={key_before_rotate}, "
+            f"after rotate={key.shape}"
+        )
 
         return key
 
@@ -594,15 +599,29 @@ class Indexer(CustomOp):
 
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream, forward_batch=forward_batch)
+        
+        # Debug: log key shape before quantization
+        import logging
+        logger = logging.getLogger(__name__)
+        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
+        logger.warning(
+            f"[Indexer Debug MHA] After _get_k_bf16: key.shape={key.shape}, "
+            f"key.is_contiguous()={key.is_contiguous()}, "
+            f"x.shape={x.shape}"
+        )
+        
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+        
+        # Debug: log shapes after quantization
+        logger.warning(
+            f"[Indexer Debug MHA] After act_quant: k_fp8.shape={k_fp8.shape}, "
+            f"k_scale.shape={k_scale.shape}, key.shape={key.shape}"
+        )
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
         
         # Debug: log shapes before set_index_k_scale_buffer (MHA path)
-        import logging
-        logger = logging.getLogger(__name__)
-        from sglang.srt.layers.attention.nsa.utils import enable_prefill_cp
         logger.debug(
             f"[Indexer Debug MHA] Before set_index_k_scale_buffer: "
             f"loc.shape={forward_batch.out_cache_loc.shape}, "
