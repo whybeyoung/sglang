@@ -708,7 +708,11 @@ class SchedulerDisaggregationPrefillMixin:
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
-                seq_len = len(req.fill_ids)
+                # In PD mode with CP, state_indices should only include origin_input_ids,
+                # not output_ids, because decode side only pre-allocates indexer cache
+                # for origin_input_ids. Output tokens are generated during decode.
+                # Indexer cache is written for the same range as KV cache (origin_input_ids).
+                seq_len = len(req.origin_input_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
