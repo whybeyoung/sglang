@@ -1399,6 +1399,13 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            logger.info(
+                f"[handle_generate_request] Creating Req: rid={recv_req.rid}, "
+                f"disagg_mode={self.disaggregation_mode}, "
+                f"input_ids_len={len(recv_req.input_ids) if recv_req.input_ids else 0}, "
+                f"input_ids[:10]={recv_req.input_ids[:10] if recv_req.input_ids and len(recv_req.input_ids) >= 10 else (recv_req.input_ids if recv_req.input_ids else [])}, "
+                f"input_embeds={recv_req.input_embeds is not None}"
+            )
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1428,6 +1435,11 @@ class Scheduler(
                 dllm_config=self.dllm_config,
             )
             req.tokenizer = self.tokenizer
+            logger.info(
+                f"[handle_generate_request] After Req creation: "
+                f"req.origin_input_ids_len={len(req.origin_input_ids)}, "
+                f"req.origin_input_ids[:10]={req.origin_input_ids[:10] if len(req.origin_input_ids) >= 10 else req.origin_input_ids}"
+            )
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode

@@ -552,7 +552,7 @@ class DecodePreallocQueue:
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
-                logger.info(f"NSA state_indices calculation: seq_len={seq_len}")
+                logger.info(f"NSA state_indices calculation: seq_len={seq_len},origin_input_ids={decode_req.req.origin_input_ids}")
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
