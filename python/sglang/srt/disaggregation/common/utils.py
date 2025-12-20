@@ -29,7 +29,7 @@ def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
 ) -> Tuple[List[npt.NDArray[np.int32]], List[npt.NDArray[np.int32]]]:
     """Vectorised NumPy implementation."""
-    if src_indices.size == 0:
+    if src_indices.size == 0 or dst_indices.size == 0:
         return [], []
 
     brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
