@@ -277,6 +277,7 @@ class MooncakeKVManager(CommonKVManager):
         This method is used by both send_kvcache (full pool) and maybe_send_extra.
         """
         # Group by indices for optimization
+        logger.info(f"grouping concurrent contiguous: prefill_data_indices={prefill_data_indices}, dst_data_indices={dst_data_indices}")
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
         )

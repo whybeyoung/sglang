@@ -32,6 +32,7 @@ def group_concurrent_contiguous(
     if src_indices.size == 0 or dst_indices.size == 0:
         return [], []
 
+
     brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
     src_groups = np.split(src_indices, brk)
     dst_groups = np.split(dst_indices, brk)
