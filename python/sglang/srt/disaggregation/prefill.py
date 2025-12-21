@@ -109,13 +109,6 @@ class PrefillBootstrapQueue:
         self.transfer_backend = transfer_backend
         self.kv_manager = self._init_kv_manager()
 
-        if self.scheduler.tp_worker.is_hybrid_swa:
-            # FIXME: current SWA allocation allocate full kv cache size in prefill
-            self.max_total_num_tokens = min(
-                self.max_total_num_tokens,
-                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
-            )
-
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
@@ -715,7 +708,11 @@ class SchedulerDisaggregationPrefillMixin:
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
-                seq_len = len(req.fill_ids)
+                # In PD mode with CP, state_indices should only include origin_input_ids,
+                # not output_ids, because decode side only pre-allocates indexer cache
+                # for origin_input_ids. Output tokens are generated during decode.
+                # Indexer cache is written for the same range as KV cache (origin_input_ids).
+                seq_len = len(req.origin_input_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
