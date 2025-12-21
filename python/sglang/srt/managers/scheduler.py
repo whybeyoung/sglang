@@ -1604,6 +1604,15 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        # Debug: log origin_input_ids before adding to queue
+        logger.info(
+            f"[_add_request_to_queue] Before adding: rid={req.rid}, "
+            f"origin_input_ids_len={len(req.origin_input_ids)}, "
+            f"origin_input_ids[:10]={req.origin_input_ids[:10] if len(req.origin_input_ids) >= 10 else req.origin_input_ids}, "
+            f"disagg_mode={self.disaggregation_mode}, "
+            f"dp_rank={getattr(self, 'dp_rank', None)}, tp_rank={getattr(self, 'tp_rank', None)}"
+        )
+        
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
