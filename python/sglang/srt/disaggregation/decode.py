@@ -316,6 +316,14 @@ class DecodePreallocQueue:
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
+        # Debug: log origin_input_ids when adding to queue
+        logger.info(
+            f"[DecodePreallocQueue.add] Adding request: rid={req.rid}, "
+            f"origin_input_ids_len={len(req.origin_input_ids)}, "
+            f"origin_input_ids[:10]={req.origin_input_ids[:10] if len(req.origin_input_ids) >= 10 else req.origin_input_ids}, "
+            f"dp_rank={self.scheduler.dp_rank}, tp_rank={self.tp_rank}"
+        )
+        
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
