@@ -107,6 +107,15 @@ def validate_input_length(
     Returns:
         Error message if validation fails, None if successful
     """
+    # Debug: log before validation
+    if len(req.origin_input_ids) > 100 or len(req.origin_input_ids) == 1:
+        logger.info(
+            f"[validate_input_length] Before validation: rid={req.rid}, "
+            f"origin_input_ids_len={len(req.origin_input_ids)}, "
+            f"max_req_input_len={max_req_input_len}, "
+            f"allow_auto_truncate={allow_auto_truncate}"
+        )
+    
     if len(req.origin_input_ids) >= max_req_input_len:
         if allow_auto_truncate:
             logger.warning(
@@ -115,6 +124,12 @@ def validate_input_length(
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
             req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            # Debug: log after truncation
+            logger.info(
+                f"[validate_input_length] After truncation: rid={req.rid}, "
+                f"origin_input_ids_len={len(req.origin_input_ids)}, "
+                f"max_req_input_len={max_req_input_len}"
+            )
             return None
         else:
             error_msg = (
@@ -124,6 +139,14 @@ def validate_input_length(
             )
             return error_msg
 
+    # Debug: log after validation (no truncation)
+    if len(req.origin_input_ids) > 100 or len(req.origin_input_ids) == 1:
+        logger.info(
+            f"[validate_input_length] After validation (no truncation): rid={req.rid}, "
+            f"origin_input_ids_len={len(req.origin_input_ids)}, "
+            f"max_req_input_len={max_req_input_len}"
+        )
+    
     return None
 
 
