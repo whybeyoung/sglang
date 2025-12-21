@@ -510,7 +510,24 @@ class DecodePreallocQueue:
                 break
 
             allocatable_tokens -= required_tokens_for_request
+            
+            # Debug: log origin_input_ids before _pre_alloc
+            logger.info(
+                f"[pop_preallocated] Before _pre_alloc: rid={decode_req.req.rid}, "
+                f"origin_input_ids_len={len(decode_req.req.origin_input_ids)}, "
+                f"origin_input_ids[:10]={decode_req.req.origin_input_ids[:10] if len(decode_req.req.origin_input_ids) >= 10 else decode_req.req.origin_input_ids}, "
+                f"dp_rank={self.scheduler.dp_rank}, tp_rank={self.tp_rank}"
+            )
+            
             self._pre_alloc(decode_req.req)
+            
+            # Debug: log origin_input_ids after _pre_alloc
+            logger.info(
+                f"[pop_preallocated] After _pre_alloc: rid={decode_req.req.rid}, "
+                f"origin_input_ids_len={len(decode_req.req.origin_input_ids)}, "
+                f"kv_allocated_len={decode_req.req.kv_allocated_len}, "
+                f"dp_rank={self.scheduler.dp_rank}, tp_rank={self.tp_rank}"
+            )
 
             kv_indices = (
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
@@ -534,14 +551,6 @@ class DecodePreallocQueue:
             elif isinstance(self.token_to_kv_pool, SWAKVPool):
                 # SWA hybrid model: send decode-side SWA window indices
                 seq_len = len(decode_req.req.origin_input_ids)
-                # Fallback: if origin_input_ids is 1 but kv_allocated_len is large, use kv_allocated_len
-                if seq_len == 1 and decode_req.req.kv_allocated_len > 1:
-                    logger.warning(
-                        f"[SWA state_indices] origin_input_ids length is 1 but kv_allocated_len is {decode_req.req.kv_allocated_len}. "
-                        f"Using kv_allocated_len as fallback. rid={decode_req.req.rid}, "
-                        f"dp_rank={self.scheduler.dp_rank}, tp_rank={self.tp_rank}"
-                    )
-                    seq_len = decode_req.req.kv_allocated_len
                 window_size = self.scheduler.sliding_window_size
 
                 window_start = max(0, seq_len - window_size)
@@ -560,6 +569,12 @@ class DecodePreallocQueue:
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
+                logger.info(
+                    f"NSA state_indices calculation: seq_len={seq_len}, "
+                    f"origin_input_ids_len={len(decode_req.req.origin_input_ids)}, "
+                    f"kv_allocated_len={decode_req.req.kv_allocated_len}, "
+                    f"extend_input_len={decode_req.req.extend_input_len}"
+                )
                 # Fallback: if origin_input_ids is 1 but kv_allocated_len is large, use kv_allocated_len
                 # This handles the case where origin_input_ids was truncated/optimized for long sequences
                 if seq_len == 1 and decode_req.req.kv_allocated_len > 1:
@@ -569,11 +584,16 @@ class DecodePreallocQueue:
                         f"dp_rank={self.scheduler.dp_rank}, tp_rank={self.tp_rank}"
                     )
                     seq_len = decode_req.req.kv_allocated_len
-                logger.info(
-                    f"NSA state_indices calculation: seq_len={seq_len}, "
-                    f"origin_input_ids_len={len(decode_req.req.origin_input_ids)}, "
-                    f"kv_allocated_len={decode_req.req.kv_allocated_len}"
-                )
+                elif seq_len == 1 and decode_req.req.kv_allocated_len == 1:
+                    # Both are 1, but extend_input_len might have the correct value
+                    if decode_req.req.extend_input_len > 1:
+                        logger.warning(
+                            f"[NSA state_indices] origin_input_ids and kv_allocated_len are both 1, "
+                            f"but extend_input_len is {decode_req.req.extend_input_len}. "
+                            f"Using extend_input_len as fallback. rid={decode_req.req.rid}, "
+                            f"dp_rank={self.scheduler.dp_rank}, tp_rank={self.tp_rank}"
+                        )
+                        seq_len = decode_req.req.extend_input_len
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
@@ -672,6 +692,15 @@ class DecodePreallocQueue:
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
+        # Debug: log origin_input_ids before allocation
+        logger.info(
+            f"[_pre_alloc] Before allocation: rid={req.rid}, "
+            f"origin_input_ids_len={len(req.origin_input_ids)}, "
+            f"origin_input_ids[:10]={req.origin_input_ids[:10] if len(req.origin_input_ids) >= 10 else req.origin_input_ids}, "
+            f"output_ids_len={len(req.output_ids)}, "
+            f"dp_rank={self.scheduler.dp_rank}, tp_rank={self.tp_rank}"
+        )
+        
         if isinstance(self.req_to_token_pool, HybridMambaDecodeReqToTokenPool):
             req_pool_indices = self.req_to_token_pool.alloc(1, [req])
         else:
@@ -687,6 +716,12 @@ class DecodePreallocQueue:
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
+        
+        logger.info(
+            f"[_pre_alloc] After calculation: rid={req.rid}, "
+            f"fill_len={fill_len}, kv_allocated_len={req.kv_allocated_len}, "
+            f"origin_input_ids_len={len(req.origin_input_ids)}"
+        )
         if self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
