@@ -65,6 +65,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     enable_prefill_cp,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_mode1,
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
@@ -3173,6 +3174,8 @@ class DeepseekV2Model(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            if is_nsa_prefill_cp_mode1():
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
@@ -3256,6 +3259,8 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            if is_nsa_prefill_cp_mode1():
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -3398,14 +3403,19 @@ class DeepseekV2ForCausalLM(nn.Module):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+            if self.nsa_enable_prefill_cp and is_nsa_prefill_cp_mode1():
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            result = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+            if self.nsa_enable_prefill_cp and is_nsa_prefill_cp_mode1():
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+            return result
         else:
             return hidden_states
 

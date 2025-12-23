@@ -395,6 +395,9 @@ class ForwardBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # Request IDs for logging/debugging
+    rids: Optional[List[str]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -439,6 +442,7 @@ class ForwardBatch:
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            rids=[req.rid for req in batch.reqs] if hasattr(batch, 'reqs') and batch.reqs else None,
         )
         device = model_runner.device
 
