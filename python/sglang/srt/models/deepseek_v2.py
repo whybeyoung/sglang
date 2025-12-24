@@ -3175,7 +3175,9 @@ class DeepseekV2Model(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
             if is_nsa_prefill_cp_mode1():
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                # Skip synchronization during CUDA graph capture
+                if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.synchronize()
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
@@ -3260,7 +3262,9 @@ class DeepseekV2Model(nn.Module):
                 torch.cuda.current_stream(),
             )
             if is_nsa_prefill_cp_mode1():
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                # Skip synchronization during CUDA graph capture
+                if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.synchronize()
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -3404,7 +3408,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
             if self.nsa_enable_prefill_cp and is_nsa_prefill_cp_mode1():
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                # Skip synchronization during CUDA graph capture
+                if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.synchronize()
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -3414,7 +3420,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
             if self.nsa_enable_prefill_cp and is_nsa_prefill_cp_mode1():
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                # Skip synchronization during CUDA graph capture
+                if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.synchronize()
             return result
         else:
             return hidden_states
