@@ -29,3 +29,7 @@ class CacheInitParams:
     pp_rank: int = 0
     pp_size: int = 1
     is_local_attention: bool = False
+
+    # For SWAChunkCache
+    sliding_window_size: Optional[int] = None
+    attention_chunk_size: Optional[int] = None
