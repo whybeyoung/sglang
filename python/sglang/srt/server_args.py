@@ -187,6 +187,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
+    "tilelang",
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
@@ -308,7 +309,6 @@ class ServerArgs:
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
-    hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
@@ -483,6 +483,10 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+
+    # Hierarchical sparse attention
+    hierarchical_sparse_attention_extra_config: Optional[str] = None
+
     # LMCache
     enable_lmcache: bool = False
 
@@ -2845,15 +2849,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",
-            nargs="?",
-            const=0.5,
-            type=float,
-            default=ServerArgs.hybrid_kvcache_ratio,
-            help=(
-                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
-                "(0.0 = pure uniform: swa_size / full_size = 1)"
-                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
-            ),
+            action=DeprecatedAction,
+            help="Note: --hybrid-kvcache-ratio is deprecated now. Please use --swa-full-tokens-ratio instead.",
         )
         parser.add_argument(
             "--swa-full-tokens-ratio",
@@ -3417,6 +3414,7 @@ class ServerArgs:
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
             "'aiter' (ROCm only). "
+            "'tilelang' (optimal for Ada and Hopper (decode)). "
             "NOTE: This replaces the deprecated environment variables "
             "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
         )
@@ -3816,6 +3814,18 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
         )
+
+        # Hierarchical sparse attention
+        parser.add_argument(
+            "--hierarchical-sparse-attention-extra-config",
+            type=str,
+            default=ServerArgs.hierarchical_sparse_attention_extra_config,
+            help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
+            "Required fields: algorithm (str), backend (str). "
+            "All other fields are algorithm-specific and passed to the algorithm constructor. "
+            'Example: \'{"algorithm": "quest", "backend": "flashattention", "sparsity_ratio": 0.7, "min_sparse_prompt_len": 2048}\'',
+        )
+
         # LMCache
         parser.add_argument(
             "--enable-lmcache",

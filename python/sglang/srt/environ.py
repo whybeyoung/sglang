@@ -318,6 +318,11 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
 
+    # TileLang GEMM
+    SGLANG_TILELANG_GEMM_CONFIG_DIR = EnvStr("")
+    SGLANG_TILELANG_GEMM_PRECOMPILE = EnvBool(True)
+    SGLANG_IN_TILELANG_PRECOMPILE_STAGE = EnvBool(False)
+
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
@@ -418,6 +423,9 @@ class Envs:
 
     # Tokenizer
     SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+
+    # TokenizerManager
+    SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
     # fmt: on
 
