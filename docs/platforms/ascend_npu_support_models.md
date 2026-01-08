@@ -1,7 +1,7 @@
 # Support Models on Ascend NPU
 
 This section describes the models supported on the Ascend NPU, including Large Language Models, Multimodal Language
-Models, Embedding Models, and Rerank Models. Mainstream DeepSeek/Qwen/GLM series are included.
+Models, Embedding Models, Reward Models and Rerank Models. Mainstream DeepSeek/Qwen/GLM series are included.
 You are welcome to enable various models based on your business requirements.
 
 ## Large Language Models
@@ -27,7 +27,7 @@ You are welcome to enable various models based on your business requirements.
 | allenai/OLMoE-1B-7B-0924                  | OLMoE                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | stabilityai/stablelm-2-1_6b               | StableLM                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | CohereForAI/c4ai-command-r-v01            | Command-R                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| huihui-ai/grok-2                          | Grok                           |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
+| huihui-ai/grok-2                          | Grok                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ZhipuAI/chatglm2-6b                       | ChatGLM                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Shanghai_AI_Laboratory/internlm2-7b       | InternLM 2                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct      | ExaONE 3                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -40,10 +40,10 @@ You are welcome to enable various models based on your business requirements.
 | inclusionAI/Ling-lite                     | Ling                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ibm-granite/granite-3.1-8b-instruct       | Granite                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ibm-granite/granite-3.0-3b-a800m-instruct | Granite MoE                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| databricks/dbrx-instruct                  | DBRX (Databricks)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| baichuan-inc/Baichuan2-13B-Chat           | Baichuan 2 (7B, 13B)           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| baidu/ERNIE-4.5-21B-A3B-PT                | ERNIE-4.5 (4.5, 4.5MoE series) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| openbmb/MiniCPM3-4B                       | MiniCPM (v3, 4B)               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| databricks/dbrx-instruct                  | DBRX (Databricks)              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| baichuan-inc/Baichuan2-13B-Chat           | Baichuan 2 (7B, 13B)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| baidu/ERNIE-4.5-21B-A3B-PT                | ERNIE-4.5 (4.5, 4.5MoE series) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| openbmb/MiniCPM3-4B                       | MiniCPM (v3, 4B)               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | openai/gpt-oss-120b                       | GPTOSS                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Multimodal Language Models
@@ -75,7 +75,7 @@ You are welcome to enable various models based on your business requirements.
 |-------------------------------------------|--------------------------|------------------------------------------|:----------------------------------------:|
 | 	intfloat/e5-mistral-7b-instruct          | E5 (Llama/Mistral based) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	iic/gte_Qwen2-1.5B-instruct              | GTE-Qwen2                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| 	Qwen/Qwen3-Embedding-8B                  | Qwen3-Embedding          | **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| 	Qwen/Qwen3-Embedding-8B                  | Qwen3-Embedding          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	Alibaba-NLP/gme-Qwen2-VL-2B-Instruct     | GME (Multimodal)         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	AI-ModelScope/clip-vit-large-patch14-336 | CLIP                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	BAAI/bge-large-en-v1.5                   | BGE                      | **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
@@ -92,6 +92,6 @@ You are welcome to enable various models based on your business requirements.
 
 ## Rerank Models
 
-| Models                  | Model Family |              A2 Supported              |              A3 Supported              |
-|-------------------------|--------------|:--------------------------------------:|:--------------------------------------:|
-| BAAI/bge-reranker-v2-m3 | BGE-Reranker | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Models                  | Model Family |               A2 Supported               |               A3 Supported               |
+|-------------------------|--------------|:----------------------------------------:|:----------------------------------------:|
+| BAAI/bge-reranker-v2-m3 | BGE-Reranker | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
