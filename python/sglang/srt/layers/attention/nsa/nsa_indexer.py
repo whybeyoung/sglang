@@ -173,7 +173,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
@@ -207,10 +207,21 @@ class Indexer(MultiPlatformOp):
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
-        weights = weights * self.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-        return weights
+        if not is_npu():
+            from sglang.srt.layers.attention.nsa.triton_kernel import fused_weights_proj
+
+            weights = fused_weights_proj(
+                x,
+                self.weights_proj.weight,
+                q_scale.squeeze(-1).contiguous(),
+                self.softmax_scale * self.n_heads**-0.5,
+            )
+            return weights.unsqueeze(-1)
+        else:
+            weights, _ = self.weights_proj(x.float())
+            weights = weights * self.n_heads**-0.5
+            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+            return weights
 
     def _get_q_k_bf16(
         self,

@@ -134,3 +134,154 @@ def act_quant(
     )
 
     return y, s
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 128, "SPLIT_K": 16},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128, "SPLIT_K": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 128, "SPLIT_K": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "SPLIT_K": 4},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "SPLIT_K": 4},
+            num_stages=2,
+            num_warps=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _fused_weights_proj_kernel(
+    X_ptr,
+    W_ptr,
+    Out_ptr,
+    Q_Scale_ptr,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_wn,
+    stride_wk,
+    stride_outm,
+    stride_outn,
+    softmax_scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    # Pointers to X and W
+    # X: [M, K], W: [N, K]
+    # Out: [M, N]
+    
+    # Calculate ranges
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Split K dimension
+    total_k = K
+    k_chunk = tl.cdiv(total_k, SPLIT_K)
+    k_start = pid_k * k_chunk
+    k_end = tl.minimum(k_start + k_chunk, total_k)
+    
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Masks
+    mask_m = rm < M
+    mask_n = rn < N
+    
+    # Pointers
+    # x_ptrs = X_ptr + (rm[:, None] * stride_xm + rk[None, :] * stride_xk)
+    # w_ptrs = W_ptr + (rn[:, None] * stride_wn + rk[None, :] * stride_wk)
+    
+    # Loop over K
+    for k in range(k_start, k_end, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        mask_k = rk < k_end # Check against k_end which is capped at total_k
+        
+        # Load blocks
+        # x shape: [BLOCK_M, BLOCK_K]
+        x_ptrs = X_ptr + (rm[:, None] * stride_xm + rk[None, :] * stride_xk)
+        x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        
+        # w shape: [BLOCK_N, BLOCK_K]
+        w_ptrs = W_ptr + (rn[:, None] * stride_wn + rk[None, :] * stride_wk)
+        w = tl.load(w_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+        
+        # Dot product
+        # x: [M, K], w: [N, K]. dot(x, w.T)
+        acc += tl.dot(x, w.T)
+        
+    # Apply scales
+    # q_scale: [M]
+    qs_ptrs = Q_Scale_ptr + rm
+    qs = tl.load(qs_ptrs, mask=mask_m, other=0.0)
+    
+    acc = acc * qs[:, None] * softmax_scale
+    
+    # Store with atomic add
+    out_ptrs = Out_ptr + (rm[:, None] * stride_outm + rn[None, :] * stride_outn)
+    tl.atomic_add(out_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+def fused_weights_proj(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    q_scale: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """
+    Fused implementation of:
+    1. x.float() @ weights.T
+    2. * q_scale
+    3. * softmax_scale
+    
+    x: [M, K] (bf16/fp16/fp32)
+    weights: [N, K] (bf16/fp16/fp32)
+    q_scale: [M] (fp32)
+    """
+    M, K = x.shape
+    N = weights.shape[0]
+    assert weights.shape[1] == K
+    
+    # Output buffer (zeroed for atomic add)
+    out = torch.zeros((M, N), dtype=torch.float32, device=x.device)
+    
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+        META['SPLIT_K']
+    )
+    
+    _fused_weights_proj_kernel[grid](
+        x, weights, out, q_scale,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weights.stride(0), weights.stride(1),
+        out.stride(0), out.stride(1),
+        softmax_scale,
+    )
+    
+    return out
