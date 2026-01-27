@@ -8,6 +8,7 @@ import torch
 from einops import rearrange
 
 from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
@@ -15,6 +16,7 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_fp8_fnuz = is_fp8_fnuz()
 if _is_cuda:
     try:
         import deep_gemm
@@ -83,6 +85,11 @@ class BaseIndexerMetadata(ABC):
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         """
         Return: seq lens for each batch.
+        """
+
+    def get_nsa_extend_len_cpu(self) -> List[int]:
+        """
+        Return: extend seq lens for each batch.
         """
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
@@ -186,7 +193,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16,
+            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
@@ -220,6 +227,8 @@ class Indexer(MultiPlatformOp):
 
     @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _project_and_scale_head_gates(self, x: torch.Tensor):
+        if _is_hip:
+            x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
         weights = weights.float()
         weights = weights * self.n_heads**-0.5
@@ -227,6 +236,8 @@ class Indexer(MultiPlatformOp):
 
     @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
+        if _is_hip:
+            x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
         weights = weights.float()
         weights = weights * self.n_heads**-0.5
@@ -385,6 +396,9 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
+        # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
+        # and it is necessary to extract the actual q length.
+        q_offset = sum(metadata.get_nsa_extend_len_cpu())
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
@@ -411,9 +425,9 @@ class Indexer(MultiPlatformOp):
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8[:q_offset],
                 kv_cache_fp8,
-                weights,
+                weights[:q_offset],
                 seqlens_32,
                 block_tables,
                 schedule_metadata,
@@ -423,6 +437,16 @@ class Indexer(MultiPlatformOp):
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
+        # Restore possible padding exist in the hidden states.
+        if not _is_hip and q_offset < q_fp8.shape[0]:
+            pad_len = q_fp8.shape[0] - q_offset
+            padding = torch.full(
+                (pad_len, topk_result.shape[1]),
+                -1,
+                dtype=topk_result.dtype,
+                device=topk_result.device,
+            )
+            topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
     def _should_chunk_mqa_logits(
@@ -500,8 +524,10 @@ class Indexer(MultiPlatformOp):
             )
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
-
-        k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+        if _is_fp8_fnuz:
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fnuz)
+        else:
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks, ke = metadata.get_indexer_kvcache_range()
@@ -565,9 +591,9 @@ class Indexer(MultiPlatformOp):
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
-                    logits = fp8_mqa_logits(
+                    logits_chunk = fp8_mqa_logits(
                         q_fp8[start:end],
-                        kv_fp8,
+                        kv,
                         scale,
                         weights[start:end],
                         ks[start:end],
@@ -997,11 +1023,12 @@ class Indexer(MultiPlatformOp):
                             .view(m, ng, group)
                             .mul_(x_s.to(torch.float32).unsqueeze(-1))
                             .view(m, n)
+                            .to(torch.bfloat16)
                         )
                     else:
-                        x_for_gate = x_q.to(torch.float32)
+                        x_for_gate = x_q.to(torch.bfloat16)
                 else:
-                    x_for_gate = x_q.to(torch.float32)
+                    x_for_gate = x_q.to(torch.bfloat16)
             else:
                 x_for_gate = x
 
