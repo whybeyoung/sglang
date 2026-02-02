@@ -228,7 +228,7 @@ def render_message(
             raise DS32EncodingError(f"Invalid messages at {index}:\n{assistant_msg}")
 
         tool_call_order = index - prev_assistant_idx
-        assistant_tool_calls = assistant_msg.get("tool_calls")
+        assistant_tool_calls = assistant_msg.get("tool_calls",[])
         if not (assistant_tool_calls and len(assistant_tool_calls) >= tool_call_order):
             raise DS32EncodingError("No tool calls but found tool output")
 

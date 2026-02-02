@@ -49,6 +49,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -385,6 +386,44 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
+
+            for msg in messages:
+                if isinstance(msg.get("content"), list):
+                    text_parts = []
+                    for chunk in msg["content"]:
+                        if isinstance(chunk, dict):
+                            chunk_type = chunk.get("type")
+                            if chunk_type == "text":
+                                text_parts.append(chunk["text"])
+                            elif chunk_type == "image_url":
+                                image_obj = chunk.get("image_url") or {}
+                                mdp = image_obj.get("max_dynamic_patch", None)
+                                image_data.append(
+                                    ImageData(
+                                        url=image_obj["url"],
+                                        detail=image_obj.get("detail", "auto"),
+                                        max_dynamic_patch=mdp,
+                                    )
+                                )
+                                if chunk.get("modalities"):
+                                    modalities.append(chunk.get("modalities"))
+                            elif chunk_type == "video_url":
+                                video_obj = chunk.get("video_url") or {}
+                                mdp = video_obj.get("max_dynamic_patch", None)
+                                if mdp is None:
+                                    video_data.append(chunk["video_url"]["url"])
+                                else:
+                                    video_data.append(
+                                        {
+                                            "url": video_obj["url"],
+                                            "max_dynamic_patch": mdp,
+                                        }
+                                    )
+                                if chunk.get("modalities"):
+                                    modalities.append(chunk.get("modalities"))
+                            elif chunk_type == "audio_url":
+                                audio_data.append(chunk["audio_url"]["url"])
+                    msg["content"] = " ".join(text_parts) if text_parts else ""
 
             # Handle continue_final_message: separate final assistant message
             messages, assistant_prefix = self._handle_last_assistant_message(
