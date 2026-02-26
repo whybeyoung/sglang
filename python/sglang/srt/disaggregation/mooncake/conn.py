@@ -891,8 +891,11 @@ class MooncakeKVManager(CommonKVManager):
                                         endpoint, dst_port, room, status, local_rank
                                     )
                     else:
-                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
-                        # Dummy request does not need to sync status to decode endpoint
+                        # Dummy request means the decode instance is not used,
+                        # so its status can be marked as success directly.
+                        # Keep the membership guard to avoid resurrecting a
+                        # request that has already been cleared concurrently.
+                        # Dummy request does not need to sync status to decode endpoint.
                         if kv_chunk.is_last and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
@@ -1038,12 +1041,12 @@ class MooncakeKVManager(CommonKVManager):
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
-        is_last: bool,
+        is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
+        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         if (
             bootstrap_room not in self.request_status
@@ -1057,7 +1060,11 @@ class MooncakeKVManager(CommonKVManager):
         if bootstrap_room not in self.transfer_infos:
             # This means that the current rank is a dummy rank for this request,
             # and it has already been marked as success, so there is no need to
-            # add further chunks into the transfer queue.
+            # add further chunks into the transfer queue. We still guard on
+            # request_status membership to avoid recreating terminal status for
+            # requests that have already been cleared on this rank.
+            if is_last_chunk and bootstrap_room in self.request_status:
+                self.update_status(bootstrap_room, KVPoll.Success)
             return
 
         # NOTE(shangming): sharding according to the dst_infos to make sure
@@ -1072,7 +1079,7 @@ class MooncakeKVManager(CommonKVManager):
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
                 index_slice=index_slice,
-                is_last=is_last,
+                is_last=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
             )
@@ -1134,21 +1141,21 @@ class MooncakeKVSender(CommonKVSender):
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
-        is_last = self.curr_idx == self.num_kv_indices
+        is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if not is_last:
+        if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
                 index_slice,
-                False,
+                is_last_chunk=False,
             )
         else:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
                 index_slice,
-                True,
+                is_last_chunk=is_last_chunk,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
             )

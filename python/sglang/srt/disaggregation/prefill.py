@@ -25,6 +25,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -49,12 +50,33 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+
+def poll_and_all_reduce_attn_groups(
+    pollers,
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: Optional[dist.ProcessGroup] = None,
+):
+    # First sync across CP ranks (same attn_tp shard).
+    polls = poll_and_all_reduce(pollers, attn_cp_cpu_group)
+    # Then sync across attn-TP ranks so all TPxCP participants in one DP shard
+    # observe the same status transitions.
+    if (
+        attn_tp_cpu_group is not None
+        and dist.get_world_size(group=attn_tp_cpu_group) > 1
+    ):
+        tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+        dist.all_reduce(
+            tensor_to_reduce,
+            op=dist.ReduceOp.MIN,
+            group=attn_tp_cpu_group,
+        )
+        polls = tensor_to_reduce.tolist()
+    return polls
 
 
 def release_req_to_metadata_buffer(
@@ -93,7 +115,7 @@ class PrefillBootstrapQueue:
         tp_size: int,
         gpu_id: int,
         bootstrap_port: int,
-        gloo_group: ProcessGroup,
+        gloo_group: dist.ProcessGroup,
         max_total_num_tokens: int,
         decode_tp_size: int,
         decode_dp_size: int,
@@ -269,8 +291,10 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = poll_and_all_reduce(
-            [req.disagg_kv_sender for req in self.queue], self.gloo_group
+        polls = poll_and_all_reduce_attn_groups(
+            [req.disagg_kv_sender for req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -553,13 +577,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
-        polls = poll_and_all_reduce(
+        polls = poll_and_all_reduce_attn_groups(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
-        # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
 
             if rids_to_check is not None:
@@ -621,8 +645,9 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Used by PP, get the transferred rids but **do not pop**
         """
-        polls = poll_and_all_reduce(
+        polls = poll_and_all_reduce_attn_groups(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
@@ -740,4 +765,5 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
+
         req.disagg_kv_sender.send(page_indices, state_indices)

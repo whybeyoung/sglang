@@ -28,6 +28,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
@@ -79,8 +81,18 @@ class CommonKVManager(BaseKVManager):
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_cp_size = get_attention_cp_size()
+        self.attn_cp_rank = get_attention_cp_rank()
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
+        # For MLA + CP prefill, a single authoritative CP rank per attn-TP rank
+        # is enough because KV is already rebuilt to full sequence on each CP rank.
+        self.skip_register_prefill = (
+            disaggregation_mode == DisaggregationMode.PREFILL
+            and is_mla_backend
+            and self.attn_cp_size > 1
+            and self.attn_cp_rank != 0
+        )
         self.system_dp_size = (
             1 if server_args.enable_dp_attention else server_args.dp_size
         )
@@ -104,7 +116,8 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.register_to_bootstrap()
+            if not self.skip_register_prefill:
+                self.register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -244,7 +257,6 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "load_balance_method": self.server_args.load_balance_method,
         }
-
         try:
             response = requests.put(url, json=payload, timeout=5)
             if response.status_code == 200:
@@ -328,9 +340,17 @@ class CommonKVSender(BaseKVSender):
         self.bootstrap_server_url = bootstrap_addr
         # inner state
         self.curr_idx = 0
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        initial_status = KVPoll.Bootstrapping
         if (
-            self.kv_mgr.server_args.dp_size > 1
+            self.kv_mgr.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.kv_mgr.skip_register_prefill
+        ):
+            # Non-authoritative CP ranks are dummy participants.
+            initial_status = KVPoll.WaitingForInput
+        self.kv_mgr.update_status(self.bootstrap_room, initial_status)
+        if (
+            not self.kv_mgr.skip_register_prefill
+            and self.kv_mgr.server_args.dp_size > 1
             and self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room"
         ):
             self._register_prefill_dp_rank()
