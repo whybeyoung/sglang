@@ -261,10 +261,14 @@ def compute_dp_attention_local_info(
     return local_attn_tp_rank, local_attn_tp_size, local_attn_dp_rank
 
 
+_ATTN_TP_GROUP: Optional[GroupCoordinator] = None
+
+
 def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
+    global _ATTN_TP_GROUP
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
     enable_dp_attention = server_args.enable_dp_attention
@@ -294,6 +298,32 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
+    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
+
+    _ATTN_TP_RANK, _ATTN_TP_SIZE, _ = compute_dp_attention_world_info(
+        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
+    )
+    tp_group = get_tp_group()
+    pp_size = server_args.pp_size
+    use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
+    _ATTN_TP_GROUP = GroupCoordinator(
+        [
+            list(range(head, head + _ATTN_TP_SIZE))
+            for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
+        ],
+        tp_group.local_rank,
+        torch.distributed.get_backend(tp_group.device_group),
+        use_pynccl=use_pynccl,
+        use_pymscclpp=False,
+        use_custom_allreduce=False,
+        use_torch_symm_mem_all_reduce=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        use_npu_communicator=False,
+        group_name="attention_tp",
+    )
+
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
@@ -310,15 +340,18 @@ def is_allocation_symmetric() -> bool:
 
 
 def get_attention_tp_group() -> GroupCoordinator:
-    return get_attn_tp_group()
+    assert _ATTN_TP_GROUP is not None, "dp attention not initialized!"
+    return _ATTN_TP_GROUP
 
 
 def get_attention_tp_rank() -> int:
-    return get_attn_tensor_model_parallel_rank()
+    assert _ATTN_TP_GROUP is not None, "dp attention not initialized!"
+    return _ATTN_TP_GROUP.rank_in_group
 
 
 def get_attention_tp_size() -> int:
-    return get_attn_tensor_model_parallel_world_size()
+    assert _ATTN_TP_GROUP is not None, "dp attention not initialized!"
+    return _ATTN_TP_GROUP.world_size
 
 
 def get_attention_cp_group() -> GroupCoordinator:
