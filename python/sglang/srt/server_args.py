@@ -1048,7 +1048,7 @@ class ServerArgs:
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
-                    reserved_mem += 2 * 1024
+                    reserved_mem += 4 * 1024
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1481,9 +1481,10 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
+                "ascend",
                 "trtllm_mha",
                 "intel_xpu",
-            }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
+            }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -2371,8 +2372,9 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # Avoid using flashinfer_trtllm for speculative MoE runner backend by default
-        # TODO: Remove this block after verifying no accuracy regression with flashinfer_trtllm speculative backend
+        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
+        # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
+        # end to end, so we just avoid using trtllm_moe for speculative decoding.
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         if self.speculative_moe_runner_backend is None:
@@ -2384,7 +2386,7 @@ class ServerArgs:
         else:
             assert not MoeRunnerBackend(
                 self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend cannot be flashinfer_trtllm for risk in some draft models."
+            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
@@ -2566,8 +2568,8 @@ class ServerArgs:
                 )
                 self.load_format = "auto"
             elif (
-                not self.validate_transfer_engine()
-                and self.remote_instance_weight_loader_backend == "transfer_engine"
+                self.remote_instance_weight_loader_backend == "transfer_engine"
+                and not self.validate_transfer_engine()
             ):
                 logger.warning(
                     "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
