@@ -859,7 +859,7 @@ class SchedulerPPMixin:
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
-        if self.attn_tp_rank == 0:
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
@@ -872,7 +872,7 @@ class SchedulerPPMixin:
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.attn_tp_rank == 0:
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
                 [],
@@ -890,6 +890,14 @@ class SchedulerPPMixin:
                 self.attn_tp_group.rank,
                 self.attn_tp_cpu_group,
                 src=self.attn_tp_group.ranks[0],
+            )
+
+        if self.attn_cp_size > 1:
+            data = broadcast_pyobj(
+                data,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
             )
 
         return data
@@ -1084,8 +1092,16 @@ class SchedulerPPMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
-            self.attn_tp_cpu_group,
+            self.attn_cp_cpu_group,
         )
+        if self.attn_tp_size > 1:
+            tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+            torch.distributed.all_reduce(
+                tensor_to_reduce,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.attn_tp_cpu_group,
+            )
+            polls = tensor_to_reduce.tolist()
         rids: List = []
         for poll_statuses in poll_statuses_group:
             rids.append(
