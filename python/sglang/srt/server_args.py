@@ -354,6 +354,7 @@ class ServerArgs:
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
+    enable_streaming_session: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -517,6 +518,7 @@ class ServerArgs:
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
     elastic_ep_backend: Literal[None, "mooncake"] = None
+    enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
 
     # Mamba cache
@@ -1149,7 +1151,10 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        if kv_cache_dtype == "fp8_e4m3":
+        if not user_set_prefill and not user_set_decode and is_hip():
+            self.nsa_prefill_backend = "tilelang"
+            self.nsa_decode_backend = "tilelang"
+        elif kv_cache_dtype == "fp8_e4m3":
             # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
             if not user_set_prefill:
                 self.nsa_prefill_backend = "flashmla_auto"
@@ -1352,16 +1357,6 @@ class ServerArgs:
                 f"- Prefill: {prefill_attn_backend}\n"
                 f"- Decode: {decode_attn_backend}\n"
             )
-
-            if (
-                prefill_attn_backend == "trtllm_mha"
-                or decode_attn_backend == "trtllm_mha"
-            ):
-                # TODO: support swa kv indices translation for trtllm_mha attention backend
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
-                )
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
@@ -3398,6 +3393,12 @@ class ServerArgs:
             help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
+            "--enable-streaming-session",
+            action="store_true",
+            default=ServerArgs.enable_streaming_session,
+            help="Enable streaming session mode and SessionAwareCache wrapper.",
+        )
+        parser.add_argument(
             "--random-seed",
             type=int,
             default=ServerArgs.random_seed,
@@ -4258,6 +4259,12 @@ class ServerArgs:
             default=ServerArgs.elastic_ep_backend,
             choices=["none", "mooncake"],
             help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+        )
+        parser.add_argument(
+            "--enable-elastic-expert-backup",
+            action="store_true",
+            default=ServerArgs.enable_elastic_expert_backup,
+            help="Enable elastic expert backup feature.",
         )
         parser.add_argument(
             "--mooncake-ib-device",
