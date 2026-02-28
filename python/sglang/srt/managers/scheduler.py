@@ -1386,14 +1386,20 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
 
     def init_req_max_new_tokens(self, req):
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
+        orig_max_new = (
+            req.sampling_params.max_new_tokens
+            if req.sampling_params.max_new_tokens is not None
+            else 1 << 30
+        )
+        truncated = min(
+            orig_max_new,
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
+        # Avoid 0 when user requested generation: decode treats max_new_tokens==0 as
+        # prefill_only and can hang/crash. Same logic for PD prefill and decode.
+        if truncated <= 0 and orig_max_new > 0:
+            truncated = 1
+        req.sampling_params.max_new_tokens = max(0, truncated)
 
     def _process_and_broadcast_mm_inputs(
         self,

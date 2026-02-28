@@ -775,9 +775,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"exceeds the model's context length ({self.context_len} tokens). "
                     "Truncating max_new_tokens."
                 )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
+                truncated = max(0, _max_req_len - input_token_num)
+                # Avoid 0 when user requested generation: decode treats max_new_tokens==0 as
+                # prefill_only and can hang/crash. Same logic for PD prefill/decode.
+                if truncated == 0 and max_new_tokens and max_new_tokens > 0:
+                    truncated = 1
+                obj.sampling_params["max_new_tokens"] = truncated
             else:
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
