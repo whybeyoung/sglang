@@ -89,6 +89,10 @@ FetchContent_Declare(
 FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
+# Use fork with PR#24 (masked MHA for SM90) for sparse_mask_fine / get_tile_size support.
+# To use upstream sgl-attn (no PR24), switch back to:
+#   GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
+#   GIT_TAG        cc75c5c5979a607ad20a6828635646f9841acf01
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/whybeyoung/sgl-flash-attn

@@ -57,10 +57,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      num_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
-      "    Tensor?  sinks"
-      ") -> (Tensor, Tensor, Tensor, Tensor)");  // NEW return type: tuple of 4 tensors
+      "    Tensor?  sinks,"
+      "    Tensor?  sparse_mask_fine"  // [total_q, max_k_blocks, num_int32_per_block], PR#24
+      ") -> (Tensor, Tensor, Tensor, Tensor)");
 
   m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
+
+  m.def(
+      "get_tile_size(Tensor dummy, int headdim, int headdim_v, ScalarType qkv_dtype, "
+      "bool is_causal, int window_size_left, int window_size_right, bool has_softcap) -> (int, int)");
+  m.impl("get_tile_size", torch::kCUDA, &mha_get_tile_size);
 }
 
 REGISTER_EXTENSION(flash_ops)

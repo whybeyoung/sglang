@@ -370,6 +370,8 @@ class Envs:
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    # Use FA3 masked MHA (sparse_mask_fine) on SM90+ when sgl-kernel is built with PR#24 (e.g. whybeyoung/sgl-flash-attn).
+    SGLANG_USE_FA3_SPARSE_MASK = EnvBool(False)
     SGLANG_VERIFY_FUSED_METADATA_COPY = EnvBool(False)
     SGLANG_NSA_FORCE_MLA = EnvBool(False)
 

@@ -67,7 +67,11 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+        get_tile_size as flash_attn_get_tile_size,
+    )
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -81,6 +85,51 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 # Set SGLANG_VERIFY_FUSED_METADATA_COPY=1 or true to enable verification
 # This will crash with detailed error message if any inconsistency is detected
 _VERIFY_FUSED_METADATA_COPY = envs.SGLANG_VERIFY_FUSED_METADATA_COPY.get()
+
+
+def _prepare_sparse_mask_fine_from_page_table(
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_k: int,
+    page_size: int,
+    kBlockN: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build sparse_mask_fine [total_q, max_k_blocks, num_int32_per_block] for FA3 masked MHA (PR#24).
+
+    Causal variant: for each Q position we set bits for all K blocks up to that sequence's length.
+    Row stride is padded to a multiple of 32 int32s (128 bytes) for TMA alignment (see flash_api.cpp).
+    """
+    total_q = int(cu_seqlens_q[-1].item())
+    max_k_blocks = (max_seqlen_k + kBlockN - 1) // kBlockN
+    num_int32_per_block = (kBlockN + 31) // 32
+    # TMA requires (max_k_blocks * num_int32_per_block * 4) % 128 == 0
+    row_elems = max_k_blocks * num_int32_per_block
+    row_elems_padded = (row_elems + 31) // 32 * 32
+    max_k_blocks_padded = (row_elems_padded + num_int32_per_block - 1) // num_int32_per_block
+    mask = torch.zeros(
+        (total_q, max_k_blocks_padded, num_int32_per_block),
+        dtype=torch.int32,
+        device=device,
+    )
+    cu = cu_seqlens_q.cpu()
+    seqlens = cache_seqlens.cpu()
+    num_seqs = seqlens.shape[0]
+    for q_idx in range(total_q):
+        # q_idx belongs to sequence seq_id: cu[seq_id] <= q_idx < cu[seq_id+1]
+        seq_id = torch.searchsorted(cu, q_idx + 1, right=False).item() - 1
+        seq_id = max(0, min(seq_id, num_seqs - 1))
+        seqlen_k = int(seqlens[seq_id].item())
+        n_full_blocks = seqlen_k // kBlockN
+        remainder = seqlen_k % kBlockN
+        for kb in range(n_full_blocks):
+            for b in range(num_int32_per_block):
+                mask[q_idx, kb, b] = -1  # all bits 1
+        if remainder > 0:
+            for j in range(remainder):
+                mask[q_idx, n_full_blocks, j // 32] |= 1 << (j % 32)
+    return mask
 
 
 @dataclass(frozen=True)
@@ -1619,6 +1668,37 @@ class NativeSparseAttnBackend(
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
+
+        sparse_mask_fine = None
+        if (
+            not _is_hip
+            and self.device_sm_major >= 9
+            and envs.SGLANG_USE_FA3_SPARSE_MASK.get()
+        ):
+            try:
+                headdim_q = q_rope.shape[-1] + (q_nope.shape[-1] if q_nope is not None else 0)
+                kBlockM, kBlockN = flash_attn_get_tile_size(
+                    headdim=headdim_q,
+                    headdim_v=v_head_dim,
+                    qkv_dtype=q_rope.dtype,
+                    is_causal=True,
+                    window_size_left=-1,
+                    window_size_right=-1,
+                    has_softcap=logit_cap > 0,
+                )
+                max_seqlen_k = int(cache_seqlens.max().item())
+                sparse_mask_fine = _prepare_sparse_mask_fine_from_page_table(
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_k=max_seqlen_k,
+                    page_size=page_size,
+                    kBlockN=kBlockN,
+                    device=q_rope.device,
+                )
+            except Exception:  # noqa: S110
+                sparse_mask_fine = None
+
         o = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,
@@ -1630,10 +1710,11 @@ class NativeSparseAttnBackend(
             cu_seqlens_k_new=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=sm_scale,
-            causal=True,
+            causal=sparse_mask_fine is None,
             softcap=logit_cap,
             return_softmax_lse=False,
             num_splits=self.num_splits,
+            sparse_mask_fine=sparse_mask_fine,
         )
         return o  # type: ignore
 
