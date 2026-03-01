@@ -332,13 +332,21 @@ set(SOURCES
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
-
+)
+# Flash sparse (TileLang SM80) sources exist in sgl-attn but not in sgl-flash-attn fork; add only if present.
+set(FLASH_SPARSE_SM80_SRC
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
+if(EXISTS "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu")
+    list(APPEND SOURCES ${FLASH_SPARSE_SM80_SRC})
+    message(STATUS "Flash sparse SM80 sources found (sgl-attn); adding to build.")
+else()
+    message(STATUS "Flash sparse SM80 sources not found (e.g. sgl-flash-attn fork); skipping.")
+endif()
 
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
