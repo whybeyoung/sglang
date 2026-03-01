@@ -101,6 +101,19 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
+# When building flash_ops, we register flash-attn ops from flash_extension.cc via a
+# PyTorch-compatible shim. The fork's hopper/flash_api.cpp also registers to flash_attn_3
+# with a signature (std::optional<const at::Tensor>&) that does not bind to PyTorch rvalues.
+# Patch flash_api.cpp to skip its TORCH_LIBRARY registration when SGL_KERNEL_FLASH_OPS is defined.
+set(FA_API_CPP "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp")
+if(EXISTS "${FA_API_CPP}")
+  file(READ "${FA_API_CPP}" _fa_api_content)
+  string(REPLACE "TORCH_LIBRARY(flash_attn_3, m)" "#ifndef SGL_KERNEL_FLASH_OPS\nTORCH_LIBRARY(flash_attn_3, m)" _fa_api_content "${_fa_api_content}")
+  string(REPLACE "m.impl(\"get_scheduler_metadata\", &mha_fwd_get_scheduler_metadata);\n}" "m.impl(\"get_scheduler_metadata\", &mha_fwd_get_scheduler_metadata);\n}\n#endif\n" _fa_api_content "${_fa_api_content}")
+  file(WRITE "${FA_API_CPP}" "${_fa_api_content}")
+  message(STATUS "Patched hopper/flash_api.cpp to allow SGL_KERNEL_FLASH_OPS (skip flash_attn_3 registration)")
+endif()
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
@@ -516,6 +529,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         FLASHATTENTION_DISABLE_DROPOUT
         FLASHATTENTION_DISABLE_UNEVEN_K
         FLASHATTENTION_VARLEN_ONLY
+        SGL_KERNEL_FLASH_OPS
     )
 
     if(NOT ENABLE_BELOW_SM90)
