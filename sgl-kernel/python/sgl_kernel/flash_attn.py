@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -68,6 +68,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    sparse_mask_fine: Optional[torch.Tensor] = None,  # [total_q, max_k_blocks, num_int32_per_block], PR#24 SM90
     score_mod=None,
     aux_tensors=None,
     ver=3,
@@ -264,9 +265,37 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         sinks,
+        sparse_mask_fine,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+
+def get_tile_size(
+    headdim: int,
+    headdim_v: Optional[int] = None,
+    qkv_dtype: torch.dtype = torch.bfloat16,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    has_softcap: bool = False,
+) -> Tuple[int, int]:
+    """Return (kBlockM, kBlockN) for sparse mask preparation (PR#24, SM90)."""
+    if headdim_v is None:
+        headdim_v = headdim
+    dummy = torch.empty(0, device="cuda", dtype=qkv_dtype)
+    return tuple(
+        torch.ops.sgl_kernel.get_tile_size.default(
+            dummy,
+            headdim,
+            headdim_v,
+            qkv_dtype,
+            is_causal,
+            window_size_left,
+            window_size_right,
+            has_softcap,
+        )
+    )
 
 
 def flash_attn_varlen_func(

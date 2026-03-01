@@ -82,4 +82,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     int64_t num_splits,
     std::optional<bool> pack_gqa_,
     int64_t sm_margin,
-    std::optional<const at::Tensor>& sinks_);  // (h)
+    std::optional<const at::Tensor>& sinks_,  // (h)
+    std::optional<at::Tensor> sparse_mask_fine_);  // [total_q, max_k_blocks, num_int32_per_block]
+
+// Get (kBlockM, kBlockN) for sparse mask preparation (PR#24, SM90 only).
+std::tuple<int64_t, int64_t> mha_get_tile_size(
+    at::Tensor dummy,
+    int64_t headdim,
+    int64_t headdim_v,
+    at::ScalarType qkv_dtype,
+    bool is_causal,
+    int64_t window_size_left,
+    int64_t window_size_right,
+    bool has_softcap);
