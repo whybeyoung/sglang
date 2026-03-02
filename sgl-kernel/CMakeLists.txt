@@ -114,6 +114,25 @@ if(EXISTS "${FA_API_CPP}")
   message(STATUS "Patched hopper/flash_api.cpp to allow SGL_KERNEL_FLASH_OPS (skip flash_attn_3 registration)")
 endif()
 
+# Fork's flash_fwd_launch_template.h passes sink_ptr + sparse_mask_* + total_q in mainloop_args for all Arch.
+# SM80 CollectiveMainloopFwdSm80::Arguments has no those members -> "too many initializer values".
+# Add dummy members to SM80 Arguments and Params so the same initializer list compiles for Arch 80/86/89.
+set(FA_MAINLOOP_SM80_HPP "${repo-flash-attention_SOURCE_DIR}/hopper/mainloop_fwd_sm80.hpp")
+if(EXISTS "${FA_MAINLOOP_SM80_HPP}")
+  file(READ "${FA_MAINLOOP_SM80_HPP}" _fa_sm80_content)
+  string(REPLACE " int const* const seqlens_rotary = nullptr;\n };\n\n // Device side kernel params"
+    " int const* const seqlens_rotary = nullptr;\n Element const* const ptr_sink = nullptr;\n int const* sparse_mask_fine = nullptr;\n int sparse_mask_max_k_blocks = 0;\n int sparse_mask_fine_q_stride = 0;\n int sparse_mask_fine_k_stride = 0;\n int total_q = 0;\n };\n\n // Device side kernel params"
+    _fa_sm80_content "${_fa_sm80_content}")
+  string(REPLACE " int const* const seqlens_rotary = nullptr;\n };\n\n static Params\n to_underlying_arguments"
+    " int const* const seqlens_rotary = nullptr;\n Element const* const ptr_sink = nullptr;\n int const* sparse_mask_fine = nullptr;\n int sparse_mask_max_k_blocks = 0;\n int sparse_mask_fine_q_stride = 0;\n int sparse_mask_fine_k_stride = 0;\n int total_q = 0;\n };\n\n static Params\n to_underlying_arguments"
+    _fa_sm80_content "${_fa_sm80_content}")
+  string(REPLACE " args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};"
+    " args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,\n args.ptr_sink, args.sparse_mask_fine, args.sparse_mask_max_k_blocks, args.sparse_mask_fine_q_stride, args.sparse_mask_fine_k_stride, args.total_q};"
+    _fa_sm80_content "${_fa_sm80_content}")
+  file(WRITE "${FA_MAINLOOP_SM80_HPP}" "${_fa_sm80_content}")
+  message(STATUS "Patched hopper/mainloop_fwd_sm80.hpp for sink/sparse_mask args (SM80 build)")
+endif()
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
