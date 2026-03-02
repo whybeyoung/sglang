@@ -1310,6 +1310,15 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
+        # PP+CP: only TP0+CP0 recv pyobj; broadcast to CP so all ranks share recv_reqs (avoid proxy send/recv mismatch).
+        if not self.server_args.enable_dp_attention and self.attn_cp_size != 1:
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
+            )
+
         # Process MM requests under EPD-disaggregation mode
         if (
             self.pp_rank == 0
