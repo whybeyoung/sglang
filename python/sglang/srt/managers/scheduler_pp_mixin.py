@@ -231,7 +231,16 @@ class SchedulerPPMixin:
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+
+                # Always recv proxy tensors on non-first rank to keep the
+                # PP tensor-dict channel in sync.  When Stage 0 had no batch
+                # it sends an empty sentinel dict; we detect that here and
+                # force-skip the batch on this stage as well.
+                pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                if pp_proxy_tensors is not None and not pp_proxy_tensors.tensors:
+                    # Received empty sentinel – previous stage had no batch
+                    self.cur_batch = None
+                    self.mbs[mb_id] = None
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -305,6 +314,13 @@ class SchedulerPPMixin:
                         torch.cuda.current_stream().wait_event(self.launch_event)
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
+                            async_send=True,
+                        )
+                    else:
+                        # Send empty sentinel so the next stage's recv stays
+                        # in sync with our send on the tensor-dict channel.
+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            {},
                             async_send=True,
                         )
 
