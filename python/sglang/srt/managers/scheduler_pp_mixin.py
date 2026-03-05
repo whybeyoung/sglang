@@ -222,25 +222,29 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                # Always recv proxy tensors on non-first rank to keep the
+                # PP tensor-dict channel in sync.  When the previous stage
+                # had no batch it sends an empty sentinel dict; we detect
+                # that here and skip batch allocation entirely so no KV
+                # cache is allocated (and thus no leak on discard).
+                pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                prev_stage_has_batch = (
+                    pp_proxy_tensors is None or bool(pp_proxy_tensors.tensors)
+                )
+
                 self.process_prefill_chunk()
-                batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+                if prev_stage_has_batch:
+                    batch = self.get_new_batch_prefill()
+                    batch = self.maybe_prepare_mlp_sync_batch(batch)
+                else:
+                    batch = None
+
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-
-                # Always recv proxy tensors on non-first rank to keep the
-                # PP tensor-dict channel in sync.  When Stage 0 had no batch
-                # it sends an empty sentinel dict; we detect that here and
-                # force-skip the batch on this stage as well.
-                pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                if pp_proxy_tensors is not None and not pp_proxy_tensors.tensors:
-                    # Received empty sentinel – previous stage had no batch
-                    self.cur_batch = None
-                    self.mbs[mb_id] = None
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
