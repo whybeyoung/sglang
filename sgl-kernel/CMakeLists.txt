@@ -96,7 +96,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/whybeyoung/sgl-flash-attn
-    GIT_TAG        584142f
+    GIT_TAG        16ccc05
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
