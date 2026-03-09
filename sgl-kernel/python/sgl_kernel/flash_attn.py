@@ -323,6 +323,7 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    sparse_mask_fine: Optional[torch.Tensor] = None,  # [total_q, max_k_blocks, num_int32_per_block], PR#24 SM90
     score_mod=None,
     aux_tensors=None,
     ver=3,
@@ -384,7 +385,7 @@ def flash_attn_varlen_func(
         seqused_k,
         max_seqlen_q,
         max_seqlen_k,
-        None,  # page_table,
+        page_table,
         None,  # kv_batch_idx
         None,  # leftpad_k
         None,  # rotary cos
@@ -405,6 +406,7 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
         sinks=sinks,
+        sparse_mask_fine=sparse_mask_fine,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out
