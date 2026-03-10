@@ -1,8 +1,11 @@
 # Adapted from https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/encoding/encoding_dsv32.py
 import copy
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 
 class DS32EncodingError(Exception):
@@ -225,11 +228,19 @@ def render_message(
             index == 0
             or (prev_assistant_idx >= 0 and assistant_msg.get("role") == "assistant")
         ):
+            logger.error(
+                f"DS32EncodingError: Invalid messages at {index}, "
+                f"full messages={json.dumps([{{'role': m.get('role'), 'content': str(m.get('content', ''))[:100]}} for m in messages], ensure_ascii=False)}"
+            )
             raise DS32EncodingError(f"Invalid messages at {index}:\n{assistant_msg}")
 
         tool_call_order = index - prev_assistant_idx
         assistant_tool_calls = assistant_msg.get("tool_calls")
         if not (assistant_tool_calls and len(assistant_tool_calls) >= tool_call_order):
+            logger.error(
+                f"DS32EncodingError: No tool calls but found tool output at {index}, "
+                f"assistant_msg={json.dumps({'role': assistant_msg.get('role'), 'tool_calls': assistant_msg.get('tool_calls')}, ensure_ascii=False)}"
+            )
             raise DS32EncodingError("No tool calls but found tool output")
 
         if tool_call_order == 1:

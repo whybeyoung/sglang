@@ -103,24 +103,30 @@ class OpenAIServingBase(ABC):
                     adapted_request, processed_request, raw_request
                 )
         except HTTPException as e:
+            rid = getattr(request, "rid", None)
+            logger.info(f"HTTPException: {e.detail}, rid={rid}")
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
         except ValueError as e:
+            rid = getattr(request, "rid", None)
+            logger.info(f"ValueError: {e}, rid={rid}")
             return self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",
                 status_code=400,
             )
         except DS32EncodingError as e:
-            logger.info(f"DS32EncodingError: {e}")
+            rid = getattr(request, "rid", None)
+            logger.info(f"DS32EncodingError: {e}, rid={rid}")
             return self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",
                 status_code=400,
             )
         except Exception as e:
-            logger.exception(f"Error in request: {e}")
+            rid = getattr(request, "rid", None)
+            logger.exception(f"Error in request: {e}, rid={rid}")
             return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
