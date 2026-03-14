@@ -28,7 +28,6 @@ from sglang.srt.layers.attention.nsa.transform_index import (
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
-    is_nsa_enable_prefill_cp,
     nsa_cp_round_robin_split_data,
     nsa_cp_round_robin_split_q_seqs,
     pad_nsa_cache_seqlens,
@@ -2114,6 +2113,8 @@ class NativeSparseAttnBackend(
             )
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # Note: CP-aware selection - if CP split is triggered (nsa_cp_metadata set),
+            # must use MLA path even for short sequences to handle distributed KV correctly.
             self.use_mha = (
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
@@ -2123,7 +2124,7 @@ class NativeSparseAttnBackend(
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
-                and (not is_nsa_enable_prefill_cp())  # CP not enabled
+                and forward_batch.nsa_cp_metadata is None  # No CP split triggered
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
