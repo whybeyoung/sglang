@@ -1930,6 +1930,10 @@ class GetLoadsReqOutput(BaseReq):
     max_running_requests: int = field(
         metadata={"metric": ("gauge", "Maximum running requests capacity")}
     )
+    input_throughput: float = field(
+        default=0.0,
+        metadata={"metric": ("gauge", "Input (prefill) throughput tokens/sec")},
+    )
 
     memory: Optional[MemoryMetrics] = None
     speculative: Optional[SpeculativeMetrics] = None

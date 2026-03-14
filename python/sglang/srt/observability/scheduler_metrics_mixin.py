@@ -748,6 +748,7 @@ class SchedulerMetricsMixin:
             cache_hit_rate=round(self.stats.cache_hit_rate, 4),
             utilization=round(self.stats.utilization, 4),
             max_running_requests=self.max_running_requests,
+            input_throughput=round(self.last_input_throughput, 2),
             memory=memory,
             speculative=speculative,
             lora=lora,
