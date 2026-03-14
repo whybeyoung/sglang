@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.model_config import is_deepseek_nsa
+from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -246,7 +246,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+            index_topk = get_nsa_index_topk(self.config) if self.use_nsa else None
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch, index_topk):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,

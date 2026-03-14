@@ -150,7 +150,19 @@ class NSAContextParallelMetadata:
     total_seq_lens: torch.Tensor = None
 
 
-def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch, index_topk: int = None):
+    from sglang.srt.environ import envs
+    
+    # Only trigger CP for sequences longer than cp_threshold
+    # Short sequences should use the optimized MHA path instead
+    # Priority: SGLANG_NSA_MHA_CP_THRESHOLD (if > 0) > index_topk > 2048
+    cp_threshold = envs.SGLANG_NSA_MHA_CP_THRESHOLD.get()
+    if cp_threshold <= 0:
+        cp_threshold = index_topk if index_topk is not None else 2048
+    
+    if seq_len < cp_threshold:
+        return False
+    
     if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (

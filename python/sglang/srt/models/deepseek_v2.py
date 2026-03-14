@@ -2137,7 +2137,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+            index_topk = get_nsa_index_topk(self.config) if self.use_nsa else None
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch, index_topk):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,

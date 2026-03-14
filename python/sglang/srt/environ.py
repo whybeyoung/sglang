@@ -372,6 +372,9 @@ class Envs:
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_VERIFY_FUSED_METADATA_COPY = EnvBool(False)
     SGLANG_NSA_FORCE_MLA = EnvBool(False)
+    # MHA/CP threshold: sequences shorter than this use MHA, longer use MLA+CP
+    # Default 0 means auto (use model's index_topk), set to positive value (e.g., 12288) to override
+    SGLANG_NSA_MHA_CP_THRESHOLD = EnvInt(0)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

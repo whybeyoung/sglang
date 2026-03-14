@@ -2106,10 +2106,12 @@ class NativeSparseAttnBackend(
             device_sm = get_device_sm()
 
             # when nsa prefill impl is trtllm, use its max chunk capacity as mha max kv len
+            # For NSA models, use SGLANG_NSA_MHA_CP_THRESHOLD env var (0 = auto, use index_topk)
+            mha_cp_threshold = envs.SGLANG_NSA_MHA_CP_THRESHOLD.get()
             mha_max_kv_len = (
                 forward_batch.get_max_chunk_capacity()
                 if self.nsa_prefill_impl == "trtllm"
-                else self.nsa_index_topk
+                else (mha_cp_threshold if mha_cp_threshold > 0 else self.nsa_index_topk)
             )
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
