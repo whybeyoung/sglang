@@ -233,6 +233,7 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(self.send_prefill_ready_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
@@ -243,8 +244,16 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk()
-                batch = self.get_new_batch_prefill()
+                authoritative_prefill_ready_rids = None
+                if not self.pp_group.is_first_rank:
+                    authoritative_prefill_ready_rids = self._pp_recv_pyobj_from_prev_stage()
+                batch = self.get_new_batch_prefill(
+                    authoritative_rids=authoritative_prefill_ready_rids
+                )
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
+                self._pp_validate_authoritative_prefill_ready_rids(
+                    batch, authoritative_prefill_ready_rids
+                )
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -320,6 +329,10 @@ class SchedulerPPMixin:
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
+                    )
+                    self.send_prefill_ready_work = self._pp_send_pyobj_to_next_stage(
+                        self._pp_get_authoritative_prefill_ready_rids(self.cur_batch),
+                        async_send=True,
                     )
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(self.launch_event)
@@ -548,6 +561,7 @@ class SchedulerPPMixin:
         )
 
         self.send_req_work = []
+        self.send_prefill_ready_work = []
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
@@ -755,6 +769,40 @@ class SchedulerPPMixin:
             self.waiting_queue.extend(good_reqs)
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
+
+    def _pp_get_authoritative_prefill_ready_rids(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> List[str]:
+        if batch is None:
+            return []
+        return [req.rid for req in batch.reqs]
+
+    def _pp_validate_authoritative_prefill_ready_rids(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+        authoritative_rids: Optional[List[str]],
+    ) -> None:
+        if self.pp_group.is_first_rank or authoritative_rids is None:
+            return
+
+        local_rids = self._pp_get_authoritative_prefill_ready_rids(batch)
+        if local_rids == authoritative_rids:
+            return
+
+        logger.error(
+            "PP authoritative prefill ready rids mismatch before proxy recv at PP%s "
+            "ATTN_CP%s TP%s: authoritative=%s local=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.attn_tp_rank,
+            authoritative_rids,
+            local_rids,
+        )
+        raise RuntimeError(
+            "PP authoritative prefill ready rids mismatch before launch: "
+            f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
+            f"authoritative={authoritative_rids} local={local_rids}"
+        )
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs

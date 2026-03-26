@@ -1977,7 +1977,9 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_prefill(
+        self, authoritative_rids: Optional[List[str]] = None
+    ) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             _, token_usage, _, _ = self._get_token_info()
@@ -1986,7 +1988,8 @@ class Scheduler(
             )
 
         ret = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            authoritative_rids=authoritative_rids,
         )
 
         if self.prefill_delayer:
@@ -1995,7 +1998,9 @@ class Scheduler(
         return ret
 
     def _get_new_batch_prefill_raw(
-        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+        self,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+        authoritative_rids: Optional[List[str]] = None,
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -2007,9 +2012,17 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+        authoritative_rid_set = (
+            set(authoritative_rids) if authoritative_rids is not None else None
+        )
+        active_chunked_req = self.chunked_req is not None and (
+            authoritative_rid_set is None
+            or self.chunked_req.rid in authoritative_rid_set
+        )
+
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not active_chunked_req:
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -2020,7 +2033,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is not None
+            and active_chunked_req
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -2040,7 +2053,7 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
+        if active_chunked_req and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
@@ -2064,15 +2077,25 @@ class Scheduler(
             dllm_config=self.dllm_config,
         )
 
-        if self.chunked_req is not None:
+        has_selected_chunked_req = False
+        if active_chunked_req:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            has_selected_chunked_req = True
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
+        if authoritative_rids is None:
+            prefill_candidate_reqs = self.waiting_queue
+        else:
+            req_by_rid = {req.rid: req for req in self.waiting_queue}
+            prefill_candidate_reqs = [
+                req_by_rid[rid] for rid in authoritative_rids if rid in req_by_rid
+            ]
+
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in prefill_candidate_reqs:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2107,8 +2130,26 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
+                    if authoritative_rid_set is not None:
+                        wait_start = time.perf_counter()
+                        while not prefetch_done:
+                            self.tree_cache.check_hicache_events()
+                            time.sleep(0.001)
+                            prefetch_done = self.tree_cache.check_prefetch_progress(
+                                req.rid
+                            )
+                        logger.warning(
+                            "[PPShape] waited for authoritative prefetch readiness: "
+                            "rid=%s wait_ms=%.2f pp=%s cp=%s tp=%s",
+                            req.rid,
+                            (time.perf_counter() - wait_start) * 1e3,
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            self.attn_tp_rank,
+                        )
+                    else:
+                        # skip staging requests that are ongoing prefetch
+                        continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
@@ -2142,7 +2183,7 @@ class Scheduler(
                     )
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                has_chunked_req=has_selected_chunked_req,
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -2177,7 +2218,7 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
+        if has_selected_chunked_req and self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
 
         # Record for logging prefill stats after forward
