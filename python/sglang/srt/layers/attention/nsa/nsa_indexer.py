@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -55,6 +57,20 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+
+logger = logging.getLogger(__name__)
+
+
+def _truncate_debug_list(values, limit: int = 8):
+    if values is None:
+        return None
+    if isinstance(values, torch.Tensor):
+        values = values.tolist()
+    else:
+        values = list(values)
+    if len(values) <= limit:
+        return values
+    return values[:limit] + ["..."] + values[-1:]
 
 
 class BaseIndexerMetadata(ABC):
@@ -961,12 +977,72 @@ class Indexer(MultiPlatformOp):
             buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=layer_id
             )
-            fused_store_index_k_cache(
-                key,
-                buf,
-                forward_batch.out_cache_loc,
-                forward_batch.token_to_kv_pool.page_size,
+            key_num_tokens = key.shape[0]
+            out_cache_loc_numel = forward_batch.out_cache_loc.numel()
+            expected_num_tokens = (
+                forward_batch.extend_num_tokens
+                if forward_batch.extend_num_tokens is not None
+                else None
             )
+            should_log_debug = os.getenv("SGLANG_DEBUG_NSA_INDEXER_STORE", "0") == "1"
+            has_token_mismatch = key_num_tokens != out_cache_loc_numel
+            has_extend_mismatch = (
+                expected_num_tokens is not None and key_num_tokens != expected_num_tokens
+            )
+            if should_log_debug or has_token_mismatch or has_extend_mismatch:
+                logger.warning(
+                    "[NSAIndexerStore] layer=%s pp_logits_recv=%s cp_size=%s cp_rank=%s "
+                    "mode=%s key_shape=%s out_cache_loc_shape=%s out_cache_loc_numel=%s "
+                    "extend_num_tokens=%s seq_lens_cpu=%s extend_prefix_lens_cpu=%s "
+                    "extend_seq_lens_cpu=%s token_to_kv_page_size=%s token_mismatch=%s "
+                    "extend_mismatch=%s",
+                    layer_id,
+                    self.logits_with_pp_recv,
+                    self.cp_size,
+                    self.cp_rank,
+                    getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
+                    tuple(key.shape),
+                    tuple(forward_batch.out_cache_loc.shape),
+                    out_cache_loc_numel,
+                    expected_num_tokens,
+                    _truncate_debug_list(forward_batch.seq_lens_cpu),
+                    _truncate_debug_list(forward_batch.extend_prefix_lens_cpu),
+                    _truncate_debug_list(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.token_to_kv_pool.page_size,
+                    has_token_mismatch,
+                    has_extend_mismatch,
+                )
+            try:
+                fused_store_index_k_cache(
+                    key,
+                    buf,
+                    forward_batch.out_cache_loc,
+                    forward_batch.token_to_kv_pool.page_size,
+                )
+            except Exception:
+                logger.exception(
+                    "[NSAIndexerStoreError] layer=%s pp_logits_recv=%s cp_size=%s cp_rank=%s "
+                    "mode=%s key_shape=%s out_cache_loc_shape=%s out_cache_loc_numel=%s "
+                    "extend_num_tokens=%s seq_lens_cpu=%s extend_prefix_lens_cpu=%s "
+                    "extend_seq_lens_cpu=%s token_to_kv_page_size=%s "
+                    "out_cache_loc_head=%s out_cache_loc_tail=%s",
+                    layer_id,
+                    self.logits_with_pp_recv,
+                    self.cp_size,
+                    self.cp_rank,
+                    getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
+                    tuple(key.shape),
+                    tuple(forward_batch.out_cache_loc.shape),
+                    out_cache_loc_numel,
+                    expected_num_tokens,
+                    _truncate_debug_list(forward_batch.seq_lens_cpu),
+                    _truncate_debug_list(forward_batch.extend_prefix_lens_cpu),
+                    _truncate_debug_list(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.token_to_kv_pool.page_size,
+                    _truncate_debug_list(forward_batch.out_cache_loc[:16]),
+                    _truncate_debug_list(forward_batch.out_cache_loc[-16:]),
+                )
+                raise
             return
 
         # Fallback: original path
