@@ -56,6 +56,32 @@ def _ordered_union(left: List[str], right: List[str]) -> List[str]:
     return merged
 
 
+@dataclass(frozen=True)
+class PPPrefillReadyView:
+    rid: str
+    ready_len: int
+
+
+def _ordered_intersection_prefill_ready_views(
+    left: List[PPPrefillReadyView], right: List[PPPrefillReadyView]
+) -> List[PPPrefillReadyView]:
+    right_by_rid = {view.rid: view for view in right}
+    matched: List[PPPrefillReadyView] = []
+    for view in left:
+        right_view = right_by_rid.get(view.rid)
+        if right_view is None:
+            continue
+        if right_view.ready_len == view.ready_len:
+            matched.append(view)
+    return matched
+
+
+def _prefill_ready_views_to_rids(views: Optional[List[PPPrefillReadyView]]) -> Optional[List[str]]:
+    if views is None:
+        return None
+    return [view.rid for view in views]
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -208,7 +234,7 @@ class SchedulerPPMixin:
         pmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
-        consensus_prefill_ready_rids: Optional[List[str]] = None
+        consensus_prefill_ready_views: Optional[List[PPPrefillReadyView]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
@@ -229,7 +255,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_release_rids = None
                 next_consensus_bootstrapped_rids = None
-                next_consensus_prefill_ready_rids = consensus_prefill_ready_rids
+                next_consensus_prefill_ready_views = consensus_prefill_ready_views
                 d2h_event = None
                 next_batch_result = None
 
@@ -252,28 +278,32 @@ class SchedulerPPMixin:
                 use_wait_complete_prefill_ready_consensus = (
                     self._pp_use_wait_complete_prefill_ready_consensus()
                 )
-                prefill_ready_rids = None
-                if use_wait_complete_prefill_ready_consensus:
-                    prefill_ready_rids = self._pp_pd_get_prefill_ready_ids()
-                    pmbs[mb_id] = prefill_ready_rids
+                prefill_ready_views = None
 
                 self.process_prefill_chunk()
-                authoritative_prefill_ready_rids = None
+                if use_wait_complete_prefill_ready_consensus:
+                    prefill_ready_views = self._pp_pd_get_prefill_ready_views()
+                    pmbs[mb_id] = prefill_ready_views
+                authoritative_prefill_ready_views = None
                 if self.pp_group.is_first_rank and use_wait_complete_prefill_ready_consensus:
-                    authoritative_prefill_ready_rids = (
-                        consensus_prefill_ready_rids
-                        if consensus_prefill_ready_rids is not None
-                        else prefill_ready_rids
+                    authoritative_prefill_ready_views = (
+                        consensus_prefill_ready_views
+                        if consensus_prefill_ready_views is not None
+                        else []
                     )
                 elif not self.pp_group.is_first_rank:
-                    authoritative_prefill_ready_rids = self._pp_recv_pyobj_from_prev_stage()
+                    authoritative_prefill_ready_views = self._pp_recv_pyobj_from_prev_stage()
+                authoritative_prefill_ready_rids = _prefill_ready_views_to_rids(
+                    authoritative_prefill_ready_views
+                )
                 batch = self.get_new_batch_prefill(
                     authoritative_rids=authoritative_prefill_ready_rids
                 )
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
-                self._pp_validate_authoritative_prefill_ready_rids(
-                    batch, authoritative_prefill_ready_rids
-                )
+                if use_wait_complete_prefill_ready_consensus:
+                    self._pp_validate_authoritative_prefill_ready_views(
+                        batch, authoritative_prefill_ready_views
+                    )
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -320,12 +350,12 @@ class SchedulerPPMixin:
                 if use_wait_complete_prefill_ready_consensus:
                     (
                         send_consensus_prefill_ready_work,
-                        consensus_prefill_ready_rids,
-                    ) = self._pp_pd_send_consensus_prefill_ready_ids(
+                        consensus_prefill_ready_views,
+                    ) = self._pp_pd_send_consensus_prefill_ready_views(
                         pmbs,
                         next_first_rank_mb_id,
-                        consensus_prefill_ready_rids,
-                        prefill_ready_rids,
+                        consensus_prefill_ready_views,
+                        prefill_ready_views,
                     )
 
                 if bmbs[next_mb_id] is not None:
@@ -340,7 +370,7 @@ class SchedulerPPMixin:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
                 if use_wait_complete_prefill_ready_consensus and pmbs[next_mb_id] is not None:
-                    next_consensus_prefill_ready_rids = (
+                    next_consensus_prefill_ready_views = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
                 self._pp_commit_comm_work(send_consensus_prefill_ready_work)
@@ -367,11 +397,11 @@ class SchedulerPPMixin:
                     )
                     if use_wait_complete_prefill_ready_consensus:
                         send_prefill_wait_complete_work = self._pp_send_pyobj_to_next_stage(
-                            prefill_ready_rids,
+                            prefill_ready_views,
                             async_send=True,
                         )
                     self.send_prefill_ready_work = self._pp_send_pyobj_to_next_stage(
-                        self._pp_get_authoritative_prefill_ready_rids(self.cur_batch),
+                        self._pp_get_authoritative_prefill_ready_views(self.cur_batch),
                         async_send=True,
                     )
                     if self.cur_batch:
@@ -386,7 +416,7 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
                 if use_wait_complete_prefill_ready_consensus:
-                    consensus_prefill_ready_rids = next_consensus_prefill_ready_rids
+                    consensus_prefill_ready_views = next_consensus_prefill_ready_views
 
                 self.running_batch.batch_is_full = False
 
@@ -812,12 +842,14 @@ class SchedulerPPMixin:
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
-    def _pp_get_authoritative_prefill_ready_rids(
+    def _pp_get_authoritative_prefill_ready_views(
         self: Scheduler, batch: Optional[ScheduleBatch]
-    ) -> List[str]:
+    ) -> List[PPPrefillReadyView]:
         if batch is None:
             return []
-        return [req.rid for req in batch.reqs]
+        return [
+            PPPrefillReadyView(req.rid, len(req.prefix_indices)) for req in batch.reqs
+        ]
 
     def _pp_use_wait_complete_prefill_ready_consensus(self: Scheduler) -> bool:
         return (
@@ -831,61 +863,86 @@ class SchedulerPPMixin:
             return True
         return self.tree_cache.check_prefetch_progress(req.rid)
 
-    def _pp_get_local_prefill_ready_rids(self: Scheduler) -> List[str]:
+    def _pp_get_local_prefill_ready_views(self: Scheduler) -> List[PPPrefillReadyView]:
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
-        ready_rids: List[str] = []
+        ready_views: List[PPPrefillReadyView] = []
         seen = set()
 
         if self.chunked_req is not None and self._pp_is_prefill_req_locally_ready(
             self.chunked_req
         ):
-            ready_rids.append(self.chunked_req.rid)
+            ready_views.append(
+                PPPrefillReadyView(
+                    self.chunked_req.rid, len(self.chunked_req.prefix_indices)
+                )
+            )
             seen.add(self.chunked_req.rid)
 
         for req in self.waiting_queue:
             if req.rid in seen:
                 continue
             if self._pp_is_prefill_req_locally_ready(req):
-                ready_rids.append(req.rid)
+                ready_views.append(PPPrefillReadyView(req.rid, len(req.prefix_indices)))
                 seen.add(req.rid)
 
-        return ready_rids
+        return ready_views
 
-    def _pp_pd_get_prefill_ready_ids(self: Scheduler) -> List[str]:
-        curr_ready_rids = self._pp_get_local_prefill_ready_rids()
+    def _pp_pd_get_prefill_ready_views(self: Scheduler) -> List[PPPrefillReadyView]:
+        curr_ready_views = self._pp_get_local_prefill_ready_views()
         if self.pp_group.is_first_rank:
-            return curr_ready_rids
+            return curr_ready_views
 
-        prev_ready_rids = self._pp_recv_pyobj_from_prev_stage()
-        return _ordered_intersection(prev_ready_rids, curr_ready_rids)
+        prev_ready_views = self._pp_recv_pyobj_from_prev_stage()
+        return _ordered_intersection_prefill_ready_views(
+            prev_ready_views, curr_ready_views
+        )
 
-    def _pp_validate_authoritative_prefill_ready_rids(
+    def _pp_validate_authoritative_prefill_ready_views(
         self: Scheduler,
         batch: Optional[ScheduleBatch],
-        authoritative_rids: Optional[List[str]],
+        authoritative_views: Optional[List[PPPrefillReadyView]],
     ) -> None:
-        if self.pp_group.is_first_rank or authoritative_rids is None:
+        if authoritative_views is None:
             return
 
-        local_rids = self._pp_get_authoritative_prefill_ready_rids(batch)
-        if local_rids == authoritative_rids:
+        local_views = self._pp_get_authoritative_prefill_ready_views(batch)
+        if self.pp_group.is_first_rank:
+            authoritative_by_rid = {view.rid: view for view in authoritative_views}
+            if all(authoritative_by_rid.get(view.rid) == view for view in local_views):
+                return
+            logger.error(
+                "PP authoritative prefill ready views mismatch before launch at PP%s "
+                "ATTN_CP%s TP%s: authoritative=%s local=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                authoritative_views,
+                local_views,
+            )
+            raise RuntimeError(
+                "PP authoritative prefill ready views mismatch before launch: "
+                f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
+                f"authoritative={authoritative_views} local={local_views}"
+            )
+
+        if local_views == authoritative_views:
             return
 
         logger.error(
-            "PP authoritative prefill ready rids mismatch before proxy recv at PP%s "
+            "PP authoritative prefill ready views mismatch before proxy recv at PP%s "
             "ATTN_CP%s TP%s: authoritative=%s local=%s",
             self.pp_rank,
             self.attn_cp_rank,
             self.attn_tp_rank,
-            authoritative_rids,
-            local_rids,
+            authoritative_views,
+            local_views,
         )
         raise RuntimeError(
-            "PP authoritative prefill ready rids mismatch before launch: "
+            "PP authoritative prefill ready views mismatch before launch: "
             f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
-            f"authoritative={authoritative_rids} local={local_rids}"
+            f"authoritative={authoritative_views} local={local_views}"
         )
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
@@ -988,26 +1045,26 @@ class SchedulerPPMixin:
                 )
         return send_release_work, release_rids
 
-    def _pp_pd_send_consensus_prefill_ready_ids(
+    def _pp_pd_send_consensus_prefill_ready_views(
         self: Scheduler,
-        pmbs: List[List[str]],
+        pmbs: List[List[PPPrefillReadyView]],
         next_first_rank_mb_id: int,
-        consensus_prefill_ready_rids: Optional[List[str]],
-        prefill_ready_rids: List[str],
+        consensus_prefill_ready_views: Optional[List[PPPrefillReadyView]],
+        prefill_ready_views: List[PPPrefillReadyView],
     ):
         send_consensus_prefill_ready_work = []
         if self.pp_group.is_last_rank:
             if pmbs[next_first_rank_mb_id] is not None:
-                consensus_prefill_ready_rids = prefill_ready_rids
+                consensus_prefill_ready_views = prefill_ready_views
                 send_consensus_prefill_ready_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_prefill_ready_rids, async_send=True
+                    consensus_prefill_ready_views, async_send=True
                 )
         else:
-            if consensus_prefill_ready_rids is not None:
+            if consensus_prefill_ready_views is not None:
                 send_consensus_prefill_ready_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_prefill_ready_rids, async_send=True
+                    consensus_prefill_ready_views, async_send=True
                 )
-        return send_consensus_prefill_ready_work, consensus_prefill_ready_rids
+        return send_consensus_prefill_ready_work, consensus_prefill_ready_views
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
