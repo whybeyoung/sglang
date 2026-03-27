@@ -3107,6 +3107,24 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
+        if self.chunked_req is not None and (
+            recv_req.abort_all or self.chunked_req.rid.startswith(recv_req.rid)
+        ):
+            req = self.chunked_req
+            logger.debug(f"Abort chunked request. {req.rid=}")
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            if hasattr(req, "disagg_kv_sender") and hasattr(req.disagg_kv_sender, "abort"):
+                req.disagg_kv_sender.abort()
+            self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                release_req_to_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+            if req.req_pool_idx is not None:
+                release_kv_cache(req, self.tree_cache)
+            self.chunked_req = None
+
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
         # The request will still run one prefill forward pass.
