@@ -156,7 +156,10 @@ from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_pp_mixin import (
+    PPPrefillBatchContract,
+    SchedulerPPMixin,
+)
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
@@ -769,6 +772,9 @@ class Scheduler(
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._sgl_pp_authoritative_prefill_contract_retry_counts = {}
+        self._sgl_pp_upstream_prefill_batch_contract = None
+        self._sgl_pp_scheduled_chunked_rid = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2005,10 +2011,99 @@ class Scheduler(
         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
         return self._pp_get_req_ready_len(req)
 
+    def _pp_wait_for_authoritative_prefetch_ready(
+        self,
+        rid: str,
+        *,
+        reason: str,
+        authoritative_contract: Optional[PPPrefillBatchContract] = None,
+    ) -> None:
+        timeout_s = max(envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1)
+        wait_start = time.perf_counter()
+        prefetch_done = self.tree_cache.check_prefetch_progress(rid)
+
+        while not prefetch_done:
+            elapsed_s = time.perf_counter() - wait_start
+            if elapsed_s >= timeout_s:
+                raise RuntimeError(
+                    "PP authoritative prefetch readiness wait timed out: "
+                    f"rid={rid} reason={reason} waited_s={elapsed_s:.3f} "
+                    f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
+                    f"contract={authoritative_contract}"
+                )
+
+            self.tree_cache.check_hicache_events()
+            time.sleep(0.001)
+            prefetch_done = self.tree_cache.check_prefetch_progress(rid)
+
+        elapsed_ms = (time.perf_counter() - wait_start) * 1e3
+        if elapsed_ms > 1:
+            logger.warning(
+                "[PPShape] waited for authoritative prefetch readiness: "
+                "rid=%s reason=%s wait_ms=%.2f pp=%s cp=%s tp=%s contract=%s",
+                rid,
+                reason,
+                elapsed_ms,
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                authoritative_contract,
+            )
+
+    def _pp_apply_authoritative_prefill_req_contract(
+        self, req: Req, authoritative_contract: PPPrefillBatchContract
+    ) -> None:
+        if req.extend_batch_idx + 1 != authoritative_contract.extend_batch_idx:
+            raise RuntimeError(
+                "PP authoritative prefill batch contract extend_batch_idx mismatch: "
+                f"rid={req.rid} local_extend_batch_idx={req.extend_batch_idx} "
+                f"contract={authoritative_contract}"
+            )
+
+        if authoritative_contract.prefix_len + authoritative_contract.extend_len != (
+            authoritative_contract.fill_len
+        ):
+            raise RuntimeError(
+                "Invalid PP authoritative prefill batch contract: "
+                f"rid={authoritative_contract.rid} "
+                f"fill_len={authoritative_contract.fill_len} "
+                f"prefix_len={authoritative_contract.prefix_len} "
+                f"extend_len={authoritative_contract.extend_len}"
+            )
+
+        if len(req.fill_ids) < authoritative_contract.fill_len:
+            raise RuntimeError(
+                "PP authoritative prefill batch contract fill_len exceeds local request length: "
+                f"rid={req.rid} local_fill_len={len(req.fill_ids)} "
+                f"contract={authoritative_contract}"
+            )
+
+        local_ready_len = self._pp_get_req_ready_len(req)
+        if local_ready_len < authoritative_contract.prefix_len:
+            raise RuntimeError(
+                "PP authoritative prefill batch contract exceeds local ready capability: "
+                f"rid={req.rid} local_ready_len={local_ready_len} "
+                f"contract={authoritative_contract}"
+            )
+
+        effective_ready_len = self._pp_shape_req_ready_len(
+            req, authoritative_contract.prefix_len
+        )
+        if effective_ready_len < authoritative_contract.prefix_len:
+            raise RuntimeError(
+                "PP authoritative prefill batch contract failed to shape to prefix_len: "
+                f"rid={req.rid} effective_ready_len={effective_ready_len} "
+                f"contract={authoritative_contract}"
+            )
+
+        req.fill_ids = req.fill_ids[: authoritative_contract.fill_len]
+        req.set_extend_input_len(authoritative_contract.extend_len)
+
     def get_new_batch_prefill(
         self,
         authoritative_rids: Optional[List[str]] = None,
         authoritative_ready_len_by_rid: Optional[Dict[str, int]] = None,
+        authoritative_batch_contract: Optional[List[PPPrefillBatchContract]] = None,
     ) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2021,6 +2116,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             authoritative_rids=authoritative_rids,
             authoritative_ready_len_by_rid=authoritative_ready_len_by_rid,
+            authoritative_batch_contract=authoritative_batch_contract,
         )
 
         if self.prefill_delayer:
@@ -2033,6 +2129,7 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         authoritative_rids: Optional[List[str]] = None,
         authoritative_ready_len_by_rid: Optional[Dict[str, int]] = None,
+        authoritative_batch_contract: Optional[List[PPPrefillBatchContract]] = None,
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -2047,13 +2144,23 @@ class Scheduler(
         authoritative_rid_set = (
             set(authoritative_rids) if authoritative_rids is not None else None
         )
+        authoritative_batch_contract_by_rid = (
+            {entry.rid: entry for entry in authoritative_batch_contract}
+            if authoritative_batch_contract is not None
+            else None
+        )
+        self._sgl_pp_upstream_prefill_batch_contract = authoritative_batch_contract
+        self._sgl_pp_scheduled_chunked_rid = None
         allow_authoritative_ready_len_shaping = (
             authoritative_ready_len_by_rid is not None
+            and authoritative_batch_contract is None
         )
         has_chunked_slot = self.chunked_req is not None
         active_chunked_req = self.chunked_req is not None and (
-            authoritative_rid_set is None
-            or self.chunked_req.rid in authoritative_rid_set
+            authoritative_rid_set is None or self.chunked_req.rid in authoritative_rid_set
+        ) and (
+            authoritative_batch_contract_by_rid is None
+            or self.chunked_req.rid in authoritative_batch_contract_by_rid
         )
 
         if (
@@ -2115,22 +2222,46 @@ class Scheduler(
 
         has_selected_chunked_req = False
         if active_chunked_req:
+            if self.enable_hicache_storage and authoritative_batch_contract_by_rid is not None:
+                self._pp_wait_for_authoritative_prefetch_ready(
+                    self.chunked_req.rid,
+                    reason="active_chunked_req",
+                    authoritative_contract=authoritative_batch_contract_by_rid.get(
+                        self.chunked_req.rid
+                    )
+                    if authoritative_batch_contract_by_rid is not None
+                    else None,
+                )
             self.chunked_req.init_next_round_input(self.tree_cache)
+            authoritative_contract = None
+            if authoritative_batch_contract_by_rid is not None:
+                authoritative_contract = authoritative_batch_contract_by_rid.get(
+                    self.chunked_req.rid
+                )
             authoritative_ready_len = None
-            if authoritative_ready_len_by_rid is not None:
+            if authoritative_contract is not None:
+                if not authoritative_contract.is_chunked:
+                    raise RuntimeError(
+                        "PP authoritative prefill batch contract scheduled active chunked req as non-chunked: "
+                        f"rid={self.chunked_req.rid} contract={authoritative_contract}"
+                    )
+                self._pp_apply_authoritative_prefill_req_contract(
+                    self.chunked_req, authoritative_contract
+                )
+            elif authoritative_ready_len_by_rid is not None:
                 authoritative_ready_len = authoritative_ready_len_by_rid.get(
                     self.chunked_req.rid
                 )
             local_ready_len = self._pp_get_req_ready_len(self.chunked_req)
             effective_ready_len = local_ready_len
-            if (
+            if authoritative_contract is None and (
                 authoritative_ready_len is not None
                 and allow_authoritative_ready_len_shaping
             ):
                 effective_ready_len = self._pp_shape_req_ready_len(
                     self.chunked_req, authoritative_ready_len
                 )
-            if (
+            if authoritative_contract is None and (
                 authoritative_ready_len is not None
                 and allow_authoritative_ready_len_shaping
                 and effective_ready_len > authoritative_ready_len
@@ -2160,7 +2291,12 @@ class Scheduler(
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         if authoritative_rids is None:
-            prefill_candidate_reqs = self.waiting_queue
+            if authoritative_batch_contract is None:
+                prefill_candidate_reqs = self.waiting_queue
+            else:
+                prefill_candidate_reqs = self._pp_get_authoritative_prefill_candidates(
+                    self.waiting_queue
+                )
         else:
             req_by_rid = {req.rid: req for req in self.waiting_queue}
             prefill_candidate_reqs = [
@@ -2169,6 +2305,9 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in prefill_candidate_reqs:
+            authoritative_contract = getattr(
+                req, "_sgl_pp_authoritative_prefill_contract", None
+            )
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2203,22 +2342,11 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
-                    if authoritative_rid_set is not None:
-                        wait_start = time.perf_counter()
-                        while not prefetch_done:
-                            self.tree_cache.check_hicache_events()
-                            time.sleep(0.001)
-                            prefetch_done = self.tree_cache.check_prefetch_progress(
-                                req.rid
-                            )
-                        logger.warning(
-                            "[PPShape] waited for authoritative prefetch readiness: "
-                            "rid=%s wait_ms=%.2f pp=%s cp=%s tp=%s",
+                    if authoritative_rid_set is not None or authoritative_contract is not None:
+                        self._pp_wait_for_authoritative_prefetch_ready(
                             req.rid,
-                            (time.perf_counter() - wait_start) * 1e3,
-                            self.pp_rank,
-                            self.attn_cp_rank,
-                            self.attn_tp_rank,
+                            reason="prefill_candidate",
+                            authoritative_contract=authoritative_contract,
                         )
                     else:
                         # skip staging requests that are ongoing prefetch
@@ -2229,19 +2357,26 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if authoritative_contract is not None:
+                self._pp_apply_authoritative_prefill_req_contract(
+                    req, authoritative_contract
+                )
             local_ready_len = self._pp_get_req_ready_len(req)
             authoritative_ready_len = None
-            if authoritative_ready_len_by_rid is not None:
+            if (
+                authoritative_contract is None
+                and authoritative_ready_len_by_rid is not None
+            ):
                 authoritative_ready_len = authoritative_ready_len_by_rid.get(req.rid)
             effective_ready_len = local_ready_len
-            if (
+            if authoritative_contract is None and (
                 authoritative_ready_len is not None
                 and allow_authoritative_ready_len_shaping
             ):
                 effective_ready_len = self._pp_shape_req_ready_len(
                     req, authoritative_ready_len
                 )
-            if (
+            if authoritative_contract is None and (
                 authoritative_ready_len is not None
                 and allow_authoritative_ready_len_shaping
                 and effective_ready_len > authoritative_ready_len
@@ -2264,6 +2399,7 @@ class Scheduler(
                 os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "1") == "1"
                 and self.pp_size > 1
                 and self.disaggregation_mode == DisaggregationMode.PREFILL
+                and authoritative_contract is None
             ):
                 prefix_len_after_init = len(req.prefix_indices)
                 recomputed_extend_len = len(req.fill_ids) - prefix_len_after_init
@@ -2289,7 +2425,12 @@ class Scheduler(
                 req,
                 has_chunked_req=has_chunked_slot,
                 truncation_align_size=self.truncation_align_size,
+                force_chunked=bool(
+                    authoritative_contract is not None and authoritative_contract.is_chunked
+                ),
             )
+            if adder.new_chunked_req is not None:
+                has_chunked_slot = True
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)

@@ -723,7 +723,11 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        force_chunked: bool = False,
     ):
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -780,6 +784,15 @@ class PrefillAdder:
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
+
+            if force_chunked:
+                if has_chunked_req:
+                    return AddReqResult.OTHER
+                self.can_run_list.append(req)
+                self.new_chunked_req = req
+                self._req_inc_lock_ref(req)
+                self._update_prefill_budget(prefix_len, req.extend_input_len, 0)
+                return self.budget_state()
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:

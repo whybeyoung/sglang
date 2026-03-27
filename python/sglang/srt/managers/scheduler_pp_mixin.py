@@ -6,7 +6,7 @@ import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -62,6 +62,23 @@ def _ordered_union(left: List[str], right: List[str]) -> List[str]:
 class PPPrefillReadyView:
     rid: str
     ready_len: int
+
+
+@dataclass(frozen=True)
+class PPPrefillBatchContract:
+    rid: str
+    fill_len: int
+    prefix_len: int
+    extend_len: int
+    extend_batch_idx: int
+    is_chunked: int
+
+
+@dataclass
+class PPPrefillBatchContractDecision:
+    accepted_contract: List[PPPrefillBatchContract]
+    unexpected_local_entries: List[PPPrefillBatchContract]
+    retry_entries: List[Dict[str, Any]]
 
 
 def _ordered_intersection_prefill_ready_views(
@@ -242,6 +259,7 @@ class SchedulerPPMixin:
         release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
         send_transfer_work = []
+        send_prefill_contract_work = []
         send_prefill_wait_complete_work = []
         send_consensus_bootstrapped_work = []
         send_consensus_prefill_ready_work = []
@@ -267,7 +285,7 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
-                    self._pp_commit_comm_work(self.send_prefill_ready_work)
+                    self._pp_commit_comm_work(self.send_prefill_contract_work)
                     self._pp_commit_comm_work(send_prefill_wait_complete_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
@@ -288,6 +306,7 @@ class SchedulerPPMixin:
                     prefill_ready_views = self._pp_pd_get_prefill_ready_views()
                     pmbs[mb_id] = prefill_ready_views
                 authoritative_prefill_ready_views = None
+                authoritative_prefill_batch_contract = None
                 if self.pp_group.is_first_rank and use_wait_complete_prefill_ready_consensus:
                     authoritative_prefill_ready_views = (
                         consensus_prefill_ready_views
@@ -295,7 +314,9 @@ class SchedulerPPMixin:
                         else []
                     )
                 elif not self.pp_group.is_first_rank:
-                    authoritative_prefill_ready_views = self._pp_recv_pyobj_from_prev_stage()
+                    authoritative_prefill_batch_contract = (
+                        self._pp_recv_pyobj_from_prev_stage()
+                    )
                 authoritative_prefill_ready_rids = _prefill_ready_views_to_rids(
                     authoritative_prefill_ready_views
                 )
@@ -307,11 +328,16 @@ class SchedulerPPMixin:
                 batch = self.get_new_batch_prefill(
                     authoritative_rids=authoritative_prefill_ready_rids,
                     authoritative_ready_len_by_rid=authoritative_prefill_ready_len_by_rid,
+                    authoritative_batch_contract=authoritative_prefill_batch_contract,
                 )
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
-                if use_wait_complete_prefill_ready_consensus:
+                if use_wait_complete_prefill_ready_consensus and self.pp_group.is_first_rank:
                     self._pp_validate_authoritative_prefill_ready_views(
                         batch, authoritative_prefill_ready_views
+                    )
+                if not self.pp_group.is_first_rank:
+                    self._pp_validate_authoritative_prefill_batch_contract(
+                        batch, authoritative_prefill_batch_contract
                     )
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
@@ -409,8 +435,8 @@ class SchedulerPPMixin:
                             prefill_ready_views,
                             async_send=True,
                         )
-                    self.send_prefill_ready_work = self._pp_send_pyobj_to_next_stage(
-                        self._pp_get_authoritative_prefill_ready_views(self.cur_batch),
+                    self.send_prefill_contract_work = self._pp_send_pyobj_to_next_stage(
+                        self._pp_get_authoritative_prefill_batch_contract(self.cur_batch),
                         async_send=True,
                     )
                     if self.cur_batch:
@@ -642,7 +668,7 @@ class SchedulerPPMixin:
         )
 
         self.send_req_work = []
-        self.send_prefill_ready_work = []
+        self.send_prefill_contract_work = []
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
@@ -860,6 +886,23 @@ class SchedulerPPMixin:
             PPPrefillReadyView(req.rid, len(req.prefix_indices)) for req in batch.reqs
         ]
 
+    def _pp_get_authoritative_prefill_batch_contract(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> List[PPPrefillBatchContract]:
+        if batch is None:
+            return []
+        return [
+            PPPrefillBatchContract(
+                rid=req.rid,
+                fill_len=len(req.fill_ids),
+                prefix_len=len(req.prefix_indices),
+                extend_len=req.extend_input_len,
+                extend_batch_idx=req.extend_batch_idx,
+                is_chunked=int(req.is_chunked > 0),
+            )
+            for req in batch.reqs
+        ]
+
     def _pp_use_wait_complete_prefill_ready_consensus(self: Scheduler) -> bool:
         return (
             self.pp_size > 1
@@ -1006,6 +1049,138 @@ class SchedulerPPMixin:
             "PP authoritative prefill ready views mismatch before launch: "
             f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
             f"authoritative={authoritative_views} local={local_views}"
+        )
+
+    def _pp_get_authoritative_prefill_candidates(
+        self: Scheduler, waiting_queue: List[Req]
+    ) -> List[Req]:
+        authoritative_contract = getattr(
+            self, "_sgl_pp_upstream_prefill_batch_contract", None
+        )
+        if authoritative_contract is None:
+            return waiting_queue
+
+        for req in waiting_queue:
+            if hasattr(req, "_sgl_pp_authoritative_prefill_contract"):
+                delattr(req, "_sgl_pp_authoritative_prefill_contract")
+
+        reqs_by_rid: Dict[str, List[Req]] = defaultdict(list)
+        for req in waiting_queue:
+            reqs_by_rid[req.rid].append(req)
+
+        selected: List[Req] = []
+        scheduled_chunked_rid = None
+        for entry in authoritative_contract:
+            matched_req = None
+            for req in reqs_by_rid.get(entry.rid, []):
+                if req.extend_batch_idx + 1 != entry.extend_batch_idx:
+                    continue
+                matched_req = req
+                break
+            if matched_req is None:
+                continue
+            matched_req._sgl_pp_authoritative_prefill_contract = entry
+            selected.append(matched_req)
+            if entry.is_chunked:
+                if (
+                    scheduled_chunked_rid is not None
+                    and scheduled_chunked_rid != entry.rid
+                ):
+                    raise RuntimeError(
+                        "PP authoritative prefill batch contract contains multiple chunked requests: "
+                        f"existing={scheduled_chunked_rid} new={entry.rid}"
+                    )
+                scheduled_chunked_rid = entry.rid
+
+        self._sgl_pp_scheduled_chunked_rid = scheduled_chunked_rid
+        return selected
+
+    def _pp_partition_authoritative_prefill_batch_contract(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+        authoritative_contract: Optional[List[PPPrefillBatchContract]],
+    ) -> PPPrefillBatchContractDecision:
+        if authoritative_contract is None:
+            return PPPrefillBatchContractDecision([], [], [])
+
+        local_contract = self._pp_get_authoritative_prefill_batch_contract(batch)
+        local_by_rid = {entry.rid: entry for entry in local_contract}
+        authoritative_by_rid = {entry.rid: entry for entry in authoritative_contract}
+
+        accepted_contract: List[PPPrefillBatchContract] = []
+        unexpected_local_entries: List[PPPrefillBatchContract] = []
+        retry_entries: List[Dict[str, Any]] = []
+        unexpected_rids = set()
+
+        retry_counts = getattr(
+            self, "_sgl_pp_authoritative_prefill_contract_retry_counts", {}
+        )
+
+        for entry in authoritative_contract:
+            local_entry = local_by_rid.get(entry.rid)
+            if local_entry is None:
+                retry_count = retry_counts.get(entry.rid, 0) + 1
+                retry_counts[entry.rid] = retry_count
+                retry_entries.append(
+                    {
+                        "rid": entry.rid,
+                        "reason": "missing_before_proxy_recv",
+                        "retry_count": retry_count,
+                    }
+                )
+                continue
+            if local_entry == entry:
+                accepted_contract.append(entry)
+                retry_counts.pop(entry.rid, None)
+            else:
+                if local_entry.rid not in unexpected_rids:
+                    unexpected_local_entries.append(local_entry)
+                    unexpected_rids.add(local_entry.rid)
+
+        for local_entry in local_contract:
+            authoritative_entry = authoritative_by_rid.get(local_entry.rid)
+            if authoritative_entry != local_entry and local_entry.rid not in unexpected_rids:
+                unexpected_local_entries.append(local_entry)
+                unexpected_rids.add(local_entry.rid)
+
+        self._sgl_pp_authoritative_prefill_contract_retry_counts = retry_counts
+        return PPPrefillBatchContractDecision(
+            accepted_contract=accepted_contract,
+            unexpected_local_entries=unexpected_local_entries,
+            retry_entries=retry_entries,
+        )
+
+    def _pp_validate_authoritative_prefill_batch_contract(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+        authoritative_contract: Optional[List[PPPrefillBatchContract]],
+    ) -> None:
+        if authoritative_contract is None:
+            return
+
+        local_contract = self._pp_get_authoritative_prefill_batch_contract(batch)
+        if local_contract == authoritative_contract:
+            return
+
+        decision = self._pp_partition_authoritative_prefill_batch_contract(
+            batch, authoritative_contract
+        )
+        logger.error(
+            "PP authoritative prefill batch contract mismatch before proxy recv at PP%s "
+            "ATTN_CP%s TP%s: authoritative=%s local=%s retry=%s unexpected=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.attn_tp_rank,
+            authoritative_contract,
+            local_contract,
+            decision.retry_entries,
+            decision.unexpected_local_entries,
+        )
+        raise RuntimeError(
+            "PP authoritative prefill batch contract mismatch before launch: "
+            f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
+            f"authoritative={authoritative_contract} local={local_contract} "
+            f"retry={decision.retry_entries} unexpected={decision.unexpected_local_entries}"
         )
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
