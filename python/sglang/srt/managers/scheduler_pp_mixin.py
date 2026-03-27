@@ -229,7 +229,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_release_rids = None
                 next_consensus_bootstrapped_rids = None
-                next_consensus_prefill_ready_rids = None
+                next_consensus_prefill_ready_rids = consensus_prefill_ready_rids
                 d2h_event = None
                 next_batch_result = None
 
@@ -263,7 +263,7 @@ class SchedulerPPMixin:
                     authoritative_prefill_ready_rids = (
                         consensus_prefill_ready_rids
                         if consensus_prefill_ready_rids is not None
-                        else []
+                        else prefill_ready_rids
                     )
                 elif not self.pp_group.is_first_rank:
                     authoritative_prefill_ready_rids = self._pp_recv_pyobj_from_prev_stage()
