@@ -2049,7 +2049,6 @@ class Scheduler(
         )
         allow_authoritative_ready_len_shaping = (
             authoritative_ready_len_by_rid is not None
-            and (self.pp_size <= 1 or self.pp_group.is_first_rank)
         )
         has_chunked_slot = self.chunked_req is not None
         active_chunked_req = self.chunked_req is not None and (
