@@ -1161,7 +1161,7 @@ class HiRadixCache(RadixCache):
             )
 
         if self.prefetch_stop_policy == "wait_complete":
-            can_terminate = completed
+            can_terminate = completed and operation.has_ready_extra_pool_results()
         elif self.prefetch_stop_policy == "timeout":
             can_terminate = completed or self.is_prefetch_timeout(operation)
         else:

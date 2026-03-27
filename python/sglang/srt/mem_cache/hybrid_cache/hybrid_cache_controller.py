@@ -119,6 +119,22 @@ class StorageOperation(BaseStorageOperation):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        self.required_ready_extra_pools = {
+            _pool_name_key(transfer.name)
+            for transfer in pool_transfers or []
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+        }
+        self.ready_extra_pools: set[str] = set()
+
+    def mark_extra_pool_results_ready(
+        self, pool_transfers: Optional[list[PoolTransfer]]
+    ) -> None:
+        for transfer in pool_transfers or []:
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                self.ready_extra_pools.add(_pool_name_key(transfer.name))
+
+    def has_ready_extra_pool_results(self) -> bool:
+        return self.required_ready_extra_pools.issubset(self.ready_extra_pools)
 
 
 class PrefetchOperation(StorageOperation):
@@ -522,6 +538,7 @@ class HybridCacheController(BaseHiCacheController):
                 ),
             )
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            operation.mark_extra_pool_results_ready(transfers)
 
     def _page_backup(self, operation):
         super()._page_backup(operation)
