@@ -570,7 +570,22 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
-                assert poll == KVPoll.Success or poll == KVPoll.Failed
+                # In PP mode, the previous rank may observe a terminal state
+                # slightly earlier than this rank. Treat local transient states
+                # as undone instead of crashing on a strict assertion.
+                if poll not in (
+                    KVPoll.Success,
+                    KVPoll.Failed,
+                ):
+                    logger.warning(
+                        "PP rank %s: unexpected poll state %s for rid %s from "
+                        "consensus; treating as undone",
+                        self.pp_rank,
+                        poll,
+                        req.rid,
+                    )
+                    undone_reqs.append(req)
+                    continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
@@ -598,7 +613,13 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
-                assert False, f"Unexpected polling state {poll=}"
+                logger.warning(
+                    "Unexpected polling state %s for rid %s in inflight queue; "
+                    "treating as undone",
+                    poll,
+                    req.rid,
+                )
+                undone_reqs.append(req)
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
