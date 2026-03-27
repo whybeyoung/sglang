@@ -806,6 +806,25 @@ class TestRadixCache(unittest.TestCase):
         cache.req_to_token_pool.write.assert_not_called()
         self.assertEqual(req.cache_protected_len, 3)
 
+    def test_cache_unfinished_req_skips_cleared_req_pool_idx(self):
+        cache = RadixCache.create_simulated(page_size=1)
+        cache.insert = unittest.mock.Mock()
+        cache.req_to_token_pool.write = unittest.mock.Mock()
+        req = SimpleNamespace(
+            rid="rid-stale",
+            fill_ids=[1, 2, 3],
+            req_pool_idx=None,
+            extra_key=None,
+            cache_protected_len=0,
+            last_node=cache.root_node,
+            prefix_indices=torch.empty((0,), dtype=torch.int64),
+        )
+
+        cache.cache_unfinished_req(req, chunked=True)
+
+        cache.insert.assert_not_called()
+        cache.req_to_token_pool.write.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

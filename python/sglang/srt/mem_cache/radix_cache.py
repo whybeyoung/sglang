@@ -503,6 +503,12 @@ class RadixCache(BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             return
+        if req.req_pool_idx is None:
+            logger.warning(
+                "Skip cache_unfinished_req for rid %s because req_pool_idx is already cleared",
+                req.rid,
+            )
+            return
 
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[

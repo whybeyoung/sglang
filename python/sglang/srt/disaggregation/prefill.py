@@ -460,10 +460,33 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs.tolist()
                 )
 
+        done_reqs: List[Req] = []
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             if req.is_chunked <= 0:
+                if getattr(req, "_sgl_abort_requested", False):
+                    logger.warning(
+                        "Finalize aborted prefill result for rid %s without cache writeback",
+                        req.rid,
+                    )
+                    req.time_stats.set_prefill_finished_time()
+                    req.check_finished()
+                    if req.req_pool_idx is not None:
+                        release_kv_cache(req, self.tree_cache)
+                    if hasattr(req, "disagg_kv_sender") and hasattr(
+                        req.disagg_kv_sender, "clear"
+                    ):
+                        req.disagg_kv_sender.clear()
+                    req.time_stats.set_completion_time()
+                    done_reqs.append(req)
+                    continue
+                if req.req_pool_idx is None:
+                    logger.warning(
+                        "Skip stale prefill result for rid %s because req_pool_idx is already cleared",
+                        req.rid,
+                    )
+                    continue
                 req.time_stats.set_prefill_finished_time()
 
                 # There is no output_ids for prefill
@@ -512,6 +535,18 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     req.grammar.finished = req.finished()
             else:
+                if getattr(req, "_sgl_abort_requested", False):
+                    logger.warning(
+                        "Skip aborted chunked prefill result for rid %s",
+                        req.rid,
+                    )
+                    continue
+                if req.req_pool_idx is None:
+                    logger.warning(
+                        "Skip stale chunked prefill result for rid %s because req_pool_idx is already cleared",
+                        req.rid,
+                    )
+                    continue
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
 
@@ -534,6 +569,17 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if done_reqs:
+            self.stream_output(
+                done_reqs,
+                any(req.return_logprob for req in done_reqs),
+                None,
+            )
+            for req in done_reqs:
+                release_req_to_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
 
         if self.current_scheduler_metrics_enabled:
             can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
@@ -703,7 +749,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         """
         Send a prefilled chunk to the decode server
         """
@@ -719,12 +765,6 @@ class SchedulerDisaggregationPrefillMixin:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
-        req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -770,10 +810,25 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
+        if start_idx >= end_idx:
+            req.start_send_idx = end_idx
+            if last_chunk:
+                req.disagg_kv_sender.send(
+                    torch.empty((0,), dtype=torch.int32).numpy(), state_indices
+                )
+            return True
+
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
+            .cpu()
+            .numpy()
+        )
+        req.start_send_idx = end_idx
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
-            return
+            return False
         req.disagg_kv_sender.send(page_indices, state_indices)
+        return True

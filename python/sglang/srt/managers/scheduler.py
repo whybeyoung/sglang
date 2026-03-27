@@ -3111,6 +3111,7 @@ class Scheduler(
             recv_req.abort_all or self.chunked_req.rid.startswith(recv_req.rid)
         ):
             req = self.chunked_req
+            req._sgl_abort_requested = True
             logger.debug(f"Abort chunked request. {req.rid=}")
             if self.enable_hicache_storage:
                 self.tree_cache.release_aborted_request(req.rid)
@@ -3137,6 +3138,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    req._sgl_abort_requested = True
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -3144,6 +3146,7 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    req._sgl_abort_requested = True
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -3188,6 +3191,13 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
+                req._sgl_abort_requested = True
+                if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and hasattr(req, "disagg_kv_sender")
+                    and hasattr(req.disagg_kv_sender, "abort")
+                ):
+                    req.disagg_kv_sender.abort()
                 req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
