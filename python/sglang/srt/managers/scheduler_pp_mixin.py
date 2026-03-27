@@ -944,7 +944,7 @@ class SchedulerPPMixin:
         batch: Optional[ScheduleBatch],
         authoritative_views: Optional[List[PPPrefillReadyView]],
     ) -> None:
-        def within_authoritative_cap(require_exact_rids: bool) -> bool:
+        def within_authoritative_cap() -> bool:
             authoritative_idx = 0
             authoritative_len = len(authoritative_views)
 
@@ -953,8 +953,6 @@ class SchedulerPPMixin:
                     authoritative_view = authoritative_views[authoritative_idx]
                     if authoritative_view.rid == local_view.rid:
                         break
-                    if require_exact_rids:
-                        return False
                     authoritative_idx += 1
 
                 if authoritative_idx >= authoritative_len:
@@ -965,14 +963,17 @@ class SchedulerPPMixin:
                     return False
                 authoritative_idx += 1
 
-            return (not require_exact_rids) or authoritative_idx == authoritative_len
+            return True
+
+        def matches_authoritative_exactly() -> bool:
+            return local_views == authoritative_views
 
         if authoritative_views is None:
             return
 
         local_views = self._pp_get_authoritative_prefill_ready_views(batch)
         if self.pp_group.is_first_rank:
-            if within_authoritative_cap(require_exact_rids=False):
+            if within_authoritative_cap():
                 return
             logger.error(
                 "PP authoritative prefill ready views exceed authoritative cap before launch at PP%s "
@@ -989,11 +990,11 @@ class SchedulerPPMixin:
                 f"authoritative={authoritative_views} local={local_views}"
             )
 
-        if within_authoritative_cap(require_exact_rids=True):
+        if matches_authoritative_exactly():
             return
 
         logger.error(
-            "PP authoritative prefill ready views exceed authoritative cap before proxy recv at PP%s "
+            "PP authoritative prefill ready views mismatch before proxy recv at PP%s "
             "ATTN_CP%s TP%s: authoritative=%s local=%s",
             self.pp_rank,
             self.attn_cp_rank,
@@ -1002,7 +1003,7 @@ class SchedulerPPMixin:
             local_views,
         )
         raise RuntimeError(
-            "PP authoritative prefill ready views exceed authoritative cap before launch: "
+            "PP authoritative prefill ready views mismatch before launch: "
             f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
             f"authoritative={authoritative_views} local={local_views}"
         )

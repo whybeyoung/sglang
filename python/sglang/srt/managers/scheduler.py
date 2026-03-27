@@ -2047,6 +2047,10 @@ class Scheduler(
         authoritative_rid_set = (
             set(authoritative_rids) if authoritative_rids is not None else None
         )
+        allow_authoritative_ready_len_shaping = (
+            authoritative_ready_len_by_rid is not None
+            and (self.pp_size <= 1 or self.pp_group.is_first_rank)
+        )
         has_chunked_slot = self.chunked_req is not None
         active_chunked_req = self.chunked_req is not None and (
             authoritative_rid_set is None
@@ -2120,7 +2124,10 @@ class Scheduler(
                 )
             local_ready_len = self._pp_get_req_ready_len(self.chunked_req)
             effective_ready_len = local_ready_len
-            if authoritative_ready_len is not None:
+            if (
+                authoritative_ready_len is not None
+                and allow_authoritative_ready_len_shaping
+            ):
                 effective_ready_len = self._pp_shape_req_ready_len(
                     self.chunked_req, authoritative_ready_len
                 )
@@ -2227,7 +2234,10 @@ class Scheduler(
             if authoritative_ready_len_by_rid is not None:
                 authoritative_ready_len = authoritative_ready_len_by_rid.get(req.rid)
             effective_ready_len = local_ready_len
-            if authoritative_ready_len is not None:
+            if (
+                authoritative_ready_len is not None
+                and allow_authoritative_ready_len_shaping
+            ):
                 effective_ready_len = self._pp_shape_req_ready_len(
                     req, authoritative_ready_len
                 )
