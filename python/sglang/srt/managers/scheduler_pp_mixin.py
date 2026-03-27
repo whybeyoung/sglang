@@ -205,13 +205,17 @@ class SchedulerPPMixin:
 
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
+        pmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
+        consensus_prefill_ready_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
         send_transfer_work = []
+        send_prefill_wait_complete_work = []
         send_consensus_bootstrapped_work = []
+        send_consensus_prefill_ready_work = []
         send_release_work = []
 
         while True:
@@ -225,6 +229,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_release_rids = None
                 next_consensus_bootstrapped_rids = None
+                next_consensus_prefill_ready_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -234,6 +239,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     self._pp_commit_comm_work(self.send_prefill_ready_work)
+                    self._pp_commit_comm_work(send_prefill_wait_complete_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
@@ -243,9 +249,23 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                use_wait_complete_prefill_ready_consensus = (
+                    self._pp_use_wait_complete_prefill_ready_consensus()
+                )
+                prefill_ready_rids = None
+                if use_wait_complete_prefill_ready_consensus:
+                    prefill_ready_rids = self._pp_pd_get_prefill_ready_ids()
+                    pmbs[mb_id] = prefill_ready_rids
+
                 self.process_prefill_chunk()
                 authoritative_prefill_ready_rids = None
-                if not self.pp_group.is_first_rank:
+                if self.pp_group.is_first_rank and use_wait_complete_prefill_ready_consensus:
+                    authoritative_prefill_ready_rids = (
+                        consensus_prefill_ready_rids
+                        if consensus_prefill_ready_rids is not None
+                        else []
+                    )
+                elif not self.pp_group.is_first_rank:
                     authoritative_prefill_ready_rids = self._pp_recv_pyobj_from_prev_stage()
                 batch = self.get_new_batch_prefill(
                     authoritative_rids=authoritative_prefill_ready_rids
@@ -297,6 +317,16 @@ class SchedulerPPMixin:
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
+                if use_wait_complete_prefill_ready_consensus:
+                    (
+                        send_consensus_prefill_ready_work,
+                        consensus_prefill_ready_rids,
+                    ) = self._pp_pd_send_consensus_prefill_ready_ids(
+                        pmbs,
+                        next_first_rank_mb_id,
+                        consensus_prefill_ready_rids,
+                        prefill_ready_rids,
+                    )
 
                 if bmbs[next_mb_id] is not None:
                     next_consensus_bootstrapped_rids = (
@@ -309,6 +339,11 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
+                if use_wait_complete_prefill_ready_consensus and pmbs[next_mb_id] is not None:
+                    next_consensus_prefill_ready_rids = (
+                        self._pp_recv_pyobj_from_prev_stage()
+                    )
+                self._pp_commit_comm_work(send_consensus_prefill_ready_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -330,6 +365,11 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    if use_wait_complete_prefill_ready_consensus:
+                        send_prefill_wait_complete_work = self._pp_send_pyobj_to_next_stage(
+                            prefill_ready_rids,
+                            async_send=True,
+                        )
                     self.send_prefill_ready_work = self._pp_send_pyobj_to_next_stage(
                         self._pp_get_authoritative_prefill_ready_rids(self.cur_batch),
                         async_send=True,
@@ -345,6 +385,8 @@ class SchedulerPPMixin:
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
+                if use_wait_complete_prefill_ready_consensus:
+                    consensus_prefill_ready_rids = next_consensus_prefill_ready_rids
 
                 self.running_batch.batch_is_full = False
 
@@ -777,6 +819,48 @@ class SchedulerPPMixin:
             return []
         return [req.rid for req in batch.reqs]
 
+    def _pp_use_wait_complete_prefill_ready_consensus(self: Scheduler) -> bool:
+        return (
+            self.pp_size > 1
+            and self.enable_hicache_storage
+            and self.server_args.hicache_storage_prefetch_policy == "wait_complete"
+        )
+
+    def _pp_is_prefill_req_locally_ready(self: Scheduler, req: Req) -> bool:
+        if not self.enable_hicache_storage:
+            return True
+        return self.tree_cache.check_prefetch_progress(req.rid)
+
+    def _pp_get_local_prefill_ready_rids(self: Scheduler) -> List[str]:
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
+        ready_rids: List[str] = []
+        seen = set()
+
+        if self.chunked_req is not None and self._pp_is_prefill_req_locally_ready(
+            self.chunked_req
+        ):
+            ready_rids.append(self.chunked_req.rid)
+            seen.add(self.chunked_req.rid)
+
+        for req in self.waiting_queue:
+            if req.rid in seen:
+                continue
+            if self._pp_is_prefill_req_locally_ready(req):
+                ready_rids.append(req.rid)
+                seen.add(req.rid)
+
+        return ready_rids
+
+    def _pp_pd_get_prefill_ready_ids(self: Scheduler) -> List[str]:
+        curr_ready_rids = self._pp_get_local_prefill_ready_rids()
+        if self.pp_group.is_first_rank:
+            return curr_ready_rids
+
+        prev_ready_rids = self._pp_recv_pyobj_from_prev_stage()
+        return _ordered_intersection(prev_ready_rids, curr_ready_rids)
+
     def _pp_validate_authoritative_prefill_ready_rids(
         self: Scheduler,
         batch: Optional[ScheduleBatch],
@@ -903,6 +987,27 @@ class SchedulerPPMixin:
                     release_rids, async_send=True
                 )
         return send_release_work, release_rids
+
+    def _pp_pd_send_consensus_prefill_ready_ids(
+        self: Scheduler,
+        pmbs: List[List[str]],
+        next_first_rank_mb_id: int,
+        consensus_prefill_ready_rids: Optional[List[str]],
+        prefill_ready_rids: List[str],
+    ):
+        send_consensus_prefill_ready_work = []
+        if self.pp_group.is_last_rank:
+            if pmbs[next_first_rank_mb_id] is not None:
+                consensus_prefill_ready_rids = prefill_ready_rids
+                send_consensus_prefill_ready_work = self._pp_send_pyobj_to_next_stage(
+                    consensus_prefill_ready_rids, async_send=True
+                )
+        else:
+            if consensus_prefill_ready_rids is not None:
+                send_consensus_prefill_ready_work = self._pp_send_pyobj_to_next_stage(
+                    consensus_prefill_ready_rids, async_send=True
+                )
+        return send_consensus_prefill_ready_work, consensus_prefill_ready_rids
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
