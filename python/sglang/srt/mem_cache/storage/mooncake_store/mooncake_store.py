@@ -719,7 +719,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         results: List[bool | int],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> None:
-        if os.getenv("SGLANG_DEBUG_NSA_STORAGE_KEYS", "1") != "1":
+        if os.getenv("SGLANG_DEBUG_NSA_STORAGE_KEYS", "0") != "1":
             return
         rid = self._get_debug_rid(extra_info)
         for key, result in zip(keys, results):
