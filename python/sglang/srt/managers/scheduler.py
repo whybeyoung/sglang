@@ -2103,7 +2103,6 @@ class Scheduler(
         self,
         authoritative_rids: Optional[List[str]] = None,
         authoritative_ready_len_by_rid: Optional[Dict[str, int]] = None,
-        authoritative_batch_contract: Optional[List[PPPrefillBatchContract]] = None,
     ) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2116,7 +2115,6 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             authoritative_rids=authoritative_rids,
             authoritative_ready_len_by_rid=authoritative_ready_len_by_rid,
-            authoritative_batch_contract=authoritative_batch_contract,
         )
 
         if self.prefill_delayer:
@@ -2129,7 +2127,6 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         authoritative_rids: Optional[List[str]] = None,
         authoritative_ready_len_by_rid: Optional[Dict[str, int]] = None,
-        authoritative_batch_contract: Optional[List[PPPrefillBatchContract]] = None,
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -2144,12 +2141,12 @@ class Scheduler(
         authoritative_rid_set = (
             set(authoritative_rids) if authoritative_rids is not None else None
         )
+        authoritative_batch_contract = self._sgl_pp_upstream_prefill_batch_contract
         authoritative_batch_contract_by_rid = (
             {entry.rid: entry for entry in authoritative_batch_contract}
             if authoritative_batch_contract is not None
             else None
         )
-        self._sgl_pp_upstream_prefill_batch_contract = authoritative_batch_contract
         self._sgl_pp_scheduled_chunked_rid = None
         allow_authoritative_ready_len_shaping = (
             authoritative_ready_len_by_rid is not None
@@ -2233,6 +2230,7 @@ class Scheduler(
                     else None,
                 )
             self.chunked_req.init_next_round_input(self.tree_cache)
+            chunked_req_full_fill_len = len(self.chunked_req.fill_ids)
             authoritative_contract = None
             if authoritative_batch_contract_by_rid is not None:
                 authoritative_contract = authoritative_batch_contract_by_rid.get(
@@ -2282,7 +2280,22 @@ class Scheduler(
                 self.waiting_queue.insert(0, self.chunked_req)
                 self.chunked_req = None
             else:
-                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                if authoritative_contract is not None:
+                    active_chunked_req_ref = self.chunked_req
+                    active_chunked_req_ref._sgl_pp_force_exact_chunked = True
+                    active_chunked_req_ref._sgl_pp_force_exact_chunked_truncated = (
+                        authoritative_contract.fill_len < chunked_req_full_fill_len
+                    )
+                    try:
+                        self.chunked_req = adder.add_chunked_req(active_chunked_req_ref)
+                    finally:
+                        delattr(active_chunked_req_ref, "_sgl_pp_force_exact_chunked")
+                        delattr(
+                            active_chunked_req_ref,
+                            "_sgl_pp_force_exact_chunked_truncated",
+                        )
+                else:
+                    self.chunked_req = adder.add_chunked_req(self.chunked_req)
                 has_selected_chunked_req = True
 
         has_chunked_slot = has_chunked_slot or has_selected_chunked_req
@@ -2421,14 +2434,17 @@ class Scheduler(
                         self.attn_cp_rank,
                         self.attn_tp_rank,
                     )
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=has_chunked_slot,
-                truncation_align_size=self.truncation_align_size,
-                force_chunked=bool(
-                    authoritative_contract is not None and authoritative_contract.is_chunked
-                ),
-            )
+            if authoritative_contract is not None and authoritative_contract.is_chunked:
+                req._sgl_pp_force_chunked = True
+            try:
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=has_chunked_slot,
+                    truncation_align_size=self.truncation_align_size,
+                )
+            finally:
+                if hasattr(req, "_sgl_pp_force_chunked"):
+                    delattr(req, "_sgl_pp_force_chunked")
             if adder.new_chunked_req is not None:
                 has_chunked_slot = True
 

@@ -595,6 +595,8 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        force_exact = bool(getattr(req, "_sgl_pp_force_exact_chunked", False))
+        truncated = getattr(req, "_sgl_pp_force_exact_chunked_truncated", None)
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -604,22 +606,31 @@ class PrefillAdder:
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
 
-        truncated = req.extend_input_len > _rem_tokens
-        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        if force_exact:
+            if req.extend_input_len > _rem_tokens:
+                raise RuntimeError(
+                    "PP authoritative prefill batch contract exceeds local chunk budget: "
+                    f"extend_input_len={req.extend_input_len} rem_tokens={_rem_tokens}"
+                )
+            effective_truncated = bool(truncated)
+        else:
+            effective_truncated = req.extend_input_len > _rem_tokens
+            req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
+            req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
+                if not effective_truncated
                 else 0
             ),
         )
 
         # Return if chunked prefill not finished
-        return req if truncated else None
+        return req if effective_truncated else None
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -723,12 +734,9 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self,
-        req: Req,
-        has_chunked_req: bool,
-        truncation_align_size: Optional[int],
-        force_chunked: bool = False,
+        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        force_chunked = bool(getattr(req, "_sgl_pp_force_chunked", False))
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,

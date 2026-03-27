@@ -325,10 +325,12 @@ class SchedulerPPMixin:
                     if authoritative_prefill_ready_views is not None
                     else None
                 )
+                self._sgl_pp_upstream_prefill_batch_contract = (
+                    authoritative_prefill_batch_contract
+                )
                 batch = self.get_new_batch_prefill(
                     authoritative_rids=authoritative_prefill_ready_rids,
                     authoritative_ready_len_by_rid=authoritative_prefill_ready_len_by_rid,
-                    authoritative_batch_contract=authoritative_prefill_batch_contract,
                 )
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 if use_wait_complete_prefill_ready_consensus and self.pp_group.is_first_rank:
