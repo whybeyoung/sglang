@@ -2047,6 +2047,7 @@ class Scheduler(
         authoritative_rid_set = (
             set(authoritative_rids) if authoritative_rids is not None else None
         )
+        has_chunked_slot = self.chunked_req is not None
         active_chunked_req = self.chunked_req is not None and (
             authoritative_rid_set is None
             or self.chunked_req.rid in authoritative_rid_set
@@ -2145,6 +2146,8 @@ class Scheduler(
             else:
                 self.chunked_req = adder.add_chunked_req(self.chunked_req)
                 has_selected_chunked_req = True
+
+        has_chunked_slot = has_chunked_slot or has_selected_chunked_req
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2273,7 +2276,7 @@ class Scheduler(
                     )
             res = adder.add_one_req(
                 req,
-                has_chunked_req=has_selected_chunked_req,
+                has_chunked_req=has_chunked_slot,
                 truncation_align_size=self.truncation_align_size,
             )
 
