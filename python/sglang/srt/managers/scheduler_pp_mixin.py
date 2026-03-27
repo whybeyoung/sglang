@@ -320,6 +320,11 @@ class SchedulerPPMixin:
                         if consensus_prefill_ready_views is not None
                         else []
                     )
+                    authoritative_prefill_ready_views = (
+                        self._pp_filter_duplicate_authoritative_prefill_ready_views(
+                            authoritative_prefill_ready_views
+                        )
+                    )
                 elif not self.pp_group.is_first_rank:
                     authoritative_prefill_batch_contract = (
                         self._pp_recv_pyobj_from_prev_stage()
@@ -952,6 +957,36 @@ class SchedulerPPMixin:
             inflight_rids.add(inflight_req.rid)
 
         return req.rid not in inflight_rids
+
+    def _pp_get_pending_prefill_rids(self: Scheduler) -> set[str]:
+        pending_rids = set()
+
+        if getattr(self, "chunked_req", None) is not None:
+            pending_rids.add(self.chunked_req.rid)
+
+        for batches in (
+            getattr(self, "mbs", []),
+            getattr(self, "running_mbs", []),
+            getattr(self, "last_mbs", []),
+        ):
+            for batch in batches or []:
+                if batch is None:
+                    continue
+                for req in getattr(batch, "reqs", []) or []:
+                    pending_rids.add(req.rid)
+                chunked_req = getattr(batch, "chunked_req", None)
+                if chunked_req is not None:
+                    pending_rids.add(chunked_req.rid)
+
+        return pending_rids
+
+    def _pp_filter_duplicate_authoritative_prefill_ready_views(
+        self: Scheduler, views: List[PPPrefillReadyView]
+    ) -> List[PPPrefillReadyView]:
+        pending_rids = self._pp_get_pending_prefill_rids()
+        if not pending_rids:
+            return views
+        return [view for view in views if view.rid not in pending_rids]
 
     def _pp_preview_req_next_round_ready_len(self: Scheduler, req: Req) -> int:
         if not self.enable_hierarchical_cache:
