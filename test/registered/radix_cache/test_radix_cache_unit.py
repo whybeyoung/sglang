@@ -28,6 +28,7 @@ import random
 import time
 import unittest
 import unittest.mock
+from types import SimpleNamespace
 
 import torch
 
@@ -772,6 +773,38 @@ class TestRadixCache(unittest.TestCase):
 
         print(cache.available_and_evictable_str())
         print(available_and_evictable_str(cache))
+
+    def test_cache_unfinished_req_skips_zero_delta_write(self):
+        cache = RadixCache.create_simulated(page_size=1)
+        cache.insert = unittest.mock.Mock(
+            return_value=SimpleNamespace(prefix_len=3)
+        )
+        cache.match_prefix = unittest.mock.Mock(
+            return_value=SimpleNamespace(
+                device_indices=torch.tensor([11, 12, 13], dtype=torch.int64),
+                last_device_node=cache.root_node,
+            )
+        )
+        cache.dec_lock_ref = unittest.mock.Mock()
+        cache.inc_lock_ref = unittest.mock.Mock()
+        cache.token_to_kv_pool_allocator.free = unittest.mock.Mock()
+        cache.req_to_token_pool.write = unittest.mock.Mock()
+        cache.req_to_token_pool.req_to_token[0, :3] = torch.tensor(
+            [11, 12, 13], dtype=torch.int32
+        )
+        req = SimpleNamespace(
+            fill_ids=[1, 2, 3],
+            req_pool_idx=0,
+            extra_key=None,
+            cache_protected_len=3,
+            last_node=cache.root_node,
+            prefix_indices=torch.tensor([11, 12, 13], dtype=torch.int64),
+        )
+
+        cache.cache_unfinished_req(req, chunked=True)
+
+        cache.req_to_token_pool.write.assert_not_called()
+        self.assertEqual(req.cache_protected_len, 3)
 
 
 if __name__ == "__main__":

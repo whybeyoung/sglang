@@ -538,10 +538,11 @@ class RadixCache(BasePrefixCache):
         )
         assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
 
-        self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
-        )
+        if len(new_indices) > req.cache_protected_len:
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+                new_indices[req.cache_protected_len :],
+            )
 
         # The cache_protected_len is not always equal to len(req.prefix_indices)
         # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
