@@ -997,7 +997,7 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "1") == "1":
+        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
             logger.warning(
                 "[HiCacheMatchChain] load_back begin: last_hit_node=%s nodes_to_load=%s "
                 "host_indices_len=%s mem_quota=%s delta=%s pp=%s cp=%s tp=%s",
@@ -1014,7 +1014,7 @@ class HiRadixCache(RadixCache):
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
-            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "1") == "1":
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
                 logger.warning(
                     "[HiCacheMatchChain] load_back skipped: last_hit_node=%s "
                     "host_indices_len=%s threshold=%s mem_quota=%s delta=%s",
@@ -1038,7 +1038,7 @@ class HiRadixCache(RadixCache):
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
-            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "1") == "1":
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
                 logger.warning(
                     "[HiCacheMatchChain] load_back failed: last_hit_node=%s host_indices_len=%s",
                     getattr(last_hit_node, "id", None),
@@ -1060,7 +1060,7 @@ class HiRadixCache(RadixCache):
             )
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
-        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "1") == "1":
+        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
             logger.warning(
                 "[HiCacheMatchChain] load_back success: last_hit_node=%s device_indices_len=%s "
                 "pp=%s cp=%s tp=%s",
@@ -1238,7 +1238,7 @@ class HiRadixCache(RadixCache):
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
-        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "1") == "1":
+        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
             logger.warning(
                 "[HiCacheMatchChain] prefetch finalize: rid=%s completed_tokens=%s "
                 "min_completed_tokens=%s matched_length=%s loaded_from_storage=%s "
@@ -1311,7 +1311,7 @@ class HiRadixCache(RadixCache):
             last_host_node = last_host_node.parent
 
         if (
-            os.getenv("SGLANG_DEBUG_HICACHE_MATCH", "1") == "1"
+            os.getenv("SGLANG_DEBUG_HICACHE_MATCH", "0") == "1"
             and self.pp_size > 1
         ):
             req_id = params.req.rid if params.req is not None else None

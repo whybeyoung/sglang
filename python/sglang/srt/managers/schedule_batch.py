@@ -895,7 +895,7 @@ class Req(ReqDllmMixin):
                 match_result.mamba_branching_seqlen,
             )
             self.cache_protected_len = len(self.prefix_indices)
-            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "1") == "1":
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
                 logger.warning(
                     "[HiCacheMatchChain] init_next_round_input: rid=%s fill_len=%s "
                     "token_ids_len=%s matched_device=%s matched_host=%s prefix_len=%s "
