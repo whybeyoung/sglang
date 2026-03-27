@@ -443,11 +443,16 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        all_pages_extra_pools = {
+            _pool_name_key(transfer.name)
+            for transfer in operation.pool_transfers or []
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+        }
         operation.pool_storage_result.update_extra_pool_hit_page_counts(
             {
                 name: count
                 for name, count in hit_result.extra_pool_hit_pages.items()
-                if name != PoolName.KV.value
+                if name != PoolName.KV.value and name not in all_pages_extra_pools
             }
         )
 
