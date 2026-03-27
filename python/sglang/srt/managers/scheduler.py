@@ -2133,6 +2133,7 @@ class Scheduler(
                 )
             if (
                 authoritative_ready_len is not None
+                and allow_authoritative_ready_len_shaping
                 and effective_ready_len > authoritative_ready_len
             ):
                 logger.warning(
@@ -2243,6 +2244,7 @@ class Scheduler(
                 )
             if (
                 authoritative_ready_len is not None
+                and allow_authoritative_ready_len_shaping
                 and effective_ready_len > authoritative_ready_len
             ):
                 logger.warning(
