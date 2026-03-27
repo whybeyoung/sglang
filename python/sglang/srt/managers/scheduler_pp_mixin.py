@@ -929,6 +929,30 @@ class SchedulerPPMixin:
             return True
         return self.tree_cache.check_prefetch_progress(req.rid)
 
+    def _pp_is_prefill_req_contract_visible_next_round(
+        self: Scheduler, req: Req
+    ) -> bool:
+        inflight_rids = set()
+
+        for batches in (
+            getattr(self, "mbs", []),
+            getattr(self, "running_mbs", []),
+            getattr(self, "last_mbs", []),
+        ):
+            for batch in batches or []:
+                if batch is None:
+                    continue
+                for batch_req in getattr(batch, "reqs", []) or []:
+                    inflight_rids.add(batch_req.rid)
+                chunked_req = getattr(batch, "chunked_req", None)
+                if chunked_req is not None:
+                    inflight_rids.add(chunked_req.rid)
+
+        for inflight_req in getattr(self, "disagg_prefill_inflight_queue", []) or []:
+            inflight_rids.add(inflight_req.rid)
+
+        return req.rid not in inflight_rids
+
     def _pp_preview_req_next_round_ready_len(self: Scheduler, req: Req) -> int:
         if not self.enable_hierarchical_cache:
             return len(req.prefix_indices)
@@ -962,8 +986,10 @@ class SchedulerPPMixin:
         ready_views: List[PPPrefillReadyView] = []
         seen = set()
 
-        if self.chunked_req is not None and self._pp_is_prefill_req_locally_ready(
-            self.chunked_req
+        if (
+            self.chunked_req is not None
+            and self._pp_is_prefill_req_locally_ready(self.chunked_req)
+            and self._pp_is_prefill_req_contract_visible_next_round(self.chunked_req)
         ):
             ready_views.append(
                 PPPrefillReadyView(
@@ -977,7 +1003,9 @@ class SchedulerPPMixin:
         for req in self.waiting_queue:
             if req.rid in seen:
                 continue
-            if self._pp_is_prefill_req_locally_ready(req):
+            if self._pp_is_prefill_req_locally_ready(
+                req
+            ) and self._pp_is_prefill_req_contract_visible_next_round(req):
                 ready_views.append(
                     PPPrefillReadyView(
                         req.rid,
