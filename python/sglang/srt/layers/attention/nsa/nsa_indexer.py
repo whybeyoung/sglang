@@ -343,12 +343,45 @@ class Indexer(MultiPlatformOp):
 
         # allgather+rerrange
         if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
+            if os.getenv("SGLANG_DEBUG_NSA_CP_GATHER", "0") == "1":
+                logger.warning(
+                    "[NSACPGatherBefore] layer=%s pp_logits_recv=%s cp_size=%s cp_rank=%s "
+                    "mode=%s query_shape=%s key_shape=%s positions_shape=%s "
+                    "out_cache_loc_shape=%s extend_num_tokens=%s seq_lens_cpu=%s "
+                    "extend_prefix_lens_cpu=%s extend_seq_lens_cpu=%s",
+                    getattr(self, "layer_id", None),
+                    self.logits_with_pp_recv,
+                    self.cp_size,
+                    self.cp_rank,
+                    getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
+                    tuple(query.shape),
+                    tuple(key.shape),
+                    tuple(positions.shape),
+                    tuple(forward_batch.out_cache_loc.shape),
+                    forward_batch.extend_num_tokens,
+                    _truncate_debug_list(forward_batch.seq_lens_cpu),
+                    _truncate_debug_list(forward_batch.extend_prefix_lens_cpu),
+                    _truncate_debug_list(forward_batch.extend_seq_lens_cpu),
+                )
             key = cp_all_gather_rerange_output(
                 key.contiguous(),
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            if os.getenv("SGLANG_DEBUG_NSA_CP_GATHER", "0") == "1":
+                logger.warning(
+                    "[NSACPGatherAfter] layer=%s pp_logits_recv=%s cp_size=%s cp_rank=%s "
+                    "mode=%s key_shape=%s out_cache_loc_shape=%s extend_num_tokens=%s",
+                    getattr(self, "layer_id", None),
+                    self.logits_with_pp_recv,
+                    self.cp_size,
+                    self.cp_rank,
+                    getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
+                    tuple(key.shape),
+                    tuple(forward_batch.out_cache_loc.shape),
+                    forward_batch.extend_num_tokens,
+                )
         return query, key
 
     def _get_k_bf16(

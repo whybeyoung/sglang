@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -28,6 +30,13 @@ from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+logger = logging.getLogger(__name__)
+
+
+def _shape_or_none(tensor):
+    return None if tensor is None else tuple(tensor.shape)
+
 
 if _is_cuda:
     from sgl_kernel import bmm_fp8
@@ -167,6 +176,25 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
+                    if os.getenv("SGLANG_DEBUG_PP_NSA_LAYER_INPUT", "0") == "1":
+                        logger.warning(
+                            "[PPNSALayerInput] layer=%s mode=%s hidden_states_shape=%s "
+                            "positions_shape=%s out_cache_loc_shape=%s extend_num_tokens=%s "
+                            "seq_lens_cpu=%s extend_prefix_lens_cpu=%s extend_seq_lens_cpu=%s",
+                            self.layer_id,
+                            getattr(
+                                forward_batch.forward_mode,
+                                "name",
+                                forward_batch.forward_mode,
+                            ),
+                            _shape_or_none(hidden_states),
+                            _shape_or_none(positions),
+                            _shape_or_none(forward_batch.out_cache_loc),
+                            forward_batch.extend_num_tokens,
+                            getattr(forward_batch, "seq_lens_cpu", None),
+                            getattr(forward_batch, "extend_prefix_lens_cpu", None),
+                            getattr(forward_batch, "extend_seq_lens_cpu", None),
+                        )
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
