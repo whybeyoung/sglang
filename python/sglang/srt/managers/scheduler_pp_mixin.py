@@ -1019,11 +1019,6 @@ class SchedulerPPMixin:
                     return False
 
                 authoritative_view = authoritative_views[authoritative_idx]
-                if (
-                    local_view.next_extend_batch_idx
-                    != authoritative_view.next_extend_batch_idx
-                ):
-                    return False
                 if local_view.ready_len > authoritative_view.ready_len:
                     return False
                 authoritative_idx += 1
