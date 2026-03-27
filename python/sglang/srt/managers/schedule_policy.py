@@ -811,6 +811,11 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
+                # Only one chunked prefill request may be active in a batch.
+                # Defer any additional chunked candidate to the next round.
+                if has_chunked_req:
+                    return AddReqResult.OTHER
+
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size

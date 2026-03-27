@@ -168,9 +168,10 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -1977,6 +1978,33 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _pp_get_req_ready_len(self, req: Req) -> int:
+        return len(req.prefix_indices) + req.host_hit_length
+
+    def _pp_shape_req_ready_len(self, req: Req, authoritative_ready_len: int) -> int:
+        local_ready_len = self._pp_get_req_ready_len(req)
+        effective_ready_len = min(local_ready_len, max(authoritative_ready_len, 0))
+        if effective_ready_len == local_ready_len:
+            return local_ready_len
+
+        match_result = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=req.fill_ids[:effective_ready_len], extra_key=req.extra_key
+                ),
+                req=req,
+                cow_mamba=self.tree_cache.supports_mamba(),
+            )
+        )
+        req.prefix_indices = match_result.device_indices
+        req.last_node = match_result.last_device_node
+        req.last_host_node = match_result.last_host_node
+        req.host_hit_length = match_result.host_hit_length
+        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+        req.cache_protected_len = len(req.prefix_indices)
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        return self._pp_get_req_ready_len(req)
+
     def get_new_batch_prefill(
         self,
         authoritative_rids: Optional[List[str]] = None,
@@ -2083,25 +2111,37 @@ class Scheduler(
 
         has_selected_chunked_req = False
         if active_chunked_req:
-            self.chunked_req.init_next_round_input()
+            self.chunked_req.init_next_round_input(self.tree_cache)
             authoritative_ready_len = None
             if authoritative_ready_len_by_rid is not None:
                 authoritative_ready_len = authoritative_ready_len_by_rid.get(
                     self.chunked_req.rid
                 )
-            if authoritative_ready_len is not None and len(
-                self.chunked_req.prefix_indices
-            ) != authoritative_ready_len:
+            local_ready_len = self._pp_get_req_ready_len(self.chunked_req)
+            effective_ready_len = local_ready_len
+            if authoritative_ready_len is not None:
+                effective_ready_len = self._pp_shape_req_ready_len(
+                    self.chunked_req, authoritative_ready_len
+                )
+            if (
+                authoritative_ready_len is not None
+                and effective_ready_len > authoritative_ready_len
+            ):
                 logger.warning(
-                    "[PPShape] skip chunked req due to authoritative ready_len mismatch: "
-                    "rid=%s authoritative_ready_len=%s local_ready_len=%s pp=%s cp=%s tp=%s",
+                    "[PPShape] skip chunked req due to authoritative ready_len clamp failure: "
+                    "rid=%s authoritative_ready_len=%s local_ready_len=%s "
+                    "host_hit=%s storage_hit=%s pp=%s cp=%s tp=%s",
                     self.chunked_req.rid,
                     authoritative_ready_len,
-                    len(self.chunked_req.prefix_indices),
+                    effective_ready_len,
+                    self.chunked_req.host_hit_length,
+                    self.chunked_req.storage_hit_length,
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
                 )
+                self.waiting_queue.insert(0, self.chunked_req)
+                self.chunked_req = None
             else:
                 self.chunked_req = adder.add_chunked_req(self.chunked_req)
                 has_selected_chunked_req = True
@@ -2179,17 +2219,26 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            local_ready_len = self._pp_get_req_ready_len(req)
             authoritative_ready_len = None
             if authoritative_ready_len_by_rid is not None:
                 authoritative_ready_len = authoritative_ready_len_by_rid.get(req.rid)
-            if authoritative_ready_len is not None and len(req.prefix_indices) != authoritative_ready_len:
+            effective_ready_len = local_ready_len
+            if authoritative_ready_len is not None:
+                effective_ready_len = self._pp_shape_req_ready_len(
+                    req, authoritative_ready_len
+                )
+            if (
+                authoritative_ready_len is not None
+                and effective_ready_len > authoritative_ready_len
+            ):
                 logger.warning(
-                    "[PPShape] skip req due to authoritative ready_len mismatch: "
+                    "[PPShape] skip req due to authoritative ready_len clamp failure: "
                     "rid=%s authoritative_ready_len=%s local_ready_len=%s "
                     "host_hit=%s storage_hit=%s pp=%s cp=%s tp=%s",
                     req.rid,
                     authoritative_ready_len,
-                    len(req.prefix_indices),
+                    effective_ready_len,
                     req.host_hit_length,
                     req.storage_hit_length,
                     self.pp_rank,

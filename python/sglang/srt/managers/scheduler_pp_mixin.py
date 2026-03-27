@@ -25,6 +25,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -71,8 +73,9 @@ def _ordered_intersection_prefill_ready_views(
         right_view = right_by_rid.get(view.rid)
         if right_view is None:
             continue
-        if right_view.ready_len == view.ready_len:
-            matched.append(view)
+        matched.append(
+            PPPrefillReadyView(view.rid, min(view.ready_len, right_view.ready_len))
+        )
     return matched
 
 
@@ -869,6 +872,32 @@ class SchedulerPPMixin:
             return True
         return self.tree_cache.check_prefetch_progress(req.rid)
 
+    def _pp_preview_req_next_round_ready_len(self: Scheduler, req: Req) -> int:
+        if not self.enable_hierarchical_cache:
+            return len(req.prefix_indices)
+
+        if req.is_dllm():
+            fill_ids = req.fill_ids
+        else:
+            fill_ids = req.origin_input_ids + req.output_ids
+
+        input_len = len(fill_ids)
+        max_prefix_len = input_len - 1
+        if req.return_logprob and req.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, req.logprob_start_len)
+        max_prefix_len = max(max_prefix_len, 0)
+
+        match_result = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=fill_ids[:max_prefix_len], extra_key=req.extra_key
+                ),
+                req=req,
+                cow_mamba=self.tree_cache.supports_mamba(),
+            )
+        )
+        return len(match_result.device_indices) + match_result.host_hit_length
+
     def _pp_get_local_prefill_ready_views(self: Scheduler) -> List[PPPrefillReadyView]:
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
@@ -881,7 +910,8 @@ class SchedulerPPMixin:
         ):
             ready_views.append(
                 PPPrefillReadyView(
-                    self.chunked_req.rid, len(self.chunked_req.prefix_indices)
+                    self.chunked_req.rid,
+                    self._pp_preview_req_next_round_ready_len(self.chunked_req),
                 )
             )
             seen.add(self.chunked_req.rid)
@@ -890,7 +920,11 @@ class SchedulerPPMixin:
             if req.rid in seen:
                 continue
             if self._pp_is_prefill_req_locally_ready(req):
-                ready_views.append(PPPrefillReadyView(req.rid, len(req.prefix_indices)))
+                ready_views.append(
+                    PPPrefillReadyView(
+                        req.rid, self._pp_preview_req_next_round_ready_len(req)
+                    )
+                )
                 seen.add(req.rid)
 
         return ready_views
@@ -910,16 +944,38 @@ class SchedulerPPMixin:
         batch: Optional[ScheduleBatch],
         authoritative_views: Optional[List[PPPrefillReadyView]],
     ) -> None:
+        def within_authoritative_cap(require_exact_rids: bool) -> bool:
+            authoritative_idx = 0
+            authoritative_len = len(authoritative_views)
+
+            for local_view in local_views:
+                while authoritative_idx < authoritative_len:
+                    authoritative_view = authoritative_views[authoritative_idx]
+                    if authoritative_view.rid == local_view.rid:
+                        break
+                    if require_exact_rids:
+                        return False
+                    authoritative_idx += 1
+
+                if authoritative_idx >= authoritative_len:
+                    return False
+
+                authoritative_view = authoritative_views[authoritative_idx]
+                if local_view.ready_len > authoritative_view.ready_len:
+                    return False
+                authoritative_idx += 1
+
+            return (not require_exact_rids) or authoritative_idx == authoritative_len
+
         if authoritative_views is None:
             return
 
         local_views = self._pp_get_authoritative_prefill_ready_views(batch)
         if self.pp_group.is_first_rank:
-            authoritative_by_rid = {view.rid: view for view in authoritative_views}
-            if all(authoritative_by_rid.get(view.rid) == view for view in local_views):
+            if within_authoritative_cap(require_exact_rids=False):
                 return
             logger.error(
-                "PP authoritative prefill ready views mismatch before launch at PP%s "
+                "PP authoritative prefill ready views exceed authoritative cap before launch at PP%s "
                 "ATTN_CP%s TP%s: authoritative=%s local=%s",
                 self.pp_rank,
                 self.attn_cp_rank,
@@ -928,16 +984,16 @@ class SchedulerPPMixin:
                 local_views,
             )
             raise RuntimeError(
-                "PP authoritative prefill ready views mismatch before launch: "
+                "PP authoritative prefill ready views exceed authoritative cap before launch: "
                 f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
                 f"authoritative={authoritative_views} local={local_views}"
             )
 
-        if local_views == authoritative_views:
+        if within_authoritative_cap(require_exact_rids=True):
             return
 
         logger.error(
-            "PP authoritative prefill ready views mismatch before proxy recv at PP%s "
+            "PP authoritative prefill ready views exceed authoritative cap before proxy recv at PP%s "
             "ATTN_CP%s TP%s: authoritative=%s local=%s",
             self.pp_rank,
             self.attn_cp_rank,
@@ -946,7 +1002,7 @@ class SchedulerPPMixin:
             local_views,
         )
         raise RuntimeError(
-            "PP authoritative prefill ready views mismatch before launch: "
+            "PP authoritative prefill ready views exceed authoritative cap before launch: "
             f"pp={self.pp_rank} cp={self.attn_cp_rank} tp={self.attn_tp_rank} "
             f"authoritative={authoritative_views} local={local_views}"
         )
