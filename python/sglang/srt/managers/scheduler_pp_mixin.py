@@ -62,6 +62,7 @@ def _ordered_union(left: List[str], right: List[str]) -> List[str]:
 class PPPrefillReadyView:
     rid: str
     ready_len: int
+    next_extend_batch_idx: int
 
 
 @dataclass(frozen=True)
@@ -90,8 +91,14 @@ def _ordered_intersection_prefill_ready_views(
         right_view = right_by_rid.get(view.rid)
         if right_view is None:
             continue
+        if right_view.next_extend_batch_idx != view.next_extend_batch_idx:
+            continue
         matched.append(
-            PPPrefillReadyView(view.rid, min(view.ready_len, right_view.ready_len))
+            PPPrefillReadyView(
+                view.rid,
+                min(view.ready_len, right_view.ready_len),
+                view.next_extend_batch_idx,
+            )
         )
     return matched
 
@@ -885,7 +892,12 @@ class SchedulerPPMixin:
         if batch is None:
             return []
         return [
-            PPPrefillReadyView(req.rid, len(req.prefix_indices)) for req in batch.reqs
+            PPPrefillReadyView(
+                req.rid,
+                len(req.prefix_indices),
+                req.extend_batch_idx,
+            )
+            for req in batch.reqs
         ]
 
     def _pp_get_authoritative_prefill_batch_contract(
@@ -957,6 +969,7 @@ class SchedulerPPMixin:
                 PPPrefillReadyView(
                     self.chunked_req.rid,
                     self._pp_preview_req_next_round_ready_len(self.chunked_req),
+                    self.chunked_req.extend_batch_idx + 1,
                 )
             )
             seen.add(self.chunked_req.rid)
@@ -967,7 +980,9 @@ class SchedulerPPMixin:
             if self._pp_is_prefill_req_locally_ready(req):
                 ready_views.append(
                     PPPrefillReadyView(
-                        req.rid, self._pp_preview_req_next_round_ready_len(req)
+                        req.rid,
+                        self._pp_preview_req_next_round_ready_len(req),
+                        req.extend_batch_idx + 1,
                     )
                 )
                 seen.add(req.rid)
@@ -1004,6 +1019,11 @@ class SchedulerPPMixin:
                     return False
 
                 authoritative_view = authoritative_views[authoritative_idx]
+                if (
+                    local_view.next_extend_batch_idx
+                    != authoritative_view.next_extend_batch_idx
+                ):
+                    return False
                 if local_view.ready_len > authoritative_view.ready_len:
                     return False
                 authoritative_idx += 1
