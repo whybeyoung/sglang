@@ -555,6 +555,17 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
+        def release_kv_cache_if_owned(req: Req) -> None:
+            if req.req_pool_idx is None:
+                logger.warning(
+                    "PP rank %s: skip inflight prefill KV release for rid %s "
+                    "because req_pool_idx is already cleared",
+                    self.pp_rank,
+                    req.rid,
+                )
+                return
+            release_kv_cache(req, self.tree_cache)
+
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
             self.attn_cp_cpu_group,
@@ -590,7 +601,7 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                release_kv_cache_if_owned(req)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -605,7 +616,7 @@ class SchedulerDisaggregationPrefillMixin:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                release_kv_cache_if_owned(req)  # unlock the tree
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
