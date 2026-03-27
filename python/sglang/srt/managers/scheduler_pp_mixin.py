@@ -296,8 +296,14 @@ class SchedulerPPMixin:
                 authoritative_prefill_ready_rids = _prefill_ready_views_to_rids(
                     authoritative_prefill_ready_views
                 )
+                authoritative_prefill_ready_len_by_rid = (
+                    {view.rid: view.ready_len for view in authoritative_prefill_ready_views}
+                    if authoritative_prefill_ready_views is not None
+                    else None
+                )
                 batch = self.get_new_batch_prefill(
-                    authoritative_rids=authoritative_prefill_ready_rids
+                    authoritative_rids=authoritative_prefill_ready_rids,
+                    authoritative_ready_len_by_rid=authoritative_prefill_ready_len_by_rid,
                 )
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 if use_wait_complete_prefill_ready_consensus:

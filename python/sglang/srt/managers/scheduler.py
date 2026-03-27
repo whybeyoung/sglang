@@ -22,7 +22,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Deque, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -1978,7 +1978,9 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(
-        self, authoritative_rids: Optional[List[str]] = None
+        self,
+        authoritative_rids: Optional[List[str]] = None,
+        authoritative_ready_len_by_rid: Optional[Dict[str, int]] = None,
     ) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -1990,6 +1992,7 @@ class Scheduler(
         ret = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             authoritative_rids=authoritative_rids,
+            authoritative_ready_len_by_rid=authoritative_ready_len_by_rid,
         )
 
         if self.prefill_delayer:
@@ -2001,6 +2004,7 @@ class Scheduler(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         authoritative_rids: Optional[List[str]] = None,
+        authoritative_ready_len_by_rid: Optional[Dict[str, int]] = None,
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -2080,8 +2084,27 @@ class Scheduler(
         has_selected_chunked_req = False
         if active_chunked_req:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            has_selected_chunked_req = True
+            authoritative_ready_len = None
+            if authoritative_ready_len_by_rid is not None:
+                authoritative_ready_len = authoritative_ready_len_by_rid.get(
+                    self.chunked_req.rid
+                )
+            if authoritative_ready_len is not None and len(
+                self.chunked_req.prefix_indices
+            ) != authoritative_ready_len:
+                logger.warning(
+                    "[PPShape] skip chunked req due to authoritative ready_len mismatch: "
+                    "rid=%s authoritative_ready_len=%s local_ready_len=%s pp=%s cp=%s tp=%s",
+                    self.chunked_req.rid,
+                    authoritative_ready_len,
+                    len(self.chunked_req.prefix_indices),
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                )
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                has_selected_chunked_req = True
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2156,6 +2179,24 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            authoritative_ready_len = None
+            if authoritative_ready_len_by_rid is not None:
+                authoritative_ready_len = authoritative_ready_len_by_rid.get(req.rid)
+            if authoritative_ready_len is not None and len(req.prefix_indices) != authoritative_ready_len:
+                logger.warning(
+                    "[PPShape] skip req due to authoritative ready_len mismatch: "
+                    "rid=%s authoritative_ready_len=%s local_ready_len=%s "
+                    "host_hit=%s storage_hit=%s pp=%s cp=%s tp=%s",
+                    req.rid,
+                    authoritative_ready_len,
+                    len(req.prefix_indices),
+                    req.host_hit_length,
+                    req.storage_hit_length,
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                )
+                continue
             if (
                 os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "1") == "1"
                 and self.pp_size > 1
