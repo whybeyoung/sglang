@@ -55,6 +55,17 @@ def _ordered_common_prefix(left: List[str], right: List[str]) -> List[str]:
     return prefix
 
 
+def _ordered_suffix_after_prefix(
+    prefix: List[str], full: List[str], label: str
+) -> List[str]:
+    if len(prefix) > len(full) or full[: len(prefix)] != prefix:
+        raise RuntimeError(
+            "Prefill bootstrap consensus incremental state regressed: "
+            f"{label}_prefix={prefix} {label}_full={full}"
+        )
+    return full[len(prefix) :]
+
+
 def _ordered_union(left: List[str], right: List[str]) -> List[str]:
     merged = list(left)
     seen = set(left)
@@ -230,7 +241,10 @@ class SchedulerPPMixin:
         bmbs = [None] * self.pp_loop_size
         cmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
-        inflight_bootstrap_consensus_fingerprints = set()
+        committed_bootstrap_good_rids: List[str] = []
+        committed_bootstrap_bad_rids: List[str] = []
+        inflight_bootstrap_consensus_fingerprint = None
+        inflight_bootstrap_consensus_rids = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
@@ -300,15 +314,21 @@ class SchedulerPPMixin:
                         )
                     )
                 consensus_bootstrapped_rids_to_send = cmbs[mb_id]
-                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids_to_send,
-                        bootstrapped_rids,
-                        mb_id=mb_id,
-                        inflight_bootstrap_consensus_fingerprints=inflight_bootstrap_consensus_fingerprints,
-                    )
+                (
+                    send_consensus_bootstrapped_work,
+                    consensus_bootstrapped_rids,
+                    inflight_bootstrap_consensus_fingerprint,
+                    inflight_bootstrap_consensus_rids,
+                ) = self._pp_pd_send_consensus_bootstrapped_ids(
+                    bmbs,
+                    next_first_rank_mb_id,
+                    consensus_bootstrapped_rids_to_send,
+                    bootstrapped_rids,
+                    mb_id=mb_id,
+                    committed_bootstrap_good_rids=committed_bootstrap_good_rids,
+                    committed_bootstrap_bad_rids=committed_bootstrap_bad_rids,
+                    inflight_bootstrap_consensus_fingerprint=inflight_bootstrap_consensus_fingerprint,
+                    inflight_bootstrap_consensus_rids=inflight_bootstrap_consensus_rids,
                 )
                 if not self.pp_group.is_last_rank:
                     sent_fingerprint = _bootstrap_consensus_fingerprint(
@@ -338,6 +358,7 @@ class SchedulerPPMixin:
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
+                    cleared_inflight_bootstrap_consensus_rids = None
                     incoming_fingerprint = _bootstrap_consensus_fingerprint(
                         next_consensus_bootstrapped_rids
                     )
@@ -356,29 +377,64 @@ class SchedulerPPMixin:
                             next_consensus_bootstrapped_rids[0],
                             next_consensus_bootstrapped_rids[1],
                             next_consensus_bootstrapped_rids[2],
-                            len(inflight_bootstrap_consensus_fingerprints),
+                            1 if inflight_bootstrap_consensus_fingerprint else 0,
                         )
                     if self.pp_group.is_last_rank:
-                        if incoming_fingerprint is not None:
-                            inflight_bootstrap_consensus_fingerprints.discard(
-                                incoming_fingerprint
+                        if (
+                            incoming_fingerprint is not None
+                            and incoming_fingerprint
+                            == inflight_bootstrap_consensus_fingerprint
+                            and inflight_bootstrap_consensus_rids is not None
+                        ):
+                            cleared_inflight_bootstrap_consensus_rids = (
+                                inflight_bootstrap_consensus_rids
                             )
-                            if self._pp_prefill_diag_enabled():
-                                logger.warning(
-                                    "[PPPrefillDiag][bootstrap_inflight_clear] pp=%s cp=%s tp=%s "
-                                    "mb=%s cleared_good=%s cleared_bad=%s inflight_size=%s",
-                                    self.pp_rank,
-                                    self.attn_cp_rank,
-                                    self.attn_tp_rank,
-                                    next_mb_id,
-                                    next_consensus_bootstrapped_rids[0],
-                                    next_consensus_bootstrapped_rids[1],
-                                    len(inflight_bootstrap_consensus_fingerprints),
-                                )
+                            inflight_bootstrap_consensus_fingerprint = None
+                            inflight_bootstrap_consensus_rids = None
+                        elif (
+                            self._pp_prefill_diag_enabled()
+                            and incoming_fingerprint is not None
+                            and inflight_bootstrap_consensus_fingerprint is not None
+                        ):
+                            logger.warning(
+                                "[PPPrefillDiag][bootstrap_inflight_ignore] pp=%s cp=%s tp=%s "
+                                "mb=%s incoming_good=%s incoming_bad=%s inflight_size=%s",
+                                self.pp_rank,
+                                self.attn_cp_rank,
+                                self.attn_tp_rank,
+                                next_mb_id,
+                                next_consensus_bootstrapped_rids[0],
+                                next_consensus_bootstrapped_rids[1],
+                                1 if inflight_bootstrap_consensus_fingerprint else 0,
+                            )
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
                     )
                     cmbs[next_mb_id] = next_consensus_bootstrapped_rids
+                    if (
+                        self.pp_group.is_last_rank
+                        and cleared_inflight_bootstrap_consensus_rids is not None
+                    ):
+                        committed_bootstrap_good_rids.extend(
+                            cleared_inflight_bootstrap_consensus_rids[0]
+                        )
+                        committed_bootstrap_bad_rids.extend(
+                            cleared_inflight_bootstrap_consensus_rids[1]
+                        )
+                        if self._pp_prefill_diag_enabled():
+                            logger.warning(
+                                "[PPPrefillDiag][bootstrap_inflight_clear] pp=%s cp=%s tp=%s "
+                                "mb=%s cleared_good=%s cleared_bad=%s inflight_size=%s committed_good=%s committed_bad=%s",
+                                self.pp_rank,
+                                self.attn_cp_rank,
+                                self.attn_tp_rank,
+                                next_mb_id,
+                                cleared_inflight_bootstrap_consensus_rids[0],
+                                cleared_inflight_bootstrap_consensus_rids[1],
+                                0,
+                                committed_bootstrap_good_rids,
+                                committed_bootstrap_bad_rids,
+                            )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
@@ -963,37 +1019,53 @@ class SchedulerPPMixin:
         consensus_bootstrapped_rids: List[str],
         bootstrapped_rids: List[str],
         mb_id: Optional[int] = None,
-        inflight_bootstrap_consensus_fingerprints=None,
+        committed_bootstrap_good_rids: Optional[List[str]] = None,
+        committed_bootstrap_bad_rids: Optional[List[str]] = None,
+        inflight_bootstrap_consensus_fingerprint=None,
+        inflight_bootstrap_consensus_rids=None,
     ):
         # 3 (Release): send the release rids from last stage to the first stage
         send_consensus_bootstrapped_work = []
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
-                consensus_bootstrapped_rids = bootstrapped_rids
-                fingerprint = None
-                if inflight_bootstrap_consensus_fingerprints is not None:
-                    fingerprint = _bootstrap_consensus_fingerprint(
-                        consensus_bootstrapped_rids
-                    )
+                current_good_rids, current_bad_rids, shared_bootstrap_capacity = (
+                    bootstrapped_rids
+                )
+                committed_bootstrap_good_rids = committed_bootstrap_good_rids or []
+                committed_bootstrap_bad_rids = committed_bootstrap_bad_rids or []
+                delta_good_rids = _ordered_suffix_after_prefix(
+                    committed_bootstrap_good_rids,
+                    current_good_rids,
+                    "good",
+                )
+                delta_bad_rids = _ordered_suffix_after_prefix(
+                    committed_bootstrap_bad_rids,
+                    current_bad_rids,
+                    "bad",
+                )
+                consensus_bootstrapped_rids = [
+                    delta_good_rids,
+                    delta_bad_rids,
+                    shared_bootstrap_capacity,
+                ]
+                fingerprint = _bootstrap_consensus_fingerprint(
+                    consensus_bootstrapped_rids
+                )
                 if (
-                    fingerprint is None
-                    or inflight_bootstrap_consensus_fingerprints is None
-                    or fingerprint not in inflight_bootstrap_consensus_fingerprints
+                    fingerprint is not None
+                    and inflight_bootstrap_consensus_fingerprint is None
                 ):
                     send_consensus_bootstrapped_work = (
                         self._pp_send_pyobj_to_next_stage(
                             consensus_bootstrapped_rids, async_send=True
                         )
                     )
-                    if (
-                        fingerprint is not None
-                        and inflight_bootstrap_consensus_fingerprints is not None
-                    ):
-                        inflight_bootstrap_consensus_fingerprints.add(fingerprint)
-                    if self._pp_prefill_diag_enabled() and fingerprint is not None:
+                    inflight_bootstrap_consensus_fingerprint = fingerprint
+                    inflight_bootstrap_consensus_rids = consensus_bootstrapped_rids
+                    if self._pp_prefill_diag_enabled():
                         logger.warning(
                             "[PPPrefillDiag][bootstrap_send_consensus] pp=%s cp=%s tp=%s "
-                            "mb=%s kind=real good=%s bad=%s shared_capacity=%s inflight_size=%s",
+                            "mb=%s kind=real good=%s bad=%s shared_capacity=%s inflight_size=%s committed_good=%s committed_bad=%s",
                             self.pp_rank,
                             self.attn_cp_rank,
                             self.attn_tp_rank,
@@ -1001,24 +1073,32 @@ class SchedulerPPMixin:
                             consensus_bootstrapped_rids[0],
                             consensus_bootstrapped_rids[1],
                             consensus_bootstrapped_rids[2],
-                            len(inflight_bootstrap_consensus_fingerprints),
+                            1,
+                            committed_bootstrap_good_rids,
+                            committed_bootstrap_bad_rids,
                         )
                 else:
                     send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        [[], [], bootstrapped_rids[2]], async_send=True
+                        [[], [], shared_bootstrap_capacity], async_send=True
                     )
                     if self._pp_prefill_diag_enabled():
+                        placeholder_reason = "no_delta"
+                        if inflight_bootstrap_consensus_fingerprint is not None:
+                            placeholder_reason = "waiting_inflight"
                         logger.warning(
                             "[PPPrefillDiag][bootstrap_send_consensus] pp=%s cp=%s tp=%s "
-                            "mb=%s kind=placeholder good=%s bad=%s shared_capacity=%s inflight_size=%s",
+                            "mb=%s kind=placeholder reason=%s good=%s bad=%s shared_capacity=%s inflight_size=%s committed_good=%s committed_bad=%s",
                             self.pp_rank,
                             self.attn_cp_rank,
                             self.attn_tp_rank,
                             mb_id,
+                            placeholder_reason,
                             consensus_bootstrapped_rids[0],
                             consensus_bootstrapped_rids[1],
-                            bootstrapped_rids[2],
-                            len(inflight_bootstrap_consensus_fingerprints),
+                            shared_bootstrap_capacity,
+                            1 if inflight_bootstrap_consensus_fingerprint else 0,
+                            committed_bootstrap_good_rids,
+                            committed_bootstrap_bad_rids,
                         )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
@@ -1041,7 +1121,12 @@ class SchedulerPPMixin:
                         consensus_bootstrapped_rids[1],
                         consensus_bootstrapped_rids[2],
                     )
-        return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
+        return (
+            send_consensus_bootstrapped_work,
+            consensus_bootstrapped_rids,
+            inflight_bootstrap_consensus_fingerprint,
+            inflight_bootstrap_consensus_rids,
+        )
 
     def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
