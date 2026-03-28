@@ -659,6 +659,17 @@ class SchedulerDisaggregationPrefillMixin:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                logger.warning(
+                    "[PPPrefillDiag][release_enqueue] pp=%s cp=%s tp=%s rid=%s "
+                    "req_id=%s req_pool_idx=%s inflight_before=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    req.rid,
+                    id(req),
+                    req.req_pool_idx,
+                    len(self.disagg_prefill_inflight_queue),
+                )
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
@@ -750,6 +761,23 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in (KVPoll.Success, KVPoll.Failed):
                 done_entries.append(PrefillTransferSnapshotEntry(req=req, poll=poll))
 
+        logger.warning(
+            "[PPPrefillDiag][release_poll] pp=%s cp=%s tp=%s inflight=%s "
+            "states=%s done=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.attn_tp_rank,
+            len(self.disagg_prefill_inflight_queue),
+            [
+                (req.rid, id(req), poll, req.req_pool_idx)
+                for req, poll in zip(self.disagg_prefill_inflight_queue, polls)
+            ],
+            [
+                (entry.req.rid, id(entry.req), entry.poll, entry.req.req_pool_idx)
+                for entry in done_entries
+            ],
+        )
+
         return PrefillTransferSnapshot(done_entries=done_entries)
 
     def apply_disagg_prefill_inflight_snapshot(
@@ -761,11 +789,34 @@ class SchedulerDisaggregationPrefillMixin:
         done_reqs = []
         snapshot_req_ids = {id(entry.req) for entry in snapshot.done_entries}
 
+        logger.warning(
+            "[PPPrefillDiag][release_apply_snapshot] pp=%s cp=%s tp=%s done=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.attn_tp_rank,
+            [
+                (entry.req.rid, id(entry.req), entry.poll, entry.req.req_pool_idx)
+                for entry in snapshot.done_entries
+            ],
+        )
+
         for entry in snapshot.done_entries:
             req = entry.req
             poll = entry.poll
 
             if poll == KVPoll.Success:
+                logger.warning(
+                    "[PPPrefillDiag][release_apply_req] pp=%s cp=%s tp=%s rid=%s "
+                    "req_id=%s poll=%s req_pool_idx=%s finished=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    req.rid,
+                    id(req),
+                    poll,
+                    req.req_pool_idx,
+                    req.finished(),
+                )
                 release_kv_cache(req, self.tree_cache)
                 req.finished_reason = FINISH_LENGTH(length=0)
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -773,6 +824,18 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                logger.warning(
+                    "[PPPrefillDiag][release_apply_req] pp=%s cp=%s tp=%s rid=%s "
+                    "req_id=%s poll=%s req_pool_idx=%s finished=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    req.rid,
+                    id(req),
+                    poll,
+                    req.req_pool_idx,
+                    req.finished(),
+                )
                 error_message = (
                     f"Prefill transfer failed for request rank={self.tp_rank} "
                     f"{req.rid=} {req.bootstrap_room=}"

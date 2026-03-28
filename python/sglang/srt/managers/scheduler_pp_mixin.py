@@ -867,6 +867,23 @@ class SchedulerPPMixin:
         self: Scheduler, release_rids: Optional[List[str]], transfer_snapshot
     ):
         if release_rids is not None and transfer_snapshot is not None:
+            logger.warning(
+                "[PPPrefillDiag][release_consensus] pp=%s cp=%s tp=%s "
+                "consensus=%s snapshot=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                release_rids,
+                [
+                    (
+                        entry.req.rid,
+                        id(entry.req),
+                        entry.poll,
+                        entry.req.req_pool_idx,
+                    )
+                    for entry in transfer_snapshot.done_entries
+                ],
+            )
             applied_snapshot = transfer_snapshot.filter_by_rids(release_rids)
             if applied_snapshot is None:
                 logger.warning(
