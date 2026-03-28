@@ -84,6 +84,34 @@ def _ordered_unique_rids(rids: List[str]) -> List[str]:
     return unique_rids
 
 
+def _filter_bootstrap_poll_result(
+    poll_result: tuple[List[Req], List[Req], List[Req]],
+    consensus_rids: List[List[str]],
+) -> Optional[tuple[List[Req], List[Req], List[Req]]]:
+    ready_reqs, failed_reqs, queue_reqs = poll_result
+    consensus_ready_rids, consensus_failed_rids = consensus_rids
+    filtered_ready_reqs = _ordered_req_subset(ready_reqs, consensus_ready_rids)
+    failed_candidates = queue_reqs if queue_reqs is not None else ready_reqs + failed_reqs
+    filtered_failed_reqs = _ordered_req_subset(
+        failed_candidates, consensus_failed_rids
+    )
+    if filtered_ready_reqs is None or filtered_failed_reqs is None:
+        return None
+    return filtered_ready_reqs, filtered_failed_reqs, failed_candidates
+
+
+def _filter_transfer_poll_result(
+    poll_result: List[tuple[Req, KVPoll]], selected_rids: List[str]
+) -> Optional[List[tuple[Req, KVPoll]]]:
+    selected_rids = _ordered_unique_rids(selected_rids)
+    done_reqs = _ordered_req_subset([req for req, _ in poll_result], selected_rids)
+    if done_reqs is None:
+        return None
+
+    req_id_to_entry = {id(req): (req, poll) for req, poll in poll_result}
+    return [req_id_to_entry[id(req)] for req in done_reqs]
+
+
 @dataclass
 class PrefillBootstrapSnapshot:
     ready_reqs: List[Req]
@@ -342,16 +370,12 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
-    def poll_bootstrapped_snapshot(self) -> PrefillBootstrapSnapshot:
+    def poll_bootstrapped_once(self) -> tuple[List[Req], List[Req], List[Req]]:
         ready_reqs = []
         failed_reqs = []
 
         if len(self.queue) == 0:
-            return PrefillBootstrapSnapshot(
-                ready_reqs=ready_reqs,
-                failed_reqs=failed_reqs,
-                queue_reqs=[],
-            )
+            return ready_reqs, failed_reqs, []
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
@@ -373,23 +397,29 @@ class PrefillBootstrapQueue:
             ready_reqs.append(req)
             available_metadata_buffers -= 1
 
+        return ready_reqs, failed_reqs, list(self.queue)
+
+    def poll_bootstrapped_snapshot(self) -> PrefillBootstrapSnapshot:
+        ready_reqs, failed_reqs, queue_reqs = self.poll_bootstrapped_once()
         return PrefillBootstrapSnapshot(
             ready_reqs=ready_reqs,
             failed_reqs=failed_reqs,
-            queue_reqs=list(self.queue),
+            queue_reqs=queue_reqs,
         )
 
-    def apply_bootstrapped_snapshot(
+    def apply_bootstrapped_once(
         self,
-        snapshot: PrefillBootstrapSnapshot,
+        ready_reqs: List[Req],
+        failed_reqs: List[Req],
+        queue_reqs: List[Req],
         *,
         authoritative_failures: bool,
     ) -> tuple[List[Req], List[Req]]:
         applied_reqs = []
-        failed_reqs = []
-        snapshot_req_ids = {id(req) for req in snapshot.ready_reqs + snapshot.failed_reqs}
+        applied_failed_reqs = []
+        snapshot_req_ids = {id(req) for req in ready_reqs + failed_reqs}
 
-        for req in snapshot.failed_reqs:
+        for req in failed_reqs:
             if hasattr(req.disagg_kv_sender, "abort"):
                 req.disagg_kv_sender.abort()
 
@@ -409,13 +439,13 @@ class PrefillBootstrapQueue:
                 )
                 self.scheduler.stream_output([req], req.return_logprob)
 
-            failed_reqs.append(req)
+            applied_failed_reqs.append(req)
             if authoritative_failures and self.scheduler.enable_metrics:
                 self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             if self.scheduler.enable_hicache_storage:
                 self.scheduler.tree_cache.release_aborted_request(req.rid)
 
-        for req in snapshot.ready_reqs:
+        for req in ready_reqs:
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 raise RuntimeError(
                     "Metadata buffer availability changed before applying "
@@ -435,7 +465,25 @@ class PrefillBootstrapQueue:
 
         self.queue = [entry for entry in self.queue if id(entry) not in snapshot_req_ids]
 
-        return applied_reqs, failed_reqs
+        return applied_reqs, applied_failed_reqs
+
+    def apply_bootstrapped_snapshot(
+        self,
+        snapshot: PrefillBootstrapSnapshot,
+        *,
+        authoritative_failures: bool,
+    ) -> tuple[List[Req], List[Req]]:
+        queue_reqs = (
+            snapshot.queue_reqs
+            if snapshot.queue_reqs is not None
+            else snapshot.ready_reqs + snapshot.failed_reqs
+        )
+        return self.apply_bootstrapped_once(
+            snapshot.ready_reqs,
+            snapshot.failed_reqs,
+            queue_reqs,
+            authoritative_failures=authoritative_failures,
+        )
 
     def pop_bootstrapped(
         self,
@@ -755,11 +803,11 @@ class SchedulerDisaggregationPrefillMixin:
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
-    def poll_disagg_prefill_inflight_snapshot(
+    def poll_disagg_prefill_inflight_once(
         self: Scheduler,
-    ) -> PrefillTransferSnapshot:
+    ) -> List[tuple[Req, KVPoll]]:
         if len(self.disagg_prefill_inflight_queue) == 0:
-            return PrefillTransferSnapshot(done_entries=[])
+            return []
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
@@ -767,11 +815,11 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
-        done_entries: List[PrefillTransferSnapshotEntry] = []
+        done_entries: List[tuple[Req, KVPoll]] = []
         seen_req_ids = set()
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             if poll in (KVPoll.Success, KVPoll.Failed) and id(req) not in seen_req_ids:
-                done_entries.append(PrefillTransferSnapshotEntry(req=req, poll=poll))
+                done_entries.append((req, poll))
                 seen_req_ids.add(id(req))
 
         logger.warning(
@@ -786,21 +834,31 @@ class SchedulerDisaggregationPrefillMixin:
                 for req, poll in zip(self.disagg_prefill_inflight_queue, polls)
             ],
             [
-                (entry.req.rid, id(entry.req), entry.poll, entry.req.req_pool_idx)
-                for entry in done_entries
+                (req.rid, id(req), poll, req.req_pool_idx)
+                for req, poll in done_entries
             ],
         )
 
-        return PrefillTransferSnapshot(done_entries=done_entries)
+        return done_entries
 
-    def apply_disagg_prefill_inflight_snapshot(
-        self: Scheduler, snapshot: PrefillTransferSnapshot
+    def poll_disagg_prefill_inflight_snapshot(
+        self: Scheduler,
+    ) -> PrefillTransferSnapshot:
+        return PrefillTransferSnapshot(
+            done_entries=[
+                PrefillTransferSnapshotEntry(req=req, poll=poll)
+                for req, poll in self.poll_disagg_prefill_inflight_once()
+            ]
+        )
+
+    def apply_disagg_prefill_inflight_once(
+        self: Scheduler, done_entries: List[tuple[Req, KVPoll]]
     ) -> List[Req]:
-        if len(snapshot.done_entries) == 0:
+        if len(done_entries) == 0:
             return []
 
         done_reqs = []
-        snapshot_req_ids = {id(entry.req) for entry in snapshot.done_entries}
+        snapshot_req_ids = {id(req) for req, _ in done_entries}
 
         logger.warning(
             "[PPPrefillDiag][release_apply_snapshot] pp=%s cp=%s tp=%s done=%s",
@@ -808,14 +866,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_cp_rank,
             self.attn_tp_rank,
             [
-                (entry.req.rid, id(entry.req), entry.poll, entry.req.req_pool_idx)
-                for entry in snapshot.done_entries
+                (req.rid, id(req), poll, req.req_pool_idx)
+                for req, poll in done_entries
             ],
         )
 
-        for entry in snapshot.done_entries:
-            req = entry.req
-            poll = entry.poll
+        for req, poll in done_entries:
 
             if req.req_pool_idx is None or req.finished():
                 logger.warning(
@@ -907,6 +963,13 @@ class SchedulerDisaggregationPrefillMixin:
         ]
 
         return done_reqs
+
+    def apply_disagg_prefill_inflight_snapshot(
+        self: Scheduler, snapshot: PrefillTransferSnapshot
+    ) -> List[Req]:
+        return self.apply_disagg_prefill_inflight_once(
+            [(entry.req, entry.poll) for entry in snapshot.done_entries]
+        )
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None

@@ -14,6 +14,10 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.prefill import (
+    _filter_bootstrap_poll_result,
+    _filter_transfer_poll_result,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     poll_and_all_reduce_attn_cp_tp_group,
@@ -760,26 +764,42 @@ class SchedulerPPMixin:
     def process_bootstrapped_queue(
         self: Scheduler,
         bootstrapped_rids: Optional[List[str]],
-        bootstrap_snapshot,
+        bootstrap_poll_result,
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
-        if bootstrapped_rids is not None and bootstrap_snapshot is not None:
-            applied_snapshot = bootstrap_snapshot.filter_by_consensus(bootstrapped_rids)
-            if applied_snapshot is None:
+        if bootstrapped_rids is not None and bootstrap_poll_result is not None:
+            if hasattr(bootstrap_poll_result, "ready_reqs"):
+                bootstrap_poll_result = (
+                    bootstrap_poll_result.ready_reqs,
+                    bootstrap_poll_result.failed_reqs,
+                    bootstrap_poll_result.queue_reqs
+                    if bootstrap_poll_result.queue_reqs is not None
+                    else bootstrap_poll_result.ready_reqs
+                    + bootstrap_poll_result.failed_reqs,
+                )
+
+            filtered_poll_result = _filter_bootstrap_poll_result(
+                bootstrap_poll_result, bootstrapped_rids
+            )
+            if filtered_poll_result is None:
+                ready_reqs, failed_reqs, _ = bootstrap_poll_result
                 logger.warning(
                     "[PPPrefillDiag][bootstrap_defer] pp=%s cp=%s tp=%s "
                     "snapshot=%s consensus=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
-                    bootstrap_snapshot.consensus_rids,
+                    [[req.rid for req in ready_reqs], [req.rid for req in failed_reqs]],
                     bootstrapped_rids,
                 )
                 return bootstrapped_rids
 
+            ready_reqs, failed_reqs, queue_reqs = filtered_poll_result
             good_reqs, failed_reqs = (
-                self.disagg_prefill_bootstrap_queue.apply_bootstrapped_snapshot(
-                    applied_snapshot,
+                self.disagg_prefill_bootstrap_queue.apply_bootstrapped_once(
+                    ready_reqs,
+                    failed_reqs,
+                    queue_reqs,
                     authoritative_failures=self.pp_group.is_first_rank,
                 )
             )
@@ -804,22 +824,21 @@ class SchedulerPPMixin:
         return None
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
-        bootstrap_snapshot = (
-            self.disagg_prefill_bootstrap_queue.poll_bootstrapped_snapshot()
-        )
+        bootstrap_poll_result = self.disagg_prefill_bootstrap_queue.poll_bootstrapped_once()
+        local_good_reqs, local_bad_reqs, _ = bootstrap_poll_result
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids = bootstrap_snapshot.ready_rids
-            bad_bootstrapped_rids = bootstrap_snapshot.failed_rids
+            good_bootstrapped_rids = [req.rid for req in local_good_reqs]
+            bad_bootstrapped_rids = [req.rid for req in local_bad_reqs]
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids = bootstrap_snapshot.ready_rids
-            curr_bad_bootstrapped_rids = bootstrap_snapshot.failed_rids
+            curr_good_bootstrapped_rids = [req.rid for req in local_good_reqs]
+            curr_bad_bootstrapped_rids = [req.rid for req in local_bad_reqs]
             good_bootstrapped_rids = _ordered_intersection(
                 prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
@@ -853,31 +872,35 @@ class SchedulerPPMixin:
                 bad_bootstrapped_rids,
                 len(self.disagg_prefill_bootstrap_queue.queue),
             )
-        return bootstrap_snapshot, [good_bootstrapped_rids, bad_bootstrapped_rids]
+        return bootstrap_poll_result, [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
-        transfer_snapshot = self.poll_disagg_prefill_inflight_snapshot()
+        transfer_poll_result = self.poll_disagg_prefill_inflight_once()
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = transfer_snapshot.done_rids
+            transferred_rids = [req.rid for req, _ in transfer_poll_result]
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = transfer_snapshot.done_rids
+            curr_transferred_rids = [req.rid for req, _ in transfer_poll_result]
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = _ordered_unique_rids(
                 _ordered_intersection(prev_transferred_rids, curr_transferred_rids)
             )
-        return transfer_snapshot, transferred_rids
+        return transfer_poll_result, transferred_rids
 
     def process_prefill_transfer_snapshot(
-        self: Scheduler, release_rids: Optional[List[str]], transfer_snapshot
+        self: Scheduler, release_rids: Optional[List[str]], transfer_poll_result
     ):
-        if release_rids is not None and transfer_snapshot is not None:
+        if release_rids is not None and transfer_poll_result is not None:
             release_rids = _ordered_unique_rids(release_rids)
+            if hasattr(transfer_poll_result, "done_entries"):
+                transfer_poll_result = [
+                    (entry.req, entry.poll) for entry in transfer_poll_result.done_entries
+                ]
             logger.warning(
                 "[PPPrefillDiag][release_consensus] pp=%s cp=%s tp=%s "
                 "consensus=%s snapshot=%s",
@@ -886,28 +909,25 @@ class SchedulerPPMixin:
                 self.attn_tp_rank,
                 release_rids,
                 [
-                    (
-                        entry.req.rid,
-                        id(entry.req),
-                        entry.poll,
-                        entry.req.req_pool_idx,
-                    )
-                    for entry in transfer_snapshot.done_entries
+                    (req.rid, id(req), poll, req.req_pool_idx)
+                    for req, poll in transfer_poll_result
                 ],
             )
-            applied_snapshot = transfer_snapshot.filter_by_rids(release_rids)
-            if applied_snapshot is None:
+            filtered_poll_result = _filter_transfer_poll_result(
+                transfer_poll_result, release_rids
+            )
+            if filtered_poll_result is None:
                 logger.warning(
                     "[PPPrefillDiag][release_defer] pp=%s cp=%s tp=%s "
                     "snapshot=%s consensus=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
-                    transfer_snapshot.done_rids,
+                    [req.rid for req, _ in transfer_poll_result],
                     release_rids,
                 )
                 return release_rids
-            self.apply_disagg_prefill_inflight_snapshot(applied_snapshot)
+            self.apply_disagg_prefill_inflight_once(filtered_poll_result)
             # The last PP rank originates the final release consensus.
             # Once that message has traversed the ring and been applied locally,
             # it must be consumed instead of being re-forwarded forever.
