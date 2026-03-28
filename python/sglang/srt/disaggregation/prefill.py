@@ -247,6 +247,46 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    def _is_hicache_ready(self, req: Req) -> bool:
+        if not self.scheduler.enable_hicache_storage:
+            return True
+
+        if not self.scheduler.tree_cache.check_prefetch_progress(req.rid):
+            return False
+
+        if req.storage_hit_length == 0:
+            req.storage_hit_length = self.scheduler.tree_cache.pop_prefetch_loaded_tokens(
+                req.rid
+            )
+        return True
+
+    def get_bootstrapped_rids(
+        self, reqs: Optional[List[Req]] = None
+    ) -> tuple[List[str], List[str]]:
+        reqs_to_poll = self.queue if reqs is None else reqs
+        if not reqs_to_poll:
+            return [], []
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in reqs_to_poll],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
+
+        good_rids = []
+        bad_rids = []
+        for req, poll in zip(reqs_to_poll, polls):
+            if poll == KVPoll.Failed:
+                bad_rids.append(req.rid)
+                continue
+            if poll != KVPoll.WaitingForInput:
+                break
+            if not self._is_hicache_ready(req):
+                break
+            good_rids.append(req.rid)
+
+        return good_rids, bad_rids
+
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -269,20 +309,26 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
+        if rids_to_check is not None:
+            rids_to_check_set = set(rids_to_check)
+            queue_indices = [
+                i for i, req in enumerate(self.queue) if req.rid in rids_to_check_set
+            ]
+            reqs_to_poll = [self.queue[i] for i in queue_indices]
+        else:
+            queue_indices = list(range(len(self.queue)))
+            reqs_to_poll = self.queue
+
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.queue],
+            [req.disagg_kv_sender for req in reqs_to_poll],
             self.scheduler.attn_cp_cpu_group,
             self.scheduler.attn_tp_cpu_group,
         )
 
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None:
-                # if req not in reqs_info_to_check, skip
-                if req.rid not in rids_to_check:
-                    continue
+        for i, req, poll in zip(queue_indices, reqs_to_poll, polls):
 
             if poll == KVPoll.Bootstrapping:
-                continue
+                break
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
                 try:
@@ -305,6 +351,9 @@ class PrefillBootstrapQueue:
                 continue
 
             # KV.WaitingForInput - init here
+            if not self._is_hicache_ready(req):
+                break
+
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break

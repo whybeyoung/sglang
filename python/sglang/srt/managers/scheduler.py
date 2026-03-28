@@ -2174,9 +2174,10 @@ class Scheduler(
                     else:
                         continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
-                )
+                if req.storage_hit_length == 0:
+                    req.storage_hit_length = (
+                        self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                    )
 
             req.init_next_round_input(self.tree_cache)
             if (

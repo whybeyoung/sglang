@@ -776,11 +776,8 @@ class SchedulerPPMixin:
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            good_bootstrapped_rids, bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids()
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -788,11 +785,17 @@ class SchedulerPPMixin:
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            prev_candidate_rids = prev_good_bootstrapped_rids + prev_bad_bootstrapped_rids
+            prev_candidate_rids_set = set(prev_candidate_rids)
+            local_candidate_reqs = [
+                req
+                for req in self.disagg_prefill_bootstrap_queue.queue
+                if req.rid in prev_candidate_rids_set
+            ]
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
+                    local_candidate_reqs
+                )
             )
             good_bootstrapped_rids = _ordered_intersection(
                 prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
