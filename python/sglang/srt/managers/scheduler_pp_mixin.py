@@ -65,6 +65,21 @@ def _ordered_union(left: List[str], right: List[str]) -> List[str]:
     return merged
 
 
+def _bootstrap_consensus_fingerprint(
+    consensus_bootstrapped_rids: Optional[List]
+) -> Optional[Tuple[Tuple[str, ...], Tuple[str, ...], int]]:
+    if consensus_bootstrapped_rids is None:
+        return None
+    good_rids, bad_rids, shared_bootstrap_capacity = consensus_bootstrapped_rids
+    if not good_rids and not bad_rids:
+        return None
+    return (
+        tuple(good_rids),
+        tuple(bad_rids),
+        shared_bootstrap_capacity,
+    )
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -216,6 +231,8 @@ class SchedulerPPMixin:
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
+        inflight_bootstrap_consensus_fingerprints = set()
+        last_forwarded_bootstrap_consensus_fingerprint = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
@@ -284,12 +301,29 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                consensus_bootstrapped_rids_to_send = consensus_bootstrapped_rids
+                if not self.pp_group.is_last_rank:
+                    fingerprint = _bootstrap_consensus_fingerprint(
+                        consensus_bootstrapped_rids
+                    )
+                    if (
+                        fingerprint is not None
+                        and fingerprint == last_forwarded_bootstrap_consensus_fingerprint
+                    ):
+                        consensus_bootstrapped_rids_to_send = [
+                            [],
+                            [],
+                            consensus_bootstrapped_rids[2],
+                        ]
+                    elif fingerprint is not None:
+                        last_forwarded_bootstrap_consensus_fingerprint = fingerprint
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
                         next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
+                        consensus_bootstrapped_rids_to_send,
                         bootstrapped_rids,
+                        inflight_bootstrap_consensus_fingerprints,
                     )
                 )
                 send_release_work, release_rids = (
@@ -302,6 +336,19 @@ class SchedulerPPMixin:
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
+                    if self.pp_group.is_last_rank:
+                        fingerprint = _bootstrap_consensus_fingerprint(
+                            next_consensus_bootstrapped_rids
+                        )
+                        if fingerprint is not None:
+                            inflight_bootstrap_consensus_fingerprints.discard(
+                                fingerprint
+                            )
+                    elif (
+                        _bootstrap_consensus_fingerprint(next_consensus_bootstrapped_rids)
+                        is not None
+                    ):
+                        last_forwarded_bootstrap_consensus_fingerprint = None
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
                     )
@@ -889,15 +936,36 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         consensus_bootstrapped_rids: List[str],
         bootstrapped_rids: List[str],
+        inflight_bootstrap_consensus_fingerprints=None,
     ):
         # 3 (Release): send the release rids from last stage to the first stage
         send_consensus_bootstrapped_work = []
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
                 consensus_bootstrapped_rids = bootstrapped_rids
-                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
-                )
+                fingerprint = None
+                if inflight_bootstrap_consensus_fingerprints is not None:
+                    fingerprint = _bootstrap_consensus_fingerprint(
+                        consensus_bootstrapped_rids
+                    )
+                if (
+                    fingerprint is None
+                    or fingerprint not in inflight_bootstrap_consensus_fingerprints
+                ):
+                    send_consensus_bootstrapped_work = (
+                        self._pp_send_pyobj_to_next_stage(
+                            consensus_bootstrapped_rids, async_send=True
+                        )
+                    )
+                    if (
+                        fingerprint is not None
+                        and inflight_bootstrap_consensus_fingerprints is not None
+                    ):
+                        inflight_bootstrap_consensus_fingerprints.add(fingerprint)
+                else:
+                    send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                        [[], [], bootstrapped_rids[2]], async_send=True
+                    )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
             if consensus_bootstrapped_rids is not None:
