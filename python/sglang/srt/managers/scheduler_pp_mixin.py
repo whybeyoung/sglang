@@ -236,24 +236,6 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids,
-                        bootstrap_snapshots[next_mb_id],
-                    )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
-
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_release_rids = self.process_prefill_transfer_snapshot(
-                        next_release_rids,
-                        transfer_snapshots[next_mb_id],
-                    )
-                self._pp_commit_comm_work(send_release_work)
-
                 bootstrap_snapshot, bootstrapped_rids = (
                     self._pp_pd_get_bootstrapped_ids()
                 )
@@ -314,6 +296,19 @@ class SchedulerPPMixin:
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
+                if bmbs[next_mb_id] is not None:
+                    next_consensus_bootstrapped_rids = (
+                        self._pp_recv_pyobj_from_prev_stage()
+                    )
+                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
+                        next_consensus_bootstrapped_rids,
+                        bootstrap_snapshots[next_mb_id],
+                    )
+                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
+
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -322,6 +317,11 @@ class SchedulerPPMixin:
                         next_batch_result,
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self.process_prefill_transfer_snapshot(
+                        next_release_rids,
+                        transfer_snapshots[next_mb_id],
+                    )
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -765,7 +765,7 @@ class SchedulerPPMixin:
                     bootstrap_snapshot.consensus_rids,
                     bootstrapped_rids,
                 )
-                return None
+                return bootstrapped_rids
 
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.apply_bootstrapped_snapshot(
@@ -878,7 +878,7 @@ class SchedulerPPMixin:
                     transfer_snapshot.done_rids,
                     release_rids,
                 )
-                return None
+                return release_rids
             self.apply_disagg_prefill_inflight_snapshot(applied_snapshot)
             return release_rids
         return None
