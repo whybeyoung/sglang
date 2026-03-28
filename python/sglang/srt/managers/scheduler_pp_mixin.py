@@ -56,6 +56,16 @@ def _ordered_union(left: List[str], right: List[str]) -> List[str]:
     return merged
 
 
+def _ordered_unique_rids(rids: List[str]) -> List[str]:
+    seen = set()
+    unique_rids: List[str] = []
+    for rid in rids:
+        if rid not in seen:
+            unique_rids.append(rid)
+            seen.add(rid)
+    return unique_rids
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -858,8 +868,8 @@ class SchedulerPPMixin:
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = transfer_snapshot.done_rids
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = _ordered_intersection(
-                prev_transferred_rids, curr_transferred_rids
+            transferred_rids = _ordered_unique_rids(
+                _ordered_intersection(prev_transferred_rids, curr_transferred_rids)
             )
         return transfer_snapshot, transferred_rids
 
@@ -867,6 +877,7 @@ class SchedulerPPMixin:
         self: Scheduler, release_rids: Optional[List[str]], transfer_snapshot
     ):
         if release_rids is not None and transfer_snapshot is not None:
+            release_rids = _ordered_unique_rids(release_rids)
             logger.warning(
                 "[PPPrefillDiag][release_consensus] pp=%s cp=%s tp=%s "
                 "consensus=%s snapshot=%s",

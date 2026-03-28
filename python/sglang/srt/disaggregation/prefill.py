@@ -74,6 +74,16 @@ def _ordered_req_subset(reqs: List[Req], selected_rids: List[str]) -> Optional[L
     return None
 
 
+def _ordered_unique_rids(rids: List[str]) -> List[str]:
+    seen = set()
+    unique_rids: List[str] = []
+    for rid in rids:
+        if rid not in seen:
+            unique_rids.append(rid)
+            seen.add(rid)
+    return unique_rids
+
+
 @dataclass
 class PrefillBootstrapSnapshot:
     ready_reqs: List[Req]
@@ -131,6 +141,7 @@ class PrefillTransferSnapshot:
         return [entry.req.rid for entry in self.done_entries]
 
     def filter_by_rids(self, selected_rids: List[str]) -> Optional["PrefillTransferSnapshot"]:
+        selected_rids = _ordered_unique_rids(selected_rids)
         done_reqs = _ordered_req_subset(self.done_reqs, selected_rids)
         if done_reqs is None:
             return None
@@ -757,9 +768,11 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         done_entries: List[PrefillTransferSnapshotEntry] = []
+        seen_req_ids = set()
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll in (KVPoll.Success, KVPoll.Failed):
+            if poll in (KVPoll.Success, KVPoll.Failed) and id(req) not in seen_req_ids:
                 done_entries.append(PrefillTransferSnapshotEntry(req=req, poll=poll))
+                seen_req_ids.add(id(req))
 
         logger.warning(
             "[PPPrefillDiag][release_poll] pp=%s cp=%s tp=%s inflight=%s "
@@ -803,6 +816,21 @@ class SchedulerDisaggregationPrefillMixin:
         for entry in snapshot.done_entries:
             req = entry.req
             poll = entry.poll
+
+            if req.req_pool_idx is None or req.finished():
+                logger.warning(
+                    "[PPPrefillDiag][release_skip_stale] pp=%s cp=%s tp=%s rid=%s "
+                    "req_id=%s poll=%s req_pool_idx=%s finished=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    req.rid,
+                    id(req),
+                    poll,
+                    req.req_pool_idx,
+                    req.finished(),
+                )
+                continue
 
             if poll == KVPoll.Success:
                 logger.warning(
