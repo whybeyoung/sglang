@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
@@ -55,6 +56,82 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+
+def _ordered_req_subset(reqs: List[Req], selected_rids: List[str]) -> Optional[List[Req]]:
+    if len(selected_rids) == 0:
+        return []
+
+    selected_idx = 0
+    selected_reqs: List[Req] = []
+    for req in reqs:
+        if req.rid == selected_rids[selected_idx]:
+            selected_reqs.append(req)
+            selected_idx += 1
+            if selected_idx == len(selected_rids):
+                return selected_reqs
+
+    return None
+
+
+@dataclass
+class PrefillBootstrapSnapshot:
+    ready_reqs: List[Req]
+    failed_reqs: List[Req]
+
+    @property
+    def ready_rids(self) -> List[str]:
+        return [req.rid for req in self.ready_reqs]
+
+    @property
+    def failed_rids(self) -> List[str]:
+        return [req.rid for req in self.failed_reqs]
+
+    @property
+    def consensus_rids(self) -> List[List[str]]:
+        return [self.ready_rids, self.failed_rids]
+
+    def filter_by_consensus(
+        self, consensus_rids: List[List[str]]
+    ) -> Optional["PrefillBootstrapSnapshot"]:
+        consensus_ready_rids, consensus_failed_rids = consensus_rids
+        ready_reqs = _ordered_req_subset(self.ready_reqs, consensus_ready_rids)
+        failed_reqs = _ordered_req_subset(self.failed_reqs, consensus_failed_rids)
+        if ready_reqs is None or failed_reqs is None:
+            return None
+        return PrefillBootstrapSnapshot(
+            ready_reqs=ready_reqs,
+            failed_reqs=failed_reqs,
+        )
+
+
+@dataclass
+class PrefillTransferSnapshotEntry:
+    req: Req
+    poll: KVPoll
+
+
+@dataclass
+class PrefillTransferSnapshot:
+    done_entries: List[PrefillTransferSnapshotEntry]
+
+    @property
+    def done_reqs(self) -> List[Req]:
+        return [entry.req for entry in self.done_entries]
+
+    @property
+    def done_rids(self) -> List[str]:
+        return [entry.req.rid for entry in self.done_entries]
+
+    def filter_by_rids(self, selected_rids: List[str]) -> Optional["PrefillTransferSnapshot"]:
+        done_reqs = _ordered_req_subset(self.done_reqs, selected_rids)
+        if done_reqs is None:
+            return None
+
+        req_id_to_entry = {id(entry.req): entry for entry in self.done_entries}
+        return PrefillTransferSnapshot(
+            done_entries=[req_id_to_entry[id(req)] for req in done_reqs]
+        )
 
 
 def release_req_to_metadata_buffer(
@@ -246,6 +323,88 @@ class PrefillBootstrapQueue:
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
         req.sampling_params.max_new_tokens = 1
+
+    def poll_bootstrapped_snapshot(self) -> PrefillBootstrapSnapshot:
+        ready_reqs = []
+        failed_reqs = []
+
+        if len(self.queue) == 0:
+            return PrefillBootstrapSnapshot(ready_reqs=ready_reqs, failed_reqs=failed_reqs)
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
+
+        available_metadata_buffers = (
+            self.req_to_metadata_buffer_idx_allocator.available_size()
+        )
+        for req, poll in zip(self.queue, polls):
+            if poll == KVPoll.Bootstrapping:
+                continue
+            if poll == KVPoll.Failed:
+                failed_reqs.append(req)
+                continue
+            if available_metadata_buffers <= 0:
+                break
+            ready_reqs.append(req)
+            available_metadata_buffers -= 1
+
+        return PrefillBootstrapSnapshot(
+            ready_reqs=ready_reqs,
+            failed_reqs=failed_reqs,
+        )
+
+    def apply_bootstrapped_snapshot(
+        self, snapshot: PrefillBootstrapSnapshot
+    ) -> tuple[List[Req], List[Req]]:
+        applied_reqs = []
+        failed_reqs = []
+        snapshot_req_ids = {id(req) for req in snapshot.ready_reqs + snapshot.failed_reqs}
+
+        for req in snapshot.failed_reqs:
+            error_message = (
+                f"Prefill bootstrap failed for request rank={self.tp_rank} "
+                f"{req.rid=} {req.bootstrap_room=}"
+            )
+            try:
+                req.disagg_kv_sender.failure_exception()
+            except Exception as e:
+                error_message += f" with exception {e}"
+            logger.error(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            self.scheduler.stream_output([req], req.return_logprob)
+            failed_reqs.append(req)
+            if self.scheduler.enable_metrics:
+                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            if self.scheduler.enable_hicache_storage:
+                self.scheduler.tree_cache.release_aborted_request(req.rid)
+
+        for req in snapshot.ready_reqs:
+            if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                raise RuntimeError(
+                    "Metadata buffer availability changed before applying "
+                    "prefill bootstrap snapshot."
+                )
+
+            req.metadata_buffer_index = (
+                self.req_to_metadata_buffer_idx_allocator.alloc()
+            )
+            assert req.metadata_buffer_index is not None
+
+            num_kv_indices = len(req.origin_input_ids)
+            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            req.time_stats.set_wait_queue_entry_time()
+            applied_reqs.append(req)
+
+        self.queue = [entry for entry in self.queue if id(entry) not in snapshot_req_ids]
+
+        return applied_reqs, failed_reqs
 
     def pop_bootstrapped(
         self,
@@ -553,6 +712,90 @@ class SchedulerDisaggregationPrefillMixin:
                 can_run_cuda_graph=can_run_cuda_graph,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
+
+    def poll_disagg_prefill_inflight_snapshot(
+        self: Scheduler,
+    ) -> PrefillTransferSnapshot:
+        if len(self.disagg_prefill_inflight_queue) == 0:
+            return PrefillTransferSnapshot(done_entries=[])
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
+        done_entries: List[PrefillTransferSnapshotEntry] = []
+        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if poll in (KVPoll.Success, KVPoll.Failed):
+                done_entries.append(PrefillTransferSnapshotEntry(req=req, poll=poll))
+
+        return PrefillTransferSnapshot(done_entries=done_entries)
+
+    def apply_disagg_prefill_inflight_snapshot(
+        self: Scheduler, snapshot: PrefillTransferSnapshot
+    ) -> List[Req]:
+        if len(snapshot.done_entries) == 0:
+            return []
+
+        done_reqs = []
+        snapshot_req_ids = {id(entry.req) for entry in snapshot.done_entries}
+
+        for entry in snapshot.done_entries:
+            req = entry.req
+            poll = entry.poll
+
+            if poll == KVPoll.Success:
+                release_kv_cache(req, self.tree_cache)
+                req.finished_reason = FINISH_LENGTH(length=0)
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
+                done_reqs.append(req)
+                req.time_stats.set_prefill_kv_transfer_finish_time()
+            elif poll == KVPoll.Failed:
+                error_message = (
+                    f"Prefill transfer failed for request rank={self.tp_rank} "
+                    f"{req.rid=} {req.bootstrap_room=}"
+                )
+                try:
+                    req.disagg_kv_sender.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.warning(error_message)
+                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+                release_kv_cache(req, self.tree_cache)
+                prepare_abort(
+                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                done_reqs.append(req)
+                if self.enable_metrics:
+                    self.metrics_collector.increment_transfer_failed_reqs()
+            else:
+                raise RuntimeError(
+                    f"Unexpected poll state {poll} in prefill inflight snapshot "
+                    f"for rid={req.rid}"
+                )
+
+        for req in done_reqs:
+            req.time_stats.set_completion_time()
+
+        self.stream_output(
+            done_reqs,
+            any(req.return_logprob for req in done_reqs),
+            None,
+        )
+        for req in done_reqs:
+            release_req_to_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+
+        self.disagg_prefill_inflight_queue = [
+            req
+            for req in self.disagg_prefill_inflight_queue
+            if id(req) not in snapshot_req_ids
+        ]
+
+        return done_reqs
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None

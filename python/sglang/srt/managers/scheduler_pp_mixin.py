@@ -205,7 +205,9 @@ class SchedulerPPMixin:
 
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
+        bootstrap_snapshots = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
+        transfer_snapshots = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
@@ -234,11 +236,35 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                if bmbs[next_mb_id] is not None:
+                    next_consensus_bootstrapped_rids = (
+                        self._pp_recv_pyobj_from_prev_stage()
+                    )
+                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
+                        next_consensus_bootstrapped_rids,
+                        bootstrap_snapshots[next_mb_id],
+                    )
+                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
+
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_release_rids = self.process_prefill_transfer_snapshot(
+                        next_release_rids,
+                        transfer_snapshots[next_mb_id],
+                    )
+                self._pp_commit_comm_work(send_release_work)
+
+                bootstrap_snapshot, bootstrapped_rids = (
+                    self._pp_pd_get_bootstrapped_ids()
+                )
+                bootstrap_snapshots[mb_id] = bootstrap_snapshot
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
 
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                transfer_snapshot, transferred_rids = (
+                    self._pp_pd_get_prefill_transferred_ids()
+                )
+                transfer_snapshots[mb_id] = transfer_snapshot
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
@@ -288,18 +314,6 @@ class SchedulerPPMixin:
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
-
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -308,9 +322,6 @@ class SchedulerPPMixin:
                         next_batch_result,
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-
-                if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -737,19 +748,28 @@ class SchedulerPPMixin:
         return predicted_size
 
     def process_bootstrapped_queue(
-        self: Scheduler, bootstrapped_rids: Optional[List[str]]
+        self: Scheduler,
+        bootstrapped_rids: Optional[List[str]],
+        bootstrap_snapshot,
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
-        if bootstrapped_rids is not None:
-            (
-                good_consensus_bootstrapped_rids,
-                bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
+        if bootstrapped_rids is not None and bootstrap_snapshot is not None:
+            applied_snapshot = bootstrap_snapshot.filter_by_consensus(bootstrapped_rids)
+            if applied_snapshot is None:
+                logger.warning(
+                    "[PPPrefillDiag][bootstrap_defer] pp=%s cp=%s tp=%s "
+                    "snapshot=%s consensus=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    bootstrap_snapshot.consensus_rids,
+                    bootstrapped_rids,
+                )
+                return None
+
             good_reqs, failed_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                    return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids
-                    + bad_consensus_bootstrapped_rids,
+                self.disagg_prefill_bootstrap_queue.apply_bootstrapped_snapshot(
+                    applied_snapshot
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -761,8 +781,8 @@ class SchedulerPPMixin:
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
-                    good_consensus_bootstrapped_rids,
-                    bad_consensus_bootstrapped_rids,
+                    bootstrapped_rids[0],
+                    bootstrapped_rids[1],
                     [req.rid for req in good_reqs],
                     [req.rid for req in failed_reqs],
                     len(self.waiting_queue),
@@ -773,27 +793,22 @@ class SchedulerPPMixin:
         return None
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
+        bootstrap_snapshot = (
+            self.disagg_prefill_bootstrap_queue.poll_bootstrapped_snapshot()
+        )
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
+            good_bootstrapped_rids = bootstrap_snapshot.ready_rids
+            bad_bootstrapped_rids = bootstrap_snapshot.failed_rids
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
+            curr_good_bootstrapped_rids = bootstrap_snapshot.ready_rids
+            curr_bad_bootstrapped_rids = bootstrap_snapshot.failed_rids
             good_bootstrapped_rids = _ordered_intersection(
                 prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
@@ -827,32 +842,45 @@ class SchedulerPPMixin:
                 bad_bootstrapped_rids,
                 len(self.disagg_prefill_bootstrap_queue.queue),
             )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+        return bootstrap_snapshot, [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+        transfer_snapshot = self.poll_disagg_prefill_inflight_snapshot()
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = transfer_snapshot.done_rids
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            curr_transferred_rids = transfer_snapshot.done_rids
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = _ordered_intersection(
                 prev_transferred_rids, curr_transferred_rids
             )
-        return transferred_rids
+        return transfer_snapshot, transferred_rids
+
+    def process_prefill_transfer_snapshot(
+        self: Scheduler, release_rids: Optional[List[str]], transfer_snapshot
+    ):
+        if release_rids is not None and transfer_snapshot is not None:
+            applied_snapshot = transfer_snapshot.filter_by_rids(release_rids)
+            if applied_snapshot is None:
+                logger.warning(
+                    "[PPPrefillDiag][release_defer] pp=%s cp=%s tp=%s "
+                    "snapshot=%s consensus=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    transfer_snapshot.done_rids,
+                    release_rids,
+                )
+                return None
+            self.apply_disagg_prefill_inflight_snapshot(applied_snapshot)
+            return release_rids
+        return None
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
