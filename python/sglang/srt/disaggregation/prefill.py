@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import torch
 
@@ -116,6 +116,9 @@ class PrefillBootstrapQueue:
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
+        self.pending_reqs: Dict[str, Req] = {}
+        self.bootstrap_slot_candidates: Dict[int, Set[str]] = {}
+        self.next_bootstrap_epoch_id = 0
         self.gloo_group = gloo_group
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
@@ -226,6 +229,7 @@ class PrefillBootstrapQueue:
         )
         self._process_req(req)
         self.queue.append(req)
+        self.pending_reqs[req.rid] = req
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -246,6 +250,27 @@ class PrefillBootstrapQueue:
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
         req.sampling_params.max_new_tokens = 1
+
+    def alloc_bootstrap_epoch_id(self) -> int:
+        bootstrap_epoch_id = self.next_bootstrap_epoch_id
+        self.next_bootstrap_epoch_id += 1
+        return bootstrap_epoch_id
+
+    def register_slot_candidates(self, slot_id: int, candidate_rids: List[str]) -> None:
+        if candidate_rids:
+            self.bootstrap_slot_candidates[slot_id] = set(candidate_rids)
+        else:
+            self.bootstrap_slot_candidates.pop(slot_id, None)
+
+    def _drop_tracked_rid(self, rid: str) -> None:
+        self.pending_reqs.pop(rid, None)
+        empty_slot_ids = []
+        for slot_id, candidate_rids in self.bootstrap_slot_candidates.items():
+            candidate_rids.discard(rid)
+            if not candidate_rids:
+                empty_slot_ids.append(slot_id)
+        for slot_id in empty_slot_ids:
+            self.bootstrap_slot_candidates.pop(slot_id, None)
 
     def pop_bootstrapped(
         self,
@@ -291,6 +316,7 @@ class PrefillBootstrapQueue:
             if self.scheduler.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.scheduler.tree_cache.release_aborted_request(req.rid)
+            self._drop_tracked_rid(req.rid)
 
         def handle_good_req(req: Req, idx: int):
             num_kv_indices = len(req.origin_input_ids)
@@ -316,6 +342,7 @@ class PrefillBootstrapQueue:
             bootstrapped_reqs.append(req)
             indices_to_remove.add(idx)
             req.time_stats.set_wait_queue_entry_time()
+            self._drop_tracked_rid(req.rid)
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
@@ -351,6 +378,7 @@ class PrefillBootstrapQueue:
 
     def apply_bootstrap_consensus(
         self,
+        bootstrap_epoch_id: int,
         good_rids: List[str],
         bad_rids: List[str],
         return_failed_reqs: bool = False,
@@ -358,15 +386,18 @@ class PrefillBootstrapQueue:
         bootstrapped_reqs = []
         failed_reqs = []
         indices_to_remove = set()
+        queue_index_by_rid = {req.rid: i for i, req in enumerate(self.queue)}
+        slot_candidates = self.bootstrap_slot_candidates.get(bootstrap_epoch_id)
 
-        if len(self.queue) == 0:
+        if slot_candidates is None:
             if good_rids or bad_rids:
                 logger.warning(
-                    "Prefill bootstrap consensus apply skipped on empty local queue: "
-                    "pp=%s cp=%s tp=%s good=%s bad=%s",
+                    "Prefill bootstrap consensus apply skipped on missing epoch registry: "
+                    "pp=%s cp=%s tp=%s epoch=%s good=%s bad=%s",
                     self.scheduler.pp_rank,
                     self.scheduler.attn_cp_rank,
                     self.scheduler.attn_tp_rank,
+                    bootstrap_epoch_id,
                     good_rids,
                     bad_rids,
                 )
@@ -390,12 +421,14 @@ class PrefillBootstrapQueue:
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
             self.scheduler.stream_output([req], req.return_logprob)
-            indices_to_remove.add(idx)
+            if idx >= 0:
+                indices_to_remove.add(idx)
             failed_reqs.append(req)
             if self.scheduler.enable_metrics:
                 self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             if self.scheduler.enable_hicache_storage:
                 self.scheduler.tree_cache.release_aborted_request(req.rid)
+            self._drop_tracked_rid(req.rid)
 
         def handle_good_req(req: Req, idx: int):
             num_kv_indices = len(req.origin_input_ids)
@@ -419,38 +452,67 @@ class PrefillBootstrapQueue:
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
-            indices_to_remove.add(idx)
+            if idx >= 0:
+                indices_to_remove.add(idx)
             req.time_stats.set_wait_queue_entry_time()
+            self._drop_tracked_rid(req.rid)
 
-        good_rid_set = set(good_rids)
-        bad_rid_set = set(bad_rids)
-        queue_rid_set = {req.rid for req in self.queue}
-        missing_rids = [
-            rid for rid in good_rids + bad_rids if rid not in queue_rid_set
+        unknown_rids = [rid for rid in good_rids if rid not in slot_candidates]
+        unknown_pending_rids = [
+            rid for rid in unknown_rids if rid in self.pending_reqs
         ]
-        if missing_rids:
+        stale_unknown_rids = [
+            rid for rid in unknown_rids if rid not in self.pending_reqs
+        ]
+        if unknown_pending_rids:
+            raise RuntimeError(
+                "Prefill bootstrap consensus apply alignment check failed: "
+                f"pp={self.scheduler.pp_rank} cp={self.scheduler.attn_cp_rank} "
+                f"tp={self.scheduler.attn_tp_rank} epoch={bootstrap_epoch_id} "
+                f"unknown_good_rids={unknown_pending_rids} "
+                f"slot_candidates={sorted(slot_candidates)} "
+                f"good={good_rids} bad={bad_rids}"
+            )
+        if stale_unknown_rids:
             logger.warning(
-                "Prefill bootstrap consensus apply ignored non-local requests: "
-                "pp=%s cp=%s tp=%s missing=%s local_queue=%s good=%s bad=%s",
+                "Prefill bootstrap consensus apply ignored stale non-slot good requests: "
+                "pp=%s cp=%s tp=%s epoch=%s stale_good=%s slot_candidates=%s good=%s bad=%s",
                 self.scheduler.pp_rank,
                 self.scheduler.attn_cp_rank,
                 self.scheduler.attn_tp_rank,
-                missing_rids,
-                list(queue_rid_set),
+                bootstrap_epoch_id,
+                stale_unknown_rids,
+                sorted(slot_candidates),
                 good_rids,
                 bad_rids,
             )
 
-        for i, req in enumerate(self.queue):
-            if req.rid in bad_rid_set:
-                handle_failed_req(req, i)
+        local_good_rids = [rid for rid in good_rids if rid in slot_candidates]
+        missing_pending_rids = [
+            rid for rid in local_good_rids if rid not in self.pending_reqs
+        ]
+        if missing_pending_rids:
+            raise RuntimeError(
+                "Prefill bootstrap consensus apply missing pending requests: "
+                f"pp={self.scheduler.pp_rank} cp={self.scheduler.attn_cp_rank} "
+                f"tp={self.scheduler.attn_tp_rank} epoch={bootstrap_epoch_id} "
+                f"missing_pending={missing_pending_rids} good={good_rids} bad={bad_rids}"
+            )
+
+        for rid in bad_rids:
+            req = self.pending_reqs.get(rid)
+            if req is None:
                 continue
-            if req.rid in good_rid_set:
-                handle_good_req(req, i)
+            handle_failed_req(req, queue_index_by_rid.get(rid, -1))
+
+        for rid in local_good_rids:
+            req = self.pending_reqs[rid]
+            handle_good_req(req, queue_index_by_rid.get(rid, -1))
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        self.bootstrap_slot_candidates.pop(bootstrap_epoch_id, None)
         if return_failed_reqs is False:
             return bootstrapped_reqs
         else:
