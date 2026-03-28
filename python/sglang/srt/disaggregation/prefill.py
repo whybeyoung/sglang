@@ -287,6 +287,112 @@ class PrefillBootstrapQueue:
 
         return good_rids, bad_rids
 
+    def _handle_bootstrap_failed_req(self, req: Req) -> None:
+        error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+        try:
+            req.disagg_kv_sender.failure_exception()
+        except Exception as e:
+            error_message += f" with exception {e}"
+        logger.error(error_message)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        prepare_abort(
+            req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        self.scheduler.stream_output([req], req.return_logprob)
+        if self.scheduler.enable_metrics:
+            self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+        if self.scheduler.enable_hicache_storage:
+            # Release prefetch events associated with the request.
+            self.scheduler.tree_cache.release_aborted_request(req.rid)
+
+    def _init_bootstrapped_req(self, req: Req) -> None:
+        num_kv_indices = len(req.origin_input_ids)
+        if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+            raise RuntimeError(
+                "Prefill bootstrap consensus apply ran out of metadata buffers for "
+                f"rid={req.rid}"
+            )
+
+        req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        assert req.metadata_buffer_index is not None
+
+        num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+        req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        req.time_stats.set_wait_queue_entry_time()
+
+    def apply_bootstrap_consensus(
+        self,
+        good_rids: List[str],
+        bad_rids: List[str],
+        return_failed_reqs: bool = False,
+    ) -> List[Req]:
+        """Apply a PP bootstrap consensus without re-polling sender state."""
+
+        if not good_rids and not bad_rids:
+            if return_failed_reqs is False:
+                return []
+            return [], []
+
+        overlap_rids = sorted(set(good_rids).intersection(bad_rids))
+        if overlap_rids:
+            raise RuntimeError(
+                "Prefill bootstrap consensus apply found duplicated good/bad rids: "
+                f"{overlap_rids}"
+            )
+
+        consensus_rids = good_rids + bad_rids
+        consensus_rid_set = set(consensus_rids)
+        rid_to_req = {}
+        indices_to_remove = set()
+        local_good_rids = []
+        local_bad_rids = []
+
+        for i, req in enumerate(self.queue):
+            if req.rid not in consensus_rid_set:
+                continue
+            rid_to_req[req.rid] = req
+            indices_to_remove.add(i)
+            if req.rid in good_rids:
+                local_good_rids.append(req.rid)
+            if req.rid in bad_rids:
+                local_bad_rids.append(req.rid)
+
+        missing_rids = [rid for rid in consensus_rids if rid not in rid_to_req]
+        if missing_rids:
+            raise RuntimeError(
+                "Prefill bootstrap consensus apply missing local requests: "
+                f"pp={self.pp_rank} tp={self.tp_rank} missing={missing_rids} "
+                f"good={good_rids} bad={bad_rids}"
+            )
+
+        if local_good_rids != good_rids or local_bad_rids != bad_rids:
+            raise RuntimeError(
+                "Prefill bootstrap consensus apply found local order mismatch: "
+                f"pp={self.pp_rank} tp={self.tp_rank} "
+                f"local_good={local_good_rids} consensus_good={good_rids} "
+                f"local_bad={local_bad_rids} consensus_bad={bad_rids}"
+            )
+
+        failed_reqs = []
+        for rid in bad_rids:
+            req = rid_to_req[rid]
+            self._handle_bootstrap_failed_req(req)
+            failed_reqs.append(req)
+
+        bootstrapped_reqs = []
+        for rid in good_rids:
+            req = rid_to_req[rid]
+            self._init_bootstrapped_req(req)
+            bootstrapped_reqs.append(req)
+
+        self.queue = [
+            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+        ]
+
+        if return_failed_reqs is False:
+            return bootstrapped_reqs
+        return bootstrapped_reqs, failed_reqs
+
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -330,45 +436,21 @@ class PrefillBootstrapQueue:
             if poll == KVPoll.Bootstrapping:
                 break
             elif poll == KVPoll.Failed:
-                error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.error(error_message)
-                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                self.scheduler.stream_output([req], req.return_logprob)
+                self._handle_bootstrap_failed_req(req)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
-                if self.scheduler.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                if self.scheduler.enable_hicache_storage:
-                    # to release prefetch events associated with the request
-                    self.scheduler.tree_cache.release_aborted_request(req.rid)
                 continue
 
             # KV.WaitingForInput - init here
             if not self._is_hicache_ready(req):
                 break
 
-            num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
 
-            req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert req.metadata_buffer_index is not None
-
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
-
+            self._init_bootstrapped_req(req)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
-            req.time_stats.set_wait_queue_entry_time()
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

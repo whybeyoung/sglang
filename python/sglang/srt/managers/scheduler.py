@@ -2921,7 +2921,9 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
+                    if self.pp_group.is_first_rank and hasattr(
+                        req.disagg_kv_sender, "abort"
+                    ):
                         req.disagg_kv_sender.abort()
 
             # Abort in-flight requests

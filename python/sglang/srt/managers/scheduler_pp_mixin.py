@@ -46,6 +46,15 @@ def _ordered_intersection(left: List[str], right: List[str]) -> List[str]:
     return [item for item in left if item in right_set]
 
 
+def _ordered_common_prefix(left: List[str], right: List[str]) -> List[str]:
+    prefix = []
+    for left_item, right_item in zip(left, right):
+        if left_item != right_item:
+            break
+        prefix.append(left_item)
+    return prefix
+
+
 def _ordered_union(left: List[str], right: List[str]) -> List[str]:
     merged = list(left)
     seen = set(left)
@@ -739,17 +748,18 @@ class SchedulerPPMixin:
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
     ):
-        # finished consensus bootstrapped reqs and prepare the waiting queue
+        # Apply the consensus snapshot without re-polling local sender state.
         if bootstrapped_rids is not None:
             (
                 good_consensus_bootstrapped_rids,
                 bad_consensus_bootstrapped_rids,
+                shared_bootstrap_capacity,
             ) = bootstrapped_rids
             good_reqs, failed_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                self.disagg_prefill_bootstrap_queue.apply_bootstrap_consensus(
+                    good_consensus_bootstrapped_rids,
+                    bad_consensus_bootstrapped_rids,
                     return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids
-                    + bad_consensus_bootstrapped_rids,
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -757,7 +767,7 @@ class SchedulerPPMixin:
                 logger.warning(
                     "[PPPrefillDiag][bootstrap_apply] pp=%s cp=%s tp=%s "
                     "consensus_good=%s consensus_bad=%s popped_good=%s popped_failed=%s "
-                    "waiting=%s bootstrap=%s waiting_head=%s",
+                    "shared_capacity=%s waiting=%s bootstrap=%s waiting_head=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
@@ -765,49 +775,60 @@ class SchedulerPPMixin:
                     bad_consensus_bootstrapped_rids,
                     [req.rid for req in good_reqs],
                     [req.rid for req in failed_reqs],
+                    shared_bootstrap_capacity,
                     len(self.waiting_queue),
                     len(self.disagg_prefill_bootstrap_queue.queue),
                     self._pp_prefill_diag_queue(list(self.waiting_queue)),
                 )
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+            return [
+                [req.rid for req in good_reqs],
+                [req.rid for req in failed_reqs],
+                shared_bootstrap_capacity,
+            ]
         return None
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
+        local_bootstrap_capacity = (
+            self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.available_size()
+        )
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
             good_bootstrapped_rids, bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids()
             )
+            shared_bootstrap_capacity = local_bootstrap_capacity
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
-            )
-            prev_candidate_rids = prev_good_bootstrapped_rids + prev_bad_bootstrapped_rids
-            prev_candidate_rids_set = set(prev_candidate_rids)
+            (
+                prev_good_bootstrapped_rids,
+                prev_bad_bootstrapped_rids,
+                prev_shared_bootstrap_capacity,
+            ) = prev_bootstrapped_rids
+            prev_good_rids_set = set(prev_good_bootstrapped_rids)
             local_candidate_reqs = [
                 req
                 for req in self.disagg_prefill_bootstrap_queue.queue
-                if req.rid in prev_candidate_rids_set
+                if req.rid in prev_good_rids_set
             ]
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
                     local_candidate_reqs
                 )
             )
-            good_bootstrapped_rids = _ordered_intersection(
+            good_bootstrapped_rids = _ordered_common_prefix(
                 prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
-            bad_bootstrapped_rids = _ordered_union(
-                prev_bad_bootstrapped_rids, curr_bad_bootstrapped_rids
+            bad_bootstrapped_rids = prev_bad_bootstrapped_rids
+            shared_bootstrap_capacity = min(
+                prev_shared_bootstrap_capacity, local_bootstrap_capacity
             )
             if self._pp_prefill_diag_enabled():
                 logger.warning(
                     "[PPPrefillDiag][bootstrap_intersection] pp=%s cp=%s tp=%s "
                     "prev_good=%s curr_good=%s merged_good=%s prev_bad=%s curr_bad=%s "
-                    "merged_bad=%s bootstrap=%s",
+                    "merged_bad=%s shared_capacity=%s local_capacity=%s bootstrap=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
@@ -817,20 +838,25 @@ class SchedulerPPMixin:
                     prev_bad_bootstrapped_rids,
                     curr_bad_bootstrapped_rids,
                     bad_bootstrapped_rids,
+                    shared_bootstrap_capacity,
+                    local_bootstrap_capacity,
                     len(self.disagg_prefill_bootstrap_queue.queue),
                 )
+        if len(good_bootstrapped_rids) > shared_bootstrap_capacity:
+            good_bootstrapped_rids = good_bootstrapped_rids[:shared_bootstrap_capacity]
         if self._pp_prefill_diag_enabled() and self.pp_group.is_first_rank:
             logger.warning(
                 "[PPPrefillDiag][bootstrap_poll] pp=%s cp=%s tp=%s local_good=%s "
-                "local_bad=%s bootstrap=%s",
+                "local_bad=%s shared_capacity=%s bootstrap=%s",
                 self.pp_rank,
                 self.attn_cp_rank,
                 self.attn_tp_rank,
                 good_bootstrapped_rids,
                 bad_bootstrapped_rids,
+                shared_bootstrap_capacity,
                 len(self.disagg_prefill_bootstrap_queue.queue),
             )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+        return [good_bootstrapped_rids, bad_bootstrapped_rids, shared_bootstrap_capacity]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
