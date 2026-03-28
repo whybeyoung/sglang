@@ -359,6 +359,18 @@ class PrefillBootstrapQueue:
 
         missing_rids = [rid for rid in consensus_rids if rid not in rid_to_req]
         if missing_rids:
+            if len(missing_rids) == len(consensus_rids):
+                logger.warning(
+                    "Prefill bootstrap consensus apply ignored stale consensus: "
+                    "pp=%s tp=%s good=%s bad=%s",
+                    self.pp_rank,
+                    self.tp_rank,
+                    good_rids,
+                    bad_rids,
+                )
+                if return_failed_reqs is False:
+                    return []
+                return [], []
             raise RuntimeError(
                 "Prefill bootstrap consensus apply missing local requests: "
                 f"pp={self.pp_rank} tp={self.tp_rank} missing={missing_rids} "
