@@ -269,6 +269,54 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
+        def handle_failed_req(req: Req, idx: int):
+            error_message = (
+                f"Prefill bootstrap failed for request rank={self.tp_rank} "
+                f"{req.rid=} {req.bootstrap_room=}"
+            )
+            try:
+                req.disagg_kv_sender.failure_exception()
+            except Exception as e:
+                error_message += f" with exception {e}"
+            logger.error(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            self.scheduler.stream_output([req], req.return_logprob)
+            indices_to_remove.add(idx)
+            failed_reqs.append(req)
+            if self.scheduler.enable_metrics:
+                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            if self.scheduler.enable_hicache_storage:
+                # to release prefetch events associated with the request
+                self.scheduler.tree_cache.release_aborted_request(req.rid)
+
+        def handle_good_req(req: Req, idx: int):
+            num_kv_indices = len(req.origin_input_ids)
+            if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                raise RuntimeError(
+                    "Prefill bootstrap consensus apply invariant violated: "
+                    "metadata capacity should have been capped before apply. "
+                    f"pp={self.scheduler.pp_rank} cp={self.scheduler.attn_cp_rank} "
+                    f"tp={self.scheduler.attn_tp_rank} rid={req.rid} "
+                    f"bootstrap_queue={len(self.queue)}"
+                )
+
+            req.metadata_buffer_index = (
+                self.req_to_metadata_buffer_idx_allocator.alloc()
+            )
+            assert req.metadata_buffer_index is not None
+
+            num_pages = kv_to_page_num(
+                num_kv_indices, self.token_to_kv_pool.page_size
+            )
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+
+            bootstrapped_reqs.append(req)
+            indices_to_remove.add(idx)
+            req.time_stats.set_wait_queue_entry_time()
+
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
             self.scheduler.attn_cp_cpu_group,
@@ -284,47 +332,125 @@ class PrefillBootstrapQueue:
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
-                error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.error(error_message)
-                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                self.scheduler.stream_output([req], req.return_logprob)
-                indices_to_remove.add(i)
-                failed_reqs.append(req)
-                if self.scheduler.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                if self.scheduler.enable_hicache_storage:
-                    # to release prefetch events associated with the request
-                    self.scheduler.tree_cache.release_aborted_request(req.rid)
+                handle_failed_req(req, i)
                 continue
 
             # KV.WaitingForInput - init here
-            num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
+            handle_good_req(req, i)
+
+        self.queue = [
+            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+        ]
+
+        if return_failed_reqs is False:
+            return bootstrapped_reqs
+        else:
+            return bootstrapped_reqs, failed_reqs
+
+    def apply_bootstrap_consensus(
+        self,
+        good_rids: List[str],
+        bad_rids: List[str],
+        return_failed_reqs: bool = False,
+    ) -> List[Req]:
+        bootstrapped_reqs = []
+        failed_reqs = []
+        indices_to_remove = set()
+
+        if len(self.queue) == 0:
+            if good_rids or bad_rids:
+                logger.warning(
+                    "Prefill bootstrap consensus apply skipped on empty local queue: "
+                    "pp=%s cp=%s tp=%s good=%s bad=%s",
+                    self.scheduler.pp_rank,
+                    self.scheduler.attn_cp_rank,
+                    self.scheduler.attn_tp_rank,
+                    good_rids,
+                    bad_rids,
+                )
+            if return_failed_reqs is False:
+                return []
+            else:
+                return [], []
+
+        def handle_failed_req(req: Req, idx: int):
+            error_message = (
+                f"Prefill bootstrap failed for request rank={self.tp_rank} "
+                f"{req.rid=} {req.bootstrap_room=}"
+            )
+            try:
+                req.disagg_kv_sender.failure_exception()
+            except Exception as e:
+                error_message += f" with exception {e}"
+            logger.error(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            self.scheduler.stream_output([req], req.return_logprob)
+            indices_to_remove.add(idx)
+            failed_reqs.append(req)
+            if self.scheduler.enable_metrics:
+                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            if self.scheduler.enable_hicache_storage:
+                self.scheduler.tree_cache.release_aborted_request(req.rid)
+
+        def handle_good_req(req: Req, idx: int):
+            num_kv_indices = len(req.origin_input_ids)
+            if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                raise RuntimeError(
+                    "Prefill bootstrap consensus apply invariant violated: "
+                    "metadata capacity should have been capped before apply. "
+                    f"pp={self.scheduler.pp_rank} cp={self.scheduler.attn_cp_rank} "
+                    f"tp={self.scheduler.attn_tp_rank} rid={req.rid} "
+                    f"bootstrap_queue={len(self.queue)}"
+                )
 
             req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            num_pages = kv_to_page_num(
+                num_kv_indices, self.token_to_kv_pool.page_size
+            )
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
-            indices_to_remove.add(i)
+            indices_to_remove.add(idx)
             req.time_stats.set_wait_queue_entry_time()
+
+        good_rid_set = set(good_rids)
+        bad_rid_set = set(bad_rids)
+        queue_rid_set = {req.rid for req in self.queue}
+        missing_rids = [
+            rid for rid in good_rids + bad_rids if rid not in queue_rid_set
+        ]
+        if missing_rids:
+            logger.warning(
+                "Prefill bootstrap consensus apply ignored non-local requests: "
+                "pp=%s cp=%s tp=%s missing=%s local_queue=%s good=%s bad=%s",
+                self.scheduler.pp_rank,
+                self.scheduler.attn_cp_rank,
+                self.scheduler.attn_tp_rank,
+                missing_rids,
+                list(queue_rid_set),
+                good_rids,
+                bad_rids,
+            )
+
+        for i, req in enumerate(self.queue):
+            if req.rid in bad_rid_set:
+                handle_failed_req(req, i)
+                continue
+            if req.rid in good_rid_set:
+                handle_good_req(req, i)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
-
         if return_failed_reqs is False:
             return bootstrapped_reqs
         else:
