@@ -98,6 +98,13 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def complete_without_send(self):
+        """
+        Mark a transfer as successfully concluded even though no KV pages need to
+        be sent for the final chunk.
+        """
+        raise NotImplementedError()
+
     @abstractmethod
     def poll(self) -> KVPoll:
         """

@@ -72,6 +72,10 @@ class FakeKVSender(BaseKVSender):
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
 
+    def complete_without_send(self):
+        self.has_sent = True
+        logger.debug("FakeKVSender complete without sending kv pages")
+
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 

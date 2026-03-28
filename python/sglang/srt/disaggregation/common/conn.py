@@ -403,6 +403,11 @@ class CommonKVSender(BaseKVSender):
     ):
         pass
 
+    def complete_without_send(self):
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+        if hasattr(self, "conclude_state"):
+            self.conclude_state = KVPoll.Success
+
     def poll(self) -> KVPoll:
         pass
 
