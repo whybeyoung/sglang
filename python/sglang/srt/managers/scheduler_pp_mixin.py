@@ -908,6 +908,11 @@ class SchedulerPPMixin:
                 )
                 return release_rids
             self.apply_disagg_prefill_inflight_snapshot(applied_snapshot)
+            # The last PP rank originates the final release consensus.
+            # Once that message has traversed the ring and been applied locally,
+            # it must be consumed instead of being re-forwarded forever.
+            if self.pp_group.is_last_rank:
+                return None
             return release_rids
         return None
 
