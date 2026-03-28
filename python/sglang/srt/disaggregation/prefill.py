@@ -78,6 +78,7 @@ def _ordered_req_subset(reqs: List[Req], selected_rids: List[str]) -> Optional[L
 class PrefillBootstrapSnapshot:
     ready_reqs: List[Req]
     failed_reqs: List[Req]
+    queue_reqs: Optional[List[Req]] = None
 
     @property
     def ready_rids(self) -> List[str]:
@@ -96,12 +97,18 @@ class PrefillBootstrapSnapshot:
     ) -> Optional["PrefillBootstrapSnapshot"]:
         consensus_ready_rids, consensus_failed_rids = consensus_rids
         ready_reqs = _ordered_req_subset(self.ready_reqs, consensus_ready_rids)
-        failed_reqs = _ordered_req_subset(self.failed_reqs, consensus_failed_rids)
+        failed_candidates = (
+            self.queue_reqs
+            if self.queue_reqs is not None
+            else self.ready_reqs + self.failed_reqs
+        )
+        failed_reqs = _ordered_req_subset(failed_candidates, consensus_failed_rids)
         if ready_reqs is None or failed_reqs is None:
             return None
         return PrefillBootstrapSnapshot(
             ready_reqs=ready_reqs,
             failed_reqs=failed_reqs,
+            queue_reqs=failed_candidates,
         )
 
 
@@ -329,7 +336,11 @@ class PrefillBootstrapQueue:
         failed_reqs = []
 
         if len(self.queue) == 0:
-            return PrefillBootstrapSnapshot(ready_reqs=ready_reqs, failed_reqs=failed_reqs)
+            return PrefillBootstrapSnapshot(
+                ready_reqs=ready_reqs,
+                failed_reqs=failed_reqs,
+                queue_reqs=[],
+            )
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
@@ -354,32 +365,41 @@ class PrefillBootstrapQueue:
         return PrefillBootstrapSnapshot(
             ready_reqs=ready_reqs,
             failed_reqs=failed_reqs,
+            queue_reqs=list(self.queue),
         )
 
     def apply_bootstrapped_snapshot(
-        self, snapshot: PrefillBootstrapSnapshot
+        self,
+        snapshot: PrefillBootstrapSnapshot,
+        *,
+        authoritative_failures: bool,
     ) -> tuple[List[Req], List[Req]]:
         applied_reqs = []
         failed_reqs = []
         snapshot_req_ids = {id(req) for req in snapshot.ready_reqs + snapshot.failed_reqs}
 
         for req in snapshot.failed_reqs:
-            error_message = (
-                f"Prefill bootstrap failed for request rank={self.tp_rank} "
-                f"{req.rid=} {req.bootstrap_room=}"
-            )
-            try:
-                req.disagg_kv_sender.failure_exception()
-            except Exception as e:
-                error_message += f" with exception {e}"
-            logger.error(error_message)
-            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-            prepare_abort(
-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-            )
-            self.scheduler.stream_output([req], req.return_logprob)
+            if hasattr(req.disagg_kv_sender, "abort"):
+                req.disagg_kv_sender.abort()
+
+            if authoritative_failures:
+                error_message = (
+                    f"Prefill bootstrap failed for request rank={self.tp_rank} "
+                    f"{req.rid=} {req.bootstrap_room=}"
+                )
+                try:
+                    req.disagg_kv_sender.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.error(error_message)
+                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+                prepare_abort(
+                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                self.scheduler.stream_output([req], req.return_logprob)
+
             failed_reqs.append(req)
-            if self.scheduler.enable_metrics:
+            if authoritative_failures and self.scheduler.enable_metrics:
                 self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             if self.scheduler.enable_hicache_storage:
                 self.scheduler.tree_cache.release_aborted_request(req.rid)

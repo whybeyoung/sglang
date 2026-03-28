@@ -769,7 +769,8 @@ class SchedulerPPMixin:
 
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.apply_bootstrapped_snapshot(
-                    applied_snapshot
+                    applied_snapshot,
+                    authoritative_failures=self.pp_group.is_first_rank,
                 )
             )
             self.waiting_queue.extend(good_reqs)
