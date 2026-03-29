@@ -10,10 +10,10 @@ description: >-
 
 ## 环境
 
-| 节点   | 主机           | SSH 端口 | 说明        |
-|--------|----------------|----------|-------------|
-| node-1 | `36.138.60.54` | `30239`  | 直接可登录  |
-| node-2 | `36.138.60.54` | `30243`  | 直接可登录  |
+| 节点   | 主机           | SSH 端口 | 说明 |
+|--------|----------------|----------|------|
+| node0（PP rank0） | `36.138.60.54` | `30239` | **只用 `AIservice` 启动**（由它拉起 sglang 子进程）；勿在本机单独 `nohup launch_server` |
+| node1（PP rank1） | `36.138.60.54` | `30243` | 用下文 **node-2 启动示例** 的 `python3 -m sglang.launch_server`（与自动化脚本逐字一致） |
 
 **远端路径（两台 node 一致）**
 
@@ -39,9 +39,9 @@ export SGLANG_DEBUG_PP_PREFILL_SHAPE=1
 export SGLANG_DEBUG_HICACHE_MATCH_CHAIN=1
 ```
 
-## node-1 启动示例
+## 30239（node0）启动示例 — 仅 AIservice
 
-（业务二进制与配置路径以现场为准；二进制与 `*.toml` 应在 `/home/aiges` 下或此处使用相对路径能找到。）
+（业务二进制与配置路径以现场为准；二进制与 `*.toml` 应在 `/home/aiges` 下或此处使用相对路径能找到。**不要**在本机再单独启动 `sglang.launch_server`。）
 
 ```bash
 cd /home/aiges
@@ -52,7 +52,9 @@ nohup ./AIservice -m=1 -c=xdeepseekv3testbo.toml -s=xdeepseekv3testbo \
   -u=http://companion-dx.xfyun.iflytek:6868 -p=sparkv2 -g=pddev &
 ```
 
-## node-2 启动示例（sglang prefill + HiCache + Mooncake）
+## 30243（node1）启动示例（sglang prefill + HiCache + Mooncake）
+
+（`scripts/pp_hicache_start_cluster.sh` 中远程命令与此处**完全一致**，勿在脚本里改参数。）
 
 ```bash
 cd /home/aiges
@@ -173,7 +175,7 @@ nohup python3 -m sglang.launch_server \
 
    仅查看、不杀进程：`PP_HICACHE_DRY_RUN=1 ./scripts/pp_hicache_stop_cluster.sh`
 
-4. **两台 node**：按上文 **node-1 / node-2 启动示例** 在 `/home/aiges` 下 `nohup` 启新版本（确认 `PYTHONPATH` 指向 `/usr/local/src/sglang/python` 若跑源码树）。
+4. **两台 node**：`./scripts/pp_hicache_start_cluster.sh`（顺序：先 30239 `AIservice`，等待后再 30243 `launch_server`，命令与上文示例一致）；或手动执行相同命令。node1 侧若需源码树，按示例取消 `PYTHONPATH` 那行注释。
 
 5. **观察与 debug**：日志里搜 `PPContract`、`HiCache`、`PP recv`；卡死则 **`spy-pp0-stuck-threads`**。回到步骤 1 改代码再推、再跑 2–5。
 
@@ -185,21 +187,22 @@ nohup python3 -m sglang.launch_server \
 ./scripts/pp_hicache_deploy_cycle.sh
 ```
 
-顺序为：`git push why contract_v2` → 双机 HTTPS pull（默认 `HTTPS_PROXY=http://10.104.102.203:7890`）→ 停 `launch_server` / scheduler → 打印两台 **git HEAD、进程、nohup 尾部与 PP 相关报错 grep**。
+顺序为：`git push why contract_v2` → 双机 HTTPS pull（默认 `HTTPS_PROXY=http://10.104.102.203:7890`）→ 停服（**默认会停 30239 上 AIservice**，以便完整重启）→ **`pp_hicache_start_cluster.sh`**（30239 仅 AIservice，30243 为 skill 原文 `launch_server`）→ 等待 `PP_HICACHE_POST_START_WAIT` 秒 → `pp_hicache_observe_cluster.sh`。
 
 常用环境变量：
 
-- `PP_HICACHE_SKIP_PUSH=1`：不 push，只 pull + 停服 + 观测（已推过时）
-- `PP_HICACHE_SKIP_STOP=1`：不杀进程，只 push + pull + 观测（谨慎：未重启仍跑旧代码）
-- `PP_HICACHE_STOP_AISERVICE=1`：停服时一并 `pkill AIservice`（node-1）
+- `PP_HICACHE_SKIP_PUSH=1`：不 push，只 pull + 停服 + 启动 + 观测
+- `PP_HICACHE_SKIP_STOP=1`：不杀进程（通常与 `SKIP_START=1` 联用，仅同步）
+- `PP_HICACHE_SKIP_START=1`：停服后不自动启动（仅同步/清理）
+- `PP_HICACHE_STOP_AISERVICE=0`：停服时**不**杀 AIservice（默认在完整 cycle 里为 **1**）
+- `PP_HICACHE_POST_START_WAIT=45`：启动后再 sleep 多久再观测
+- `PP_HICACHE_SLEEP_BEFORE_RANK1=30`：AIservice 启动后多久再启 30243
 
 仅观测（不打断服务）：
 
 ```bash
 ./scripts/pp_hicache_observe_cluster.sh
 ```
-
-脚本结束后需**手动**按上文步骤 4 在 `/home/aiges` 用 `PYTHONPATH=/usr/local/src/sglang/python` 再起服务；起好后可再跑 `pp_hicache_observe_cluster.sh` 对照日志。
 
 ---
 
