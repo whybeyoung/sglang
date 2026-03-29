@@ -157,6 +157,8 @@ nohup python3 -m sglang.launch_server \
 
    可选：`PP_HICACHE_ORIGIN_URL`（默认 `https://github.com/whybeyoung/sglang.git`）、`PP_HICACHE_BRANCH`、`PP_HICACHE_REPO`。
 
+   **重要**：`git pull` 只更新磁盘；已运行的 `launch_server` **不会**热重载 `scheduler*.py`，必须走步骤 3–4 **停服再启**，否则你看到的仍是旧代码行为（例如历史 `nohup.out` 里的 `[PPContract] missing req`）。
+
 3. **Mac**：停残留推理进程（两台都执行）：
 
    ```bash
