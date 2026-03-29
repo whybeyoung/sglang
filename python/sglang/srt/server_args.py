@@ -157,6 +157,11 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
+# World sizes (tensor parallel / global prefill ranks) validated for NSA prefill CP
+# in round-robin-split. EP matches tp when DeepEP/Mooncake A2A sets ep_size = tp_size
+# (e.g. EP16 on 16-GPU prefill). Extend only after runtime validation.
+NSA_PREFILL_CP_SUPPORTED_TP_SIZES = frozenset({8, 16})
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -1232,9 +1237,13 @@ class ServerArgs:
                             # assert (
                             #     self.dp_size == 1
                             # ), "For round-robin split mode, dp attention is not supported."
-                        assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                        assert self.tp_size in NSA_PREFILL_CP_SUPPORTED_TP_SIZES, (
+                            "NSA prefill context parallel (round-robin-split) is only allowed for "
+                            f"tp_size in {sorted(NSA_PREFILL_CP_SUPPORTED_TP_SIZES)} "
+                            f"(got {self.tp_size}). "
+                            "Other sizes are restricted due to precision / multi-machine CP caveats; "
+                            "add your size to NSA_PREFILL_CP_SUPPORTED_TP_SIZES in server_args.py after validation."
+                        )
                         self.attn_cp_size = self.tp_size
 
                         logger.warning(
