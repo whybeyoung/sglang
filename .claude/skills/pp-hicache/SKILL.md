@@ -138,10 +138,12 @@ nohup python3 -m sglang.launch_server \
 ## 把本地代码同步到两台 node
 
 1. 本地在 `contract_v2` 上修改并提交。
-2. 推送到你用于同步的远程（原文档中为远程名 **`why`**；若你使用 `origin` 等，替换即可）：
+2. 推送到 **与节点上 `git remote origin` 一致的仓库**（节点常见为 `whybeyoung/sglang`；若你推到 `iflytek/sglang`，需在节点 `git remote set-url origin ...` 或先把变更合并进节点所跟踪的远程）：
 
    ```bash
    git push why contract_v2
+   # 或
+   git push iflytek contract_v2
    ```
 
 3. 在两台 node 上进入 SGLang 仓库后拉取（若需走代理）：
@@ -151,6 +153,16 @@ nohup python3 -m sglang.launch_server \
    export HTTPS_PROXY=http://10.104.102.203:7890
    git pull origin contract_v2
    ```
+
+4. **一键从笔记本同步（推荐）**：仓库内脚本会 SSH 两台 node、补齐 `github.com` 的 `known_hosts`（避免 `Host key verification failed`）、再 `fetch` + `checkout` + `pull`：
+
+   ```bash
+   ./scripts/pp_hicache_sync_cluster.sh
+   ```
+
+   可选环境变量：`PP_HICACHE_HOST`、`PP_HICACHE_PORTS`（默认 `30239 30243`）、`PP_HICACHE_REPO`、`PP_HICACHE_BRANCH`。
+
+   **若仍失败**：`Permission denied (publickey)` 表示节点上 **root** 对 `origin`（如 `git@github.com:whybeyoung/sglang.git`）没有 SSH 权限——需在每台 node 配置 **GitHub deploy key**（读库即可），或把 `origin` 改为 **HTTPS** + token/credential；也可在能 `git push` 的机器上推到与节点 `origin` 相同的仓库后再在节点 `git pull`。
 
 拉取后：**先按上文「迭代代码后重启：先清理残留 SGLang」** 结束旧进程并确认 GPU，再按现场流程启动或滚动；若运行依赖 `PYTHONPATH` 指向该仓库，确保启动脚本仍包含 `export PYTHONPATH=/usr/local/src/sglang/python:...`（或等价安装步骤）。
 
