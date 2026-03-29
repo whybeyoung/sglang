@@ -135,36 +135,60 @@ nohup python3 -m sglang.launch_server \
 3. **疑似死锁或调度挂起**：使用技能 **`spy-pp0-stuck-threads`**（同主机 `36.138.60.54`，端口按 node 选 `30239` 或 `30243`）对 PP0 等 scheduler 进程做 `py-spy dump`。
 4. **代码迭代**：重点文件通常包括 `python/sglang/srt/managers/scheduler_pp_mixin.py`、`scheduler.py`、HiCache 相关模块（如 `hiradix_cache.py` 等），以实际栈与日志为准。
 
-## 把本地代码同步到两台 node
+## 推荐迭代闭环（Mac 上 push，节点上 HTTPS pull + 停服 + 启服 + 看日志）
 
-1. 本地在 `contract_v2` 上修改并提交。
-2. 推送到 **与节点上 `git remote origin` 一致的仓库**（节点常见为 `whybeyoung/sglang`；若你推到 `iflytek/sglang`，需在节点 `git remote set-url origin ...` 或先把变更合并进节点所跟踪的远程）：
+**约定**：代码从 **Mac** 推到 **`why`（whybeyoung/sglang）**；两台机器上 **只用 HTTPS 拉取**，不要求节点具备 `git@github.com` 的 SSH key。
+
+1. **Mac**：提交后推送（仅此一步在本地用 SSH/HTTPS 连 GitHub）：
 
    ```bash
    git push why contract_v2
-   # 或
-   git push iflytek contract_v2
    ```
 
-3. 在两台 node 上进入 SGLang 仓库后拉取（若需走代理）：
+2. **Mac**：一键在两台 node 上把 `origin` 设为 HTTPS 并拉取 `contract_v2`。脚本在**远端执行 `git fetch` / `git pull` 前**会默认设置：
 
-   ```bash
-   cd /usr/local/src/sglang
-   export HTTPS_PROXY=http://10.104.102.203:7890
-   git pull origin contract_v2
-   ```
-
-4. **一键从笔记本同步（推荐）**：仓库内脚本会 SSH 两台 node、补齐 `github.com` 的 `known_hosts`（避免 `Host key verification failed`）、再 `fetch` + `checkout` + `pull`：
+   `export HTTPS_PROXY=http://10.104.102.203:7890`（同时设置 `https_proxy`）。
 
    ```bash
    ./scripts/pp_hicache_sync_cluster.sh
    ```
 
-   可选环境变量：`PP_HICACHE_HOST`、`PP_HICACHE_PORTS`（默认 `30239 30243`）、`PP_HICACHE_REPO`、`PP_HICACHE_BRANCH`。
+   改用其它代理：`PP_HICACHE_HTTPS_PROXY=http://host:port ./scripts/pp_hicache_sync_cluster.sh`；不走代理：`PP_HICACHE_HTTPS_PROXY= ./scripts/pp_hicache_sync_cluster.sh`。
 
-   **若仍失败**：`Permission denied (publickey)` 表示节点上 **root** 对 `origin`（如 `git@github.com:whybeyoung/sglang.git`）没有 SSH 权限——需在每台 node 配置 **GitHub deploy key**（读库即可），或把 `origin` 改为 **HTTPS** + token/credential；也可在能 `git push` 的机器上推到与节点 `origin` 相同的仓库后再在节点 `git pull`。
+   可选：`PP_HICACHE_ORIGIN_URL`（默认 `https://github.com/whybeyoung/sglang.git`）、`PP_HICACHE_BRANCH`、`PP_HICACHE_REPO`。
 
-拉取后：**先按上文「迭代代码后重启：先清理残留 SGLang」** 结束旧进程并确认 GPU，再按现场流程启动或滚动；若运行依赖 `PYTHONPATH` 指向该仓库，确保启动脚本仍包含 `export PYTHONPATH=/usr/local/src/sglang/python:...`（或等价安装步骤）。
+3. **Mac**：停残留推理进程（两台都执行）：
+
+   ```bash
+   ./scripts/pp_hicache_stop_cluster.sh
+   ```
+
+   若 node-1 由 **AIservice** 拉起、需要一并停掉：
+
+   ```bash
+   PP_HICACHE_STOP_AISERVICE=1 ./scripts/pp_hicache_stop_cluster.sh
+   ```
+
+   仅查看、不杀进程：`PP_HICACHE_DRY_RUN=1 ./scripts/pp_hicache_stop_cluster.sh`
+
+4. **两台 node**：按上文 **node-1 / node-2 启动示例** 在 `/home/aiges` 下 `nohup` 启新版本（确认 `PYTHONPATH` 指向 `/usr/local/src/sglang/python` 若跑源码树）。
+
+5. **观察与 debug**：日志里搜 `PPContract`、`HiCache`、`PP recv`；卡死则 **`spy-pp0-stuck-threads`**。回到步骤 1 改代码再推、再跑 2–5。
+
+---
+
+## 手动在节点上拉取（等价于脚本）
+
+```bash
+cd /usr/local/src/sglang
+git remote set-url origin https://github.com/whybeyoung/sglang.git
+export HTTPS_PROXY=http://10.104.102.203:7890   # 按需
+git fetch origin && git checkout contract_v2 && git pull --ff-only origin contract_v2
+```
+
+**私有仓库**：HTTPS 需 token（`https://<token>@github.com/...` 或 credential helper）；公开库无需。
+
+拉取后：**先停干净旧进程**（脚本或上文「迭代代码后重启」），再启动；若运行依赖 `PYTHONPATH` 指向该仓库，启动脚本需包含 `export PYTHONPATH=/usr/local/src/sglang/python:...`。
 
 ## 相关技能与文档
 
