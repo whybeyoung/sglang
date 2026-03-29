@@ -277,9 +277,17 @@ class SchedulerPPMixin:
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
 
+                # Forward tokenized/control recv_reqs before bootstrap / launch contracts.
+                # If recv_reqs were only sent at the end of the iteration (after contracts),
+                # downstream ranks would apply PP0 contracts one iteration late and hit
+                # [PPContract] missing req. Match event_loop_pp: send async here, commit
+                # at the start of the next iteration.
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     self._pp_commit_comm_work(send_prefill_launch_contract_work)
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
@@ -289,8 +297,9 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                # Prefill launch contract must be recv'd after bootstrap + transfer
-                # pyobjs: sender order is recv_reqs, bootstrapped, transfer, contract, proxy.
+                # Prefill launch contract must be recv'd after bootstrap + transfer.
+                # pyobjs: sender order is recv_reqs (forwarded above), bootstrapped,
+                # transfer, contract, proxy.
                 if self._pp_use_hicache_launch_contract():
                     if self.pp_group.is_first_rank:
                         self._sgl_pp_upstream_launch_contracts = None
@@ -373,9 +382,6 @@ class SchedulerPPMixin:
                         authoritative_abort=self.pp_group.is_first_rank,
                     )
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
