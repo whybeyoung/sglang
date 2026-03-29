@@ -360,6 +360,10 @@ class SchedulerPPMixin:
                     )
                 )
 
+                # Recv consensus + release pyobjs before waiting on outbound P2P sends.
+                # CP0_TP0 blocks inside _pp_commit_comm_work(work.wait()); if that runs
+                # before release recv, other CP ranks block in _pp_recv_pyobj broadcast
+                # waiting for CP0 — deadlock (see py-spy: CP0 in commit, CP1+ in recv).
                 if bmbs[next_mb_id] is not None:
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
@@ -367,9 +371,9 @@ class SchedulerPPMixin:
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
                     )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
