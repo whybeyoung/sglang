@@ -345,13 +345,18 @@ class SchedulerPPMixin:
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
                         next_first_rank_mb_id,
+                        next_mb_id,
                         consensus_bootstrapped_rids,
                         bootstrapped_rids,
                     )
                 )
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                        tmbs,
+                        next_first_rank_mb_id,
+                        next_mb_id,
+                        release_rids,
+                        transferred_rids,
                     )
                 )
 
@@ -513,6 +518,7 @@ class SchedulerPPMixin:
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         rmbs,
                         next_first_rank_mb_id,
+                        next_mb_id,
                         consensus_retract_rids,
                         retract_rids,
                     )
@@ -522,6 +528,7 @@ class SchedulerPPMixin:
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         pmbs,
                         next_first_rank_mb_id,
+                        next_mb_id,
                         consensus_prealloc_rids,
                         prealloc_rids,
                     )
@@ -529,7 +536,11 @@ class SchedulerPPMixin:
 
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                        tmbs,
+                        next_first_rank_mb_id,
+                        next_mb_id,
+                        release_rids,
+                        transferred_rids,
                     )
                 )
 
@@ -846,6 +857,19 @@ class SchedulerPPMixin:
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
         if bootstrapped_rids is not None:
+            if (
+                not isinstance(bootstrapped_rids, (list, tuple))
+                or len(bootstrapped_rids) != 2
+            ):
+                logger.error(
+                    "[PP] process_bootstrapped_queue: expected [good_rids, bad_rids], "
+                    "got type=%s len=%s",
+                    type(bootstrapped_rids).__name__,
+                    len(bootstrapped_rids)
+                    if isinstance(bootstrapped_rids, (list, tuple))
+                    else "n/a",
+                )
+                return None
             (
                 good_consensus_bootstrapped_rids,
                 bad_consensus_bootstrapped_rids,
@@ -969,6 +993,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         bmbs: List[List[str]],
         next_first_rank_mb_id: int,
+        next_mb_id: int,
         consensus_bootstrapped_rids: List[str],
         bootstrapped_rids: List[str],
     ):
@@ -980,9 +1005,18 @@ class SchedulerPPMixin:
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                     consensus_bootstrapped_rids, async_send=True
                 )
-        # 4 (Release): send the release rids from non last rank to the next rank
+        # 4 (Release): send the release rids from non last rank to the next rank.
+        # Must use the same predicate as recv (bmbs[next_mb_id]) so the downstream
+        # rank never recv's a different pyobj (e.g. empty recv_reqs []) off the
+        # shared PP0->PP1 FIFO when consensus_bootstrapped_rids is still None.
         else:
-            if consensus_bootstrapped_rids is not None:
+            if bmbs[next_mb_id] is not None:
+                payload = (
+                    consensus_bootstrapped_rids
+                    if consensus_bootstrapped_rids is not None
+                    else bootstrapped_rids
+                )
+                consensus_bootstrapped_rids = payload
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                     consensus_bootstrapped_rids, async_send=True
                 )
@@ -992,6 +1026,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         tmbs: List[List[str]],
         next_first_rank_mb_id: int,
+        next_mb_id: int,
         release_rids: List[str],
         transferred_rids: List[str],
     ):
@@ -1002,9 +1037,14 @@ class SchedulerPPMixin:
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
-        # 4 (Release): send the release rids from non last rank to the next rank
+        # 4 (Release): send the release rids from non last rank to the next rank.
+        # Match recv predicate tmbs[next_mb_id] (same FIFO ordering as consensus bootstrap).
         else:
-            if release_rids is not None:
+            if tmbs[next_mb_id] is not None:
+                payload = (
+                    release_rids if release_rids is not None else transferred_rids
+                )
+                release_rids = payload
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
