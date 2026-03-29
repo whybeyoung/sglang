@@ -61,6 +61,51 @@ class PPBatchMetadata:
     can_run_cuda_graph: bool
 
 
+@dataclass(frozen=True)
+class PPPrefillReadyView:
+    rid: str
+    ready_len: int
+    next_extend_batch_idx: int
+
+
+@dataclass(frozen=True)
+class PPPrefillLaunchContract:
+    """Authoritative prefill shape from PP0 for downstream PP ranks (integers only)."""
+
+    rid: str
+    fill_len: int
+    prefix_len: int
+    extend_len: int
+    extend_batch_idx: int
+    is_chunked: int
+    host_hit_length: int = 0
+
+
+# Alias for tests and older call sites
+PPPrefillBatchContract = PPPrefillLaunchContract
+
+
+def _ordered_intersection_prefill_ready_views(
+    left: List[PPPrefillReadyView], right: List[PPPrefillReadyView]
+) -> List[PPPrefillReadyView]:
+    right_by_rid = {view.rid: view for view in right}
+    matched: List[PPPrefillReadyView] = []
+    for view in left:
+        right_view = right_by_rid.get(view.rid)
+        if right_view is None:
+            continue
+        if right_view.next_extend_batch_idx != view.next_extend_batch_idx:
+            continue
+        matched.append(
+            PPPrefillReadyView(
+                view.rid,
+                min(view.ready_len, right_view.ready_len),
+                view.next_extend_batch_idx,
+            )
+        )
+    return matched
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -213,6 +258,7 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
+        send_prefill_launch_contract_work = []
 
         while True:
             server_is_idle = True
@@ -233,6 +279,7 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(send_prefill_launch_contract_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
@@ -241,6 +288,16 @@ class SchedulerPPMixin:
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+
+                # Prefill launch contract must be recv'd after bootstrap + transfer
+                # pyobjs: sender order is recv_reqs, bootstrapped, transfer, contract, proxy.
+                if self._pp_use_hicache_launch_contract():
+                    if self.pp_group.is_first_rank:
+                        self._sgl_pp_upstream_launch_contracts = None
+                    else:
+                        self._sgl_pp_upstream_launch_contracts = (
+                            self._pp_recv_pyobj_from_prev_stage()
+                        )
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
@@ -325,6 +382,17 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    if self._pp_use_hicache_launch_contract():
+                        send_prefill_launch_contract_work = (
+                            self._pp_send_pyobj_to_next_stage(
+                                self._pp_build_launch_contracts_from_batch(
+                                    self.cur_batch
+                                ),
+                                async_send=True,
+                            )
+                        )
+                    else:
+                        send_prefill_launch_contract_work = []
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(self.launch_event)
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
@@ -558,6 +626,33 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+
+    def _pp_use_hicache_launch_contract(self: Scheduler) -> bool:
+        return (
+            self.pp_size > 1
+            and self.enable_hicache_storage
+            and getattr(self, "disaggregation_mode", None) == DisaggregationMode.PREFILL
+        )
+
+    def _pp_build_launch_contracts_from_batch(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> List[PPPrefillLaunchContract]:
+        if batch is None or not batch.reqs:
+            return []
+        return [
+            PPPrefillLaunchContract(
+                rid=req.rid,
+                fill_len=len(req.fill_ids),
+                prefix_len=len(req.prefix_indices),
+                extend_len=req.extend_input_len,
+                # cur_batch.reqs have already passed prepare_for_extend() (extend_batch_idx
+                # incremented). Downstream waiting_queue reqs are still pre-increment; match that.
+                extend_batch_idx=max(0, req.extend_batch_idx - 1),
+                is_chunked=int(req.is_chunked > 0),
+                host_hit_length=int(req.host_hit_length),
+            )
+            for req in batch.reqs
+        ]
 
     def profile_and_init_predictor(self: Scheduler):
         """

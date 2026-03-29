@@ -723,10 +723,17 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        *,
+        pp0_authoritative_prefill: bool = False,
     ):
-        if (self.prefill_delayer_single_pass is not None) and (
-            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+        if (
+            not pp0_authoritative_prefill
+            and self.prefill_delayer_single_pass is not None
+            and not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
                 running_batch=self.running_batch.batch_size(),
                 max_prefill_bs=self.max_prefill_bs,
@@ -737,10 +744,18 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if self.nsa_prefill_cp_in_seq_split and len(self.can_run_list) >= 1:
+        if (
+            not pp0_authoritative_prefill
+            and self.nsa_prefill_cp_in_seq_split
+            and len(self.can_run_list) >= 1
+        ):
             return AddReqResult.OTHER
 
-        if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+        if (
+            not pp0_authoritative_prefill
+            and (x := self.prefill_max_requests) is not None
+            and len(self.can_run_list) >= x
+        ):
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
@@ -759,7 +774,11 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+        if (
+            not pp0_authoritative_prefill
+            and real_input_tokens >= self.rem_input_tokens
+            and len(self.can_run_list) != 0
+        ):
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -804,7 +823,11 @@ class PrefillAdder:
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            if (
+                not pp0_authoritative_prefill
+                and input_tokens >= self.rem_input_tokens
+                and len(self.can_run_list) != 0
+            ):
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
@@ -817,8 +840,12 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
+            elif (
+                pp0_authoritative_prefill
+                or self.rem_chunk_tokens is None
+                or input_tokens <= self.rem_chunk_tokens
+            ):
+                # Non-chunked prefill (PP0 launch contract already fixed shape per chunk)
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -858,7 +885,13 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
-        return self.budget_state()
+        state = self.budget_state()
+        # budget_state() uses OTHER when chunk/input micro-budget is exhausted — that means
+        # "stop pulling more reqs from the waiting queue", not "this add failed". PP0 launch
+        # contract already fixed this batch; treat successful append as CONTINUE.
+        if pp0_authoritative_prefill and state == AddReqResult.OTHER:
+            return AddReqResult.CONTINUE
+        return state
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
         """

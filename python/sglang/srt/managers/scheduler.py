@@ -156,7 +156,10 @@ from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_pp_mixin import (
+    PPPrefillLaunchContract,
+    SchedulerPPMixin,
+)
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
@@ -168,9 +171,10 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -768,6 +772,9 @@ class Scheduler(
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._sgl_pp_upstream_launch_contracts: Optional[
+            List[PPPrefillLaunchContract]
+        ] = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2002,6 +2009,398 @@ class Scheduler(
             snapshot.append(f"...(+{len(reqs) - limit})")
         return snapshot
 
+    def _pp_rematch_req_to_launch_contract(
+        self, req: Req, c: PPPrefillLaunchContract
+    ) -> None:
+        prefix_tokens = c.fill_len - c.extend_len
+        token_ids = req.fill_ids[:prefix_tokens] if prefix_tokens > 0 else []
+        match_result = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+                req=req,
+                cow_mamba=self.tree_cache.supports_mamba(),
+            )
+        )
+        (
+            req.prefix_indices,
+            req.last_node,
+            req.last_host_node,
+            req.host_hit_length,
+            req.mamba_branching_seqlen,
+        ) = (
+            match_result.device_indices,
+            match_result.last_device_node,
+            match_result.last_host_node,
+            match_result.host_hit_length,
+            match_result.mamba_branching_seqlen,
+        )
+        req.cache_protected_len = len(req.prefix_indices)
+        req.set_extend_input_len(c.extend_len)
+        req.fill_ids = req.fill_ids[: c.fill_len]
+
+    def _pp_apply_launch_contract_to_req(
+        self, req: Req, c: PPPrefillLaunchContract
+    ) -> None:
+        if req.extend_batch_idx != c.extend_batch_idx:
+            raise RuntimeError(
+                "PP prefill launch contract extend_batch_idx mismatch: "
+                f"rid={req.rid} local={req.extend_batch_idx} contract={c.extend_batch_idx}"
+            )
+        # PP0 snapshots contracts from cur_batch after chunked_req.is_chunked += 1 at the end of
+        # get_new_batch_prefill. Downstream applies contracts before that same increment at the end
+        # of _get_new_batch_prefill_from_pp0_contracts, and process_batch_result does is_chunked -= 1
+        # after each chunked forward. So contract is_chunked==1 with local is_chunked==0 is expected.
+        local_chunked = int(req.is_chunked > 0)
+        contract_chunked = int(c.is_chunked)
+        if local_chunked != contract_chunked:
+            # PP0 may snapshot is_chunked before/after local bookkeeping differs by one step.
+            # Also, the last chunk can arrive with contract is_chunked=0 while downstream
+            # still has local is_chunked>0 until process_batch_result decrements.
+            if not (
+                (contract_chunked == 1 and local_chunked == 0)
+                or (contract_chunked == 0 and local_chunked == 1)
+            ):
+                raise RuntimeError(
+                    "PP prefill launch contract is_chunked mismatch: "
+                    f"rid={req.rid} local={req.is_chunked} contract={c.is_chunked}"
+                )
+        req.fill_ids = req.fill_ids[: c.fill_len]
+
+        use_latched_hicache_result = False
+        if self.enable_hicache_storage:
+            use_latched_hicache_result = hasattr(
+                self.tree_cache, "pop_prefetch_ready_result"
+            )
+            prefetch_progress_arg = (
+                req if use_latched_hicache_result else req.rid
+            )
+            prefetch_done = self.tree_cache.check_prefetch_progress(
+                prefetch_progress_arg
+            )
+            if not prefetch_done:
+                timeout_s = max(envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1)
+                wait_start = time.perf_counter()
+                while not prefetch_done:
+                    if time.perf_counter() - wait_start >= timeout_s:
+                        raise RuntimeError(
+                            "[PPContract] prefetch wait timeout: "
+                            f"rid={req.rid} pp={self.pp_rank} cp={self.attn_cp_rank} "
+                            f"tp={self.attn_tp_rank}"
+                        )
+                    self.tree_cache.check_hicache_events()
+                    time.sleep(0.001)
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        prefetch_progress_arg
+                    )
+                if not use_latched_hicache_result:
+                    req.storage_hit_length = (
+                        self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                    )
+        else:
+            use_latched_hicache_result = False
+
+        req.init_next_round_input(
+            self.tree_cache,
+            use_latched_hicache_result=use_latched_hicache_result,
+        )
+        # init_next_round_input resets fill_ids from origin_input_ids + output_ids, undoing the
+        # clamp above. Re-apply PP0's authoritative fill window (chunked prefill, etc.).
+        req.fill_ids = req.fill_ids[: c.fill_len]
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        # Token-level shape must match PP0; len(prefix_indices) is device-KV slots and can
+        # legitimately differ across PP (e.g. prefix KV on PP0 device, host-only mirror on PP1).
+        if (
+            len(req.fill_ids) != c.fill_len
+            or req.extend_input_len != c.extend_len
+            or len(req.prefix_indices) != c.prefix_len
+        ):
+            self._pp_rematch_req_to_launch_contract(req, c)
+        if len(req.fill_ids) != c.fill_len or req.extend_input_len != c.extend_len:
+            raise RuntimeError(
+                "[PPContract] cannot align req to PP0 launch contract after rematch: "
+                f"rid={req.rid} pp={self.pp_rank} contract={c} "
+                f"local_fill_len={len(req.fill_ids)} local_prefix_len={len(req.prefix_indices)} "
+                f"local_extend_len={req.extend_input_len}"
+            )
+        if (
+            len(req.prefix_indices) != c.prefix_len
+            or int(req.host_hit_length) != int(c.host_hit_length)
+        ):
+            logger.warning(
+                "[PPContract] device/host prefix layout differs from PP0 (allowed): "
+                "rid=%s pp=%s cp=%s tp=%s local_prefix_indices=%s local_host_hit=%s "
+                "contract_prefix_len=%s contract_host_hit=%s fill_len=%s extend_len=%s",
+                req.rid,
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                len(req.prefix_indices),
+                req.host_hit_length,
+                c.prefix_len,
+                c.host_hit_length,
+                c.fill_len,
+                c.extend_len,
+            )
+
+    def _pp_promote_bootstrapped_reqs_for_pp0_contracts(
+        self, contracts: List[PPPrefillLaunchContract]
+    ) -> None:
+        """Ensure reqs referenced by PP0 contracts are in waiting_queue.
+
+        In PP disaggregated prefill, ``process_bootstrapped_queue`` runs later in the
+        microbatch loop than ``get_new_batch_prefill``. PP0 may already have moved the
+        same rids from bootstrap to waiting while downstream ranks still hold them only
+        in ``disagg_prefill_bootstrap_queue``, causing ``missing req`` when applying
+        launch contracts.
+        """
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+        if not contracts:
+            return
+        rid_set = {c.rid for c in contracts}
+        if self.chunked_req is not None:
+            rid_set.add(self.chunked_req.rid)
+        promoted = self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+            rids_to_check=list(rid_set),
+        )
+        if promoted:
+            self.waiting_queue.extend(promoted)
+
+    def _get_new_batch_prefill_from_pp0_contracts(
+        self,
+        contracts: List[PPPrefillLaunchContract],
+        adder: PrefillAdder,
+    ) -> Optional[ScheduleBatch]:
+        diag_enabled = self._pp_prefill_diag_enabled()
+        diag_stop_reason = "pp0_contract"
+        if diag_enabled:
+            logger.warning(
+                "[PPPrefillDiag][contract_enter] pp=%s cp=%s tp=%s n_contract=%s "
+                "chunked=%s waiting=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                len(contracts),
+                None if self.chunked_req is None else self._pp_prefill_diag_req(self.chunked_req),
+                self._pp_prefill_diag_queue(list(self.waiting_queue)),
+            )
+
+        if len(contracts) == 0:
+            if self.chunked_req is not None:
+                logger.error(
+                    "[PPContract] empty contract list but local chunked_req is set: %s",
+                    self._pp_prefill_diag_req(self.chunked_req),
+                )
+                return None
+            return None
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
+        contracts = list(contracts)
+        if self.chunked_req is not None:
+            ci = next(
+                (
+                    i
+                    for i, c in enumerate(contracts)
+                    if c.rid == self.chunked_req.rid
+                ),
+                None,
+            )
+            if ci is None:
+                logger.error(
+                    "[PPContract] no contract entry for active chunked_req rid=%s",
+                    self.chunked_req.rid,
+                )
+                return None
+            if ci != 0:
+                contracts[0], contracts[ci] = contracts[ci], contracts[0]
+
+        self._pp_promote_bootstrapped_reqs_for_pp0_contracts(contracts)
+
+        req_by_rid = {r.rid: r for r in self.waiting_queue}
+        if self.enable_lora:
+            running_loras = {req.lora_id for req in self.running_batch.reqs}
+
+        for c in contracts:
+            from_chunked = (
+                self.chunked_req is not None and c.rid == self.chunked_req.rid
+            )
+            if from_chunked:
+                req = self.chunked_req
+            else:
+                req = req_by_rid.get(c.rid)
+
+            if req is None:
+                logger.error(
+                    "[PPContract] missing req for rid=%s pp=%s",
+                    c.rid,
+                    self.pp_rank,
+                )
+                return None
+
+            if self.enable_lora and req.lora_id not in running_loras:
+                if self.enable_lora_overlap_loading:
+                    res = self.lora_overlap_loader.try_overlap_load_lora(
+                        req.lora_id, running_loras
+                    )
+                    if not res:
+                        logger.error(
+                            "[PPContract] LoRA overlap load failed rid=%s", c.rid
+                        )
+                        return None
+                else:
+                    new_lora_set = {req.lora_id} | running_loras
+                    if not self.tp_worker.model_runner.lora_manager.validate_lora_batch(
+                        new_lora_set
+                    ):
+                        logger.error(
+                            "[PPContract] LoRA batch validation failed rid=%s", c.rid
+                        )
+                        return None
+
+            running_bs = len(self.running_batch.reqs)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                self.running_batch.batch_is_full = True
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    self.running_batch.batch_is_full = True
+
+            if self.running_batch.batch_is_full:
+                logger.error(
+                    "[PPContract] batch became full before scheduling all PP0 contracts"
+                )
+                return None
+
+            self._pp_apply_launch_contract_to_req(req, c)
+
+            if from_chunked and c.is_chunked:
+                self.chunked_req = adder.add_chunked_req(req)
+            elif from_chunked and not c.is_chunked:
+                # Last chunk: PP0 contract uses is_chunked=0; req is no longer in waiting_queue.
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                    pp0_authoritative_prefill=True,
+                )
+                if self.enable_lora:
+                    running_loras.add(req.lora_id)
+                if res != AddReqResult.CONTINUE:
+                    logger.error(
+                        "[PPContract] add_one_req failed rid=%s res=%s",
+                        c.rid,
+                        res.name,
+                    )
+                    return None
+                self.chunked_req = None
+            else:
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                    pp0_authoritative_prefill=True,
+                )
+                if self.enable_lora:
+                    running_loras.add(req.lora_id)
+                if res != AddReqResult.CONTINUE:
+                    logger.error(
+                        "[PPContract] add_one_req failed rid=%s res=%s",
+                        c.rid,
+                        res.name,
+                    )
+                    return None
+
+        can_run_list: List[Req] = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+        if adder.preempt_list:
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
+
+        if adder.new_chunked_req is not None:
+            assert self.chunked_req is None
+            self.chunked_req = adder.new_chunked_req
+
+        if self.chunked_req is not None:
+            self.chunked_req.is_chunked += 1
+
+        self.adder = adder
+        self.can_run_list = can_run_list
+        self.running_bs = len(self.running_batch.reqs)
+        set_time_batch(can_run_list, "set_forward_entry_time")
+
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            chunked_req=self.chunked_req,
+        )
+        self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+        if self.enable_hierarchical_cache:
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
+            if self.pp_size > 1 and new_batch.hicache_consumer_index >= 0:
+                timeout_s = max(envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1)
+                wait_start = time.perf_counter()
+                while True:
+                    if self.tree_cache.is_load_ready(new_batch.hicache_consumer_index):
+                        break
+                    if time.perf_counter() - wait_start >= timeout_s:
+                        raise RuntimeError(
+                            "[PPHicacheLoad] launch gate timeout before batch launch: "
+                            f"consumer_index={new_batch.hicache_consumer_index} "
+                            f"reqs={new_batch.batch_size()} pp={self.pp_rank} "
+                            f"cp={self.attn_cp_rank} tp={self.attn_tp_rank}"
+                        )
+                    time.sleep(0.001)
+
+        new_batch.prepare_for_extend()
+        if diag_enabled:
+            logger.warning(
+                "[PPPrefillDiag][contract_selected] pp=%s cp=%s tp=%s reason=%s selected=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                diag_stop_reason,
+                self._pp_prefill_diag_queue(can_run_list),
+            )
+
+        new_batch.prefill_stats = PrefillStats(
+            log_input_tokens=adder.log_input_tokens,
+            log_hit_tokens=adder.log_hit_tokens,
+            new_token_ratio=adder.new_token_ratio,
+            running_bs=len(self.running_batch.reqs),
+            num_new_seqs=len(can_run_list),
+        )
+
+        if (
+            self.is_mixed_chunk
+            and not self.running_batch.is_empty()
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode()
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=self.running_batch.batch_is_full
+            )
+        else:
+            new_batch.decoding_reqs = None
+
+        return new_batch
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2088,6 +2487,14 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
         )
+        upstream_launch_contracts = self._sgl_pp_upstream_launch_contracts
+        self._sgl_pp_upstream_launch_contracts = None
+        if upstream_launch_contracts is not None:
+            return self._get_new_batch_prefill_from_pp0_contracts(
+                upstream_launch_contracts,
+                adder,
+            )
+
         diag_enabled = self._pp_prefill_diag_enabled()
         diag_stop_reason = "selected"
         if diag_enabled:
