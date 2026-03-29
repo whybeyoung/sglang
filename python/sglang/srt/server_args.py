@@ -2145,10 +2145,13 @@ class ServerArgs:
             assert (
                 self.tp_size % self.attn_cp_size == 0
             ), "tp_size must be divisible by attn_cp_size"
-            assert (
-                self.tp_size % (self.dp_size * self.attn_cp_size) == 0
-            ), "tp_size must be divisible by dp_size * attn_cp_size"
+            # NSA prefill CP sets attn_cp_size == tp_size (full CP within each TP group); then
+            # tp_size % (dp_size * attn_cp_size) is only 0 when dp_size == 1. DP-attention
+            # replicas are handled separately, so skip the generic CP×DP divisibility rule.
             if not self.enable_nsa_prefill_context_parallel:
+                assert (
+                    self.tp_size % (self.dp_size * self.attn_cp_size) == 0
+                ), "tp_size must be divisible by dp_size * attn_cp_size"
                 assert (
                     self.pp_size == 1
                 ), "PP is not supported with context parallelism"
