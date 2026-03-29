@@ -1244,10 +1244,21 @@ class ServerArgs:
                             "Other sizes are restricted due to precision / multi-machine CP caveats; "
                             "add your size to NSA_PREFILL_CP_SUPPORTED_TP_SIZES in server_args.py after validation."
                         )
-                        self.attn_cp_size = self.tp_size
+                        if self.nsa_prefill_cp_mode == "in-seq-split":
+                            self.attn_cp_size = self.tp_size
+                        else:
+                            # round-robin-split: honor --attn-cp-size for partial CP (e.g. TP16 + CP8).
+                            if self.attn_cp_size <= 1:
+                                self.attn_cp_size = self.tp_size
+                            else:
+                                assert self.tp_size % self.attn_cp_size == 0, (
+                                    "tp_size must be divisible by attn_cp_size for NSA "
+                                    "prefill context parallel (round-robin-split); "
+                                    f"got tp_size={self.tp_size}, attn_cp_size={self.attn_cp_size}"
+                                )
 
                         logger.warning(
-                            f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
+                            f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, attn_cp_size == {self.attn_cp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
                         )
                     else:
                         # Pure TP and partial DP Attention mode is active for NSA, logging a warning
@@ -2145,9 +2156,9 @@ class ServerArgs:
             assert (
                 self.tp_size % self.attn_cp_size == 0
             ), "tp_size must be divisible by attn_cp_size"
-            # NSA prefill CP sets attn_cp_size == tp_size (full CP within each TP group); then
-            # tp_size % (dp_size * attn_cp_size) is only 0 when dp_size == 1. DP-attention
-            # replicas are handled separately, so skip the generic CP×DP divisibility rule.
+            # NSA prefill CP may use attn_cp_size == tp_size (full CP) or a proper divisor
+            # (partial CP, round-robin-split). tp_size % (dp_size * attn_cp_size) is only 0
+            # when dp_size == 1 for full CP. Skip the generic CP×DP rule for NSA prefill CP.
             if not self.enable_nsa_prefill_context_parallel:
                 assert (
                     self.tp_size % (self.dp_size * self.attn_cp_size) == 0
@@ -3390,7 +3401,10 @@ class ServerArgs:
             "--attn-cp-size",
             type=int,
             default=ServerArgs.attn_cp_size,
-            help="The attention context parallelism size.",
+            help="Attention context parallel size. For NSA prefill CP with "
+            "--nsa-prefill-cp-mode round-robin-split, set to a divisor of tp_size "
+            "(e.g. tp_size=16, attn_cp_size=8); omit or 1 defaults to full CP (attn_cp_size=tp_size). "
+            "in-seq-split always uses full CP.",
         )
         parser.add_argument(
             "--moe-data-parallel-size",
