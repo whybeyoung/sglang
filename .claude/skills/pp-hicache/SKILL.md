@@ -177,6 +177,30 @@ nohup python3 -m sglang.launch_server \
 
 5. **观察与 debug**：日志里搜 `PPContract`、`HiCache`、`PP recv`；卡死则 **`spy-pp0-stuck-threads`**。回到步骤 1 改代码再推、再跑 2–5。
 
+### 一键自动化（推荐）
+
+在仓库根目录执行（需本机已能 `ssh -p 30239/30243 root@36.138.60.54`）：
+
+```bash
+./scripts/pp_hicache_deploy_cycle.sh
+```
+
+顺序为：`git push why contract_v2` → 双机 HTTPS pull（默认 `HTTPS_PROXY=http://10.104.102.203:7890`）→ 停 `launch_server` / scheduler → 打印两台 **git HEAD、进程、nohup 尾部与 PP 相关报错 grep**。
+
+常用环境变量：
+
+- `PP_HICACHE_SKIP_PUSH=1`：不 push，只 pull + 停服 + 观测（已推过时）
+- `PP_HICACHE_SKIP_STOP=1`：不杀进程，只 push + pull + 观测（谨慎：未重启仍跑旧代码）
+- `PP_HICACHE_STOP_AISERVICE=1`：停服时一并 `pkill AIservice`（node-1）
+
+仅观测（不打断服务）：
+
+```bash
+./scripts/pp_hicache_observe_cluster.sh
+```
+
+脚本结束后需**手动**按上文步骤 4 在 `/home/aiges` 用 `PYTHONPATH=/usr/local/src/sglang/python` 再起服务；起好后可再跑 `pp_hicache_observe_cluster.sh` 对照日志。
+
 ---
 
 ## 手动在节点上拉取（等价于脚本）
