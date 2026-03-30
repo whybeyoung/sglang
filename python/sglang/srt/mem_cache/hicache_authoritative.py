@@ -57,44 +57,24 @@ class AuthoritativeTreeCoordinator:
         )
 
     def sync(self, apply_fn, transform_fn=None) -> int:
-        """Broadcast authoritative ops and apply them in order on every PP rank."""
+        """Apply queued ops in order on the local PP rank.
+
+        A previous version tried to broadcast these ops from PP0 inside
+        HiCache's scheduler-side event loop. Under `pp-size > 1` that created a
+        deadlock: PP0 could enter the extra collective while PP1 was blocked in
+        the normal pipeline recv path. Keep the authoritative replay logic
+        local-only until it is piggybacked on an existing PP synchronization
+        point.
+        """
         if not self.enabled:
             return self._committed_seq
-
-        try:
-            from sglang.srt.distributed.parallel_state import get_pp_group
-
-            pp_group = get_pp_group()
-        except Exception:
-            pp_group = None
-        if pp_group is None:
-            self._drain_local_without_broadcast(apply_fn)
-            return self._committed_seq
-        if pp_group.world_size <= 1:
-            self._drain_local_without_broadcast(apply_fn)
-            return self._committed_seq
-
-        ops: list[AuthoritativeTreeOp] | None = None
-        if pp_group.rank_in_group == self.src_rank:
-            staged_ops = list(self._pending_local)
-            self._pending_local.clear()
-            if transform_fn is not None:
-                staged_ops = list(transform_fn(staged_ops))
-            ops = []
-            for op in staged_ops:
-                self._committed_seq += 1
-                op.op_seq = self._committed_seq
-                ops.append(op)
-        else:
-            self._pending_local.clear()
-
-        data = [ops]
-        pp_group.broadcast_object_list(data, src=self.src_rank)
-        recv_ops = data[0] or []
-        for op in recv_ops:
-            if op.op_seq is None:
-                raise ValueError(f"Authoritative op missing sequence: {op}")
-            self._committed_seq = max(self._committed_seq, op.op_seq)
+        staged_ops = list(self._pending_local)
+        self._pending_local.clear()
+        if transform_fn is not None:
+            staged_ops = list(transform_fn(staged_ops))
+        for op in staged_ops:
+            self._committed_seq += 1
+            op.op_seq = self._committed_seq
             apply_fn(op)
         return self._committed_seq
 

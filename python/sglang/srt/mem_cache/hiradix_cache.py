@@ -2254,6 +2254,76 @@ class HiRadixCache(RadixCache):
             input_len=len(req.fill_ids),
         )
 
+    def _recover_prefetch_committed_host_nodes(
+        self,
+        *,
+        anchor_node: TreeNode,
+        fetched_token_ids: List[int],
+        fetched_hash_value: List[str],
+        committed_tokens: int,
+    ) -> list[TreeNode]:
+        if committed_tokens <= 0:
+            return []
+        path_nodes = self._find_exact_host_path_nodes(
+            anchor_node, fetched_token_ids[:committed_tokens]
+        )
+        if not path_nodes:
+            return []
+
+        selected: list[TreeNode] = []
+        covered_tokens = 0
+        candidate_hashes: list[str] = []
+        for node in path_nodes:
+            if not node.evicted or len(node.host_value) == 0:
+                break
+            selected.append(node)
+            covered_tokens += len(node.host_value)
+            if node.hash_value:
+                candidate_hashes.extend(node.hash_value)
+            if covered_tokens >= committed_tokens:
+                break
+
+        if covered_tokens < committed_tokens:
+            return []
+
+        expected_hashes = fetched_hash_value[: committed_tokens // self.page_size]
+        if expected_hashes and candidate_hashes[: len(expected_hashes)] != expected_hashes:
+            return []
+        return selected
+
+    def _build_authoritative_ready_result_from_prefetch_finalize(
+        self,
+        req: Req,
+        *,
+        anchor_node: TreeNode,
+        fetched_token_ids: List[int],
+        fetched_hash_value: List[str],
+        committed_tokens: int,
+        storage_hit_length: int,
+    ) -> LatchedPrefetchReadyResult:
+        base_ready = self._build_latched_prefetch_ready_result(req, storage_hit_length)
+        host_nodes = self._recover_prefetch_committed_host_nodes(
+            anchor_node=anchor_node,
+            fetched_token_ids=fetched_token_ids,
+            fetched_hash_value=fetched_hash_value,
+            committed_tokens=committed_tokens,
+        )
+        host_hit_length = min(
+            committed_tokens, sum(len(node.host_value) for node in host_nodes)
+        )
+        last_host_node = host_nodes[-1] if host_nodes else self.root_node
+        return LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=base_ready.match_result.device_indices,
+                last_device_node=base_ready.match_result.last_device_node,
+                last_host_node=last_host_node,
+                host_hit_length=host_hit_length,
+                mamba_branching_seqlen=base_ready.match_result.mamba_branching_seqlen,
+            ),
+            storage_hit_length=storage_hit_length,
+            input_len=base_ready.input_len,
+        )
+
     def get_height(self, node: TreeNode):
         height = 0
         while node != self.root_node:
@@ -2855,6 +2925,9 @@ class HiRadixCache(RadixCache):
 
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
+        ready_storage_hit_length = (
+            min_completed_tokens if self.authoritative_tree.enabled else loaded_from_storage
+        )
         self.queue_authoritative_tree_op(
             "HOST_INSERT_FROM_STORAGE",
             **self._build_host_insert_from_storage_payload(
@@ -2868,11 +2941,21 @@ class HiRadixCache(RadixCache):
                 committed_tokens=min_completed_tokens,
             ),
         )
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        self.prefetch_loaded_tokens_by_reqid[req_id] = ready_storage_hit_length
         if req is not None:
-            ready_result = self._build_latched_prefetch_ready_result(
-                req, loaded_from_storage
-            )
+            if self.authoritative_tree.enabled:
+                ready_result = self._build_authoritative_ready_result_from_prefetch_finalize(
+                    req,
+                    anchor_node=last_host_node,
+                    fetched_token_ids=fetched_token_ids,
+                    fetched_hash_value=hash_value[: min_completed_tokens // self.page_size],
+                    committed_tokens=min_completed_tokens,
+                    storage_hit_length=ready_storage_hit_length,
+                )
+            else:
+                ready_result = self._build_latched_prefetch_ready_result(
+                    req, loaded_from_storage
+                )
             self.queue_authoritative_tree_op(
                 "PREFETCH_READY_SUMMARY",
                 req_id=req_id,
@@ -2960,12 +3043,9 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         ready_result: Optional[LatchedPrefetchReadyResult] = None
         if self.authoritative_tree.enabled and req is not None:
-            # Under PP authoritative mode, do not expose rank-local latched ready
-            # results before a committed summary exists, otherwise PP stages can
-            # consume different host/storage interpretations for the same req.
-            ready_result = self.build_authoritative_prefetch_ready_result(req)
-            if ready_result is not None:
-                self.prefetch_ready_results_by_reqid.pop(req_id, None)
+            ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
+            if ready_result is None:
+                ready_result = self.build_authoritative_prefetch_ready_result(req)
         else:
             ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
             ready_result = self._clamp_ready_result_to_authoritative_summary(
