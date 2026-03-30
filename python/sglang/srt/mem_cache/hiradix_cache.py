@@ -1020,7 +1020,9 @@ class HiRadixCache(RadixCache):
             self.queue_authoritative_tree_op(
                 "PREFETCH_READY_SUMMARY",
                 req_id=req_id,
-                prefix_len=len(ready_result.match_result.device_indices),
+                prefix_len=len(ready_result.match_result.device_indices)
+                + ready_result.match_result.host_hit_length
+                + ready_result.storage_hit_length,
                 host_hit_length=ready_result.match_result.host_hit_length,
                 storage_hit_length=ready_result.storage_hit_length,
                 input_len=ready_result.input_len,
@@ -2874,7 +2876,9 @@ class HiRadixCache(RadixCache):
             self.queue_authoritative_tree_op(
                 "PREFETCH_READY_SUMMARY",
                 req_id=req_id,
-                prefix_len=len(ready_result.match_result.device_indices),
+                prefix_len=len(ready_result.match_result.device_indices)
+                + ready_result.match_result.host_hit_length
+                + ready_result.storage_hit_length,
                 host_hit_length=ready_result.match_result.host_hit_length,
                 storage_hit_length=ready_result.storage_hit_length,
                 input_len=ready_result.input_len,
@@ -2958,8 +2962,6 @@ class HiRadixCache(RadixCache):
         ready_result = self._clamp_ready_result_to_authoritative_summary(
             req_id, ready_result
         )
-        if ready_result is not None:
-            self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
         if (
             ready_result is not None
             and os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1"
