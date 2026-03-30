@@ -890,8 +890,6 @@ class Req(ReqDllmMixin):
                         match_result = ready_result.match_result
                         self.storage_hit_length = ready_result.storage_hit_length
                         match_source = "latched_ready"
-                    else:
-                        self.storage_hit_length = 0
             if match_result is None:
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(

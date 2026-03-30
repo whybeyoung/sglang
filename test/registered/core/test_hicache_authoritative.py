@@ -79,21 +79,18 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(req.host_hit_length, 1)
         self.assertEqual(req.storage_hit_length, 1)
 
-    def test_pop_prefetch_ready_result_falls_back_to_authoritative_ready(self):
+    def test_pop_prefetch_ready_result_keeps_authoritative_summary_on_miss(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.prefetch_loaded_tokens_by_reqid = {}
         cache.prefetch_ready_results_by_reqid = {}
-        cache.authoritative_prefetch_ready_by_reqid = {}
-        cache.build_authoritative_prefetch_ready_result = lambda req: LatchedPrefetchReadyResult(
-            match_result=MatchResult(
-                device_indices=torch.arange(2, dtype=torch.int64),
-                last_device_node=None,
-                last_host_node=None,
+        cache.authoritative_prefetch_ready_by_reqid = {
+            "rid-pop": AuthoritativePrefetchReadySummary(
+                req_id="rid-pop",
+                prefix_len=2,
                 host_hit_length=1,
+                storage_hit_length=4,
             ),
-            storage_hit_length=4,
-            input_len=len(req.fill_ids),
-        )
+        }
         cache._clamp_ready_result_to_authoritative_summary = (
             lambda req_id, ready_result: ready_result
         )
@@ -102,9 +99,8 @@ class TestHiCacheAuthoritative(CustomTestCase):
 
         ready_result = cache.pop_prefetch_ready_result("rid-pop", req=req)
 
-        self.assertIsNotNone(ready_result)
-        self.assertEqual(len(ready_result.match_result.device_indices), 2)
-        self.assertEqual(ready_result.storage_hit_length, 4)
+        self.assertIsNone(ready_result)
+        self.assertIn("rid-pop", cache.authoritative_prefetch_ready_by_reqid)
 
     def test_hicache_clamps_match_result_with_authoritative_summary(self):
         cache = HiRadixCache.__new__(HiRadixCache)
@@ -129,6 +125,68 @@ class TestHiCacheAuthoritative(CustomTestCase):
 
         self.assertEqual(len(clamped.device_indices), 2)
         self.assertEqual(clamped.host_hit_length, 1)
+
+    def test_authoritative_node_indexes_resolve_id_and_hash(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache._authoritative_node_by_id = {}
+        cache._authoritative_node_by_last_hash = {}
+        cache._authoritative_last_hash_by_node_id = {}
+
+        class Node:
+            id = 17
+
+            @staticmethod
+            def get_last_hash_value():
+                return "hash-17"
+
+        node = Node()
+        cache._register_authoritative_node(node)
+
+        self.assertIs(cache._find_node_by_id(17), node)
+        self.assertIs(cache._find_node_by_last_hash("hash-17"), node)
+
+    def test_unregister_authoritative_node_clears_indexes(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache._authoritative_node_by_id = {}
+        cache._authoritative_node_by_last_hash = {}
+        cache._authoritative_last_hash_by_node_id = {}
+
+        class Node:
+            id = 19
+
+            @staticmethod
+            def get_last_hash_value():
+                return "hash-19"
+
+        node = Node()
+        cache._register_authoritative_node(node)
+        cache._unregister_authoritative_node(node)
+
+        self.assertIsNone(cache._authoritative_node_by_id.get(19))
+        self.assertIsNone(cache._authoritative_node_by_last_hash.get("hash-19"))
+
+    def test_promote_stable_backup_visibility_fast_path_when_empty(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.authoritative_pending_backup_refs = {}
+        cache.authoritative_pending_backup_node_ids = {1, 2}
+
+        cache._promote_stable_backup_visibility()
+
+        self.assertEqual(cache.authoritative_pending_backup_node_ids, set())
+
+    def test_replay_pending_host_insert_blueprints_fast_path_when_empty(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.authoritative_host_insert_rebuild_by_reqid = {}
+        cache._advance_host_insert_skeleton = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("should not advance empty blueprint set")
+        )
+        cache._try_apply_host_insert_rebuild_blueprint = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("should not apply empty blueprint set")
+            )
+        )
+
+        cache._replay_pending_host_insert_blueprints()
 
     def test_is_authoritative_ready_stable_requires_no_pending_host_insert_state(self):
         cache = HiRadixCache.__new__(HiRadixCache)

@@ -274,6 +274,9 @@ class HiRadixCache(RadixCache):
         self.authoritative_host_visible_node_ids: set[int] = set()
         self.authoritative_resolution_stats: dict[str, int] = {}
         self._last_authoritative_resolution_log_ts = 0.0
+        self._authoritative_node_by_id: dict[int, TreeNode] = {}
+        self._authoritative_node_by_last_hash: dict[str, TreeNode] = {}
+        self._authoritative_last_hash_by_node_id: dict[int, str] = {}
         # track requests whose prefetch was skipped (alloc failure, threshold, rate limit)
         self.prefetch_skipped_rids: set[str] = set()
         # todo: dynamically adjust the threshold
@@ -546,17 +549,69 @@ class HiRadixCache(RadixCache):
             yield node
             stack.extend(reversed(list(node.children.values())))
 
+    def _register_authoritative_node(self, node: Optional[TreeNode]) -> None:
+        if node is None:
+            return
+        node_id = getattr(node, "id", None)
+        if node_id is None:
+            return
+        self._authoritative_node_by_id[node_id] = node
+        last_hash = node.get_last_hash_value()
+        if last_hash:
+            self._authoritative_node_by_last_hash[last_hash] = node
+            self._authoritative_last_hash_by_node_id[node_id] = last_hash
+
+    def _refresh_authoritative_node_index(self, node: Optional[TreeNode]) -> None:
+        if node is None:
+            return
+        node_id = getattr(node, "id", None)
+        if node_id is None:
+            return
+        self._authoritative_node_by_id[node_id] = node
+        old_last_hash = self._authoritative_last_hash_by_node_id.pop(node_id, None)
+        if old_last_hash is not None:
+            indexed = self._authoritative_node_by_last_hash.get(old_last_hash)
+            if indexed is node:
+                self._authoritative_node_by_last_hash.pop(old_last_hash, None)
+        new_last_hash = node.get_last_hash_value()
+        if new_last_hash:
+            self._authoritative_node_by_last_hash[new_last_hash] = node
+            self._authoritative_last_hash_by_node_id[node_id] = new_last_hash
+
+    def _unregister_authoritative_node(self, node: Optional[TreeNode]) -> None:
+        if node is None:
+            return
+        node_id = getattr(node, "id", None)
+        if node_id is None:
+            return
+        indexed = self._authoritative_node_by_id.get(node_id)
+        if indexed is node:
+            self._authoritative_node_by_id.pop(node_id, None)
+        old_last_hash = self._authoritative_last_hash_by_node_id.pop(node_id, None)
+        if old_last_hash is not None:
+            indexed = self._authoritative_node_by_last_hash.get(old_last_hash)
+            if indexed is node:
+                self._authoritative_node_by_last_hash.pop(old_last_hash, None)
+
     def _find_node_by_id(self, node_id: int) -> Optional[TreeNode]:
+        node = self._authoritative_node_by_id.get(node_id)
+        if node is not None:
+            return node
         for node in self._iter_nodes():
             if getattr(node, "id", None) == node_id:
+                self._register_authoritative_node(node)
                 return node
         return None
 
     def _find_node_by_last_hash(self, last_hash: Optional[str]) -> Optional[TreeNode]:
         if not last_hash:
             return None
+        node = self._authoritative_node_by_last_hash.get(last_hash)
+        if node is not None:
+            return node
         for node in self._iter_nodes():
             if node.get_last_hash_value() == last_hash:
+                self._register_authoritative_node(node)
                 return node
         return None
 
@@ -897,11 +952,12 @@ class HiRadixCache(RadixCache):
         return True
 
     def _replay_pending_host_insert_blueprints(self) -> None:
+        if not self.authoritative_host_insert_rebuild_by_reqid:
+            return
         pending_items = list(self.authoritative_host_insert_rebuild_by_reqid.items())
         for req_id, blueprint in pending_items:
             self._advance_host_insert_skeleton(req_id, blueprint)
             self._try_apply_host_insert_rebuild_blueprint(req_id, blueprint)
-        self._maybe_commit_stable_prefetch_ready_summaries()
 
     def _is_backup_node_stable(self, node: Optional[TreeNode]) -> bool:
         if node is None:
@@ -913,6 +969,9 @@ class HiRadixCache(RadixCache):
         )
 
     def _promote_stable_backup_visibility(self) -> None:
+        if not self.authoritative_pending_backup_refs:
+            self.authoritative_pending_backup_node_ids = set()
+            return
         current_pending_ids: set[int] = set()
         pending_items = list(self.authoritative_pending_backup_refs.items())
         for backup_key, node_ref in pending_items:
@@ -935,6 +994,8 @@ class HiRadixCache(RadixCache):
 
     def _maybe_commit_stable_prefetch_ready_summaries(self) -> None:
         if not getattr(self.authoritative_tree, "enabled", False):
+            return
+        if not self.prefetch_ready_results_by_reqid:
             return
         for req_id, ready_result in list(self.prefetch_ready_results_by_reqid.items()):
             if not self._is_authoritative_ready_stable(req_id):
@@ -1315,6 +1376,7 @@ class HiRadixCache(RadixCache):
         popped = node.parent.children.pop(key, None)
         if popped is not node:
             return
+        self._unregister_authoritative_node(node)
         if node in self.evictable_host_leaves:
             self.evictable_host_leaves.remove(node)
         self._update_host_leaf_status(node.parent)
@@ -2146,8 +2208,12 @@ class HiRadixCache(RadixCache):
         self.authoritative_host_visible_node_ids.clear()
         self.authoritative_resolution_stats.clear()
         self._last_authoritative_resolution_log_ts = 0.0
+        self._authoritative_node_by_id.clear()
+        self._authoritative_node_by_last_hash.clear()
+        self._authoritative_last_hash_by_node_id.clear()
         self.evictable_host_leaves.clear()
         super().reset()
+        self._register_authoritative_node(self.root_node)
 
     def _build_latched_prefetch_ready_result(
         self, req: Req, storage_hit_length: int
@@ -2364,6 +2430,7 @@ class HiRadixCache(RadixCache):
 
     def _delete_leaf(self, node):
         self._discard_authoritative_visibility(node)
+        self._unregister_authoritative_node(node)
         super()._delete_leaf(node)
 
     def evict(self, params: EvictParams) -> EvictResult:
@@ -2618,8 +2685,12 @@ class HiRadixCache(RadixCache):
         # Keep authoritative visibility reconciliation inside the HiCache event
         # loop instead of introducing extra PP scheduler barriers.
         self.sync_authoritative_state()
-        self._promote_stable_backup_visibility()
-        self._replay_pending_host_insert_blueprints()
+        if self.authoritative_pending_backup_refs:
+            self._promote_stable_backup_visibility()
+        if self.authoritative_host_insert_rebuild_by_reqid:
+            self._replay_pending_host_insert_blueprints()
+        if self.prefetch_ready_results_by_reqid:
+            self._maybe_commit_stable_prefetch_ready_summaries()
         self._maybe_log_authoritative_resolution_stats()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
@@ -2850,12 +2921,11 @@ class HiRadixCache(RadixCache):
     ) -> Optional[LatchedPrefetchReadyResult]:
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
-        if ready_result is None and req is not None:
-            ready_result = self.build_authoritative_prefetch_ready_result(req)
         ready_result = self._clamp_ready_result_to_authoritative_summary(
             req_id, ready_result
         )
-        self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
+        if ready_result is not None:
+            self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
         if (
             ready_result is not None
             and os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1"
@@ -3153,6 +3223,7 @@ class HiRadixCache(RadixCache):
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
+            self._refresh_authoritative_node_index(new_node)
             if inserted_nodes is not None:
                 inserted_nodes.append(new_node)
             self._update_host_leaf_status(new_node)
@@ -3220,6 +3291,8 @@ class HiRadixCache(RadixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        self._refresh_authoritative_node_index(new_node)
+        self._refresh_authoritative_node_index(child)
         if child_backup_visible:
             self.authoritative_backuped_node_ids.add(new_node.id)
         if child_host_visible:
@@ -3302,6 +3375,7 @@ class HiRadixCache(RadixCache):
             # Compute hash_value if storage is enabled
             if self.enable_storage:
                 new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+            self._refresh_authoritative_node_index(new_node)
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)

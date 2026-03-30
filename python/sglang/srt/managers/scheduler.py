@@ -2183,11 +2183,12 @@ class Scheduler(
                             break
                     else:
                         continue
-                if not use_latched_hicache_result:
-                    # Pop the number of tokens loaded from storage (L3 hits)
-                    req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                        req.rid
-                    )
+                # Pop the number of tokens loaded from storage (L3 hits) as soon as
+                # prefetch completes so init_next_round_input can reuse it even when
+                # no local latched ready result is available.
+                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                    req.rid
+                )
             else:
                 use_latched_hicache_result = False
 
