@@ -158,6 +158,17 @@ class HiRadixCache(RadixCache):
                 and os.getenv("SGLANG_ENABLE_HICACHE_AUTHORITATIVE_PP", "0") == "1"
             )
         )
+        # Until PP authoritative ready/contract replay is fully wired into the
+        # main scheduler path, default PP HiCache reads to a conservative
+        # device-only view. This avoids stage-local host-hit divergence such as
+        # PP0 host_hit>0 while PP1 host_hit=0, which can later surface as batch
+        # shape mismatches in model forward.
+        self.pp_device_only_match_fallback = (
+            self.pp_size > 1
+            and not self.authoritative_tree.enabled
+            and os.getenv("SGLANG_DISABLE_PP_HICACHE_DEVICE_ONLY_FALLBACK", "0")
+            != "1"
+        )
 
         (
             extra_config,
@@ -2937,6 +2948,11 @@ class HiRadixCache(RadixCache):
     def pop_prefetch_ready_result(
         self, req_id: str, req: Optional[Req] = None
     ) -> Optional[LatchedPrefetchReadyResult]:
+        if self.pp_device_only_match_fallback:
+            self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+            self.prefetch_ready_results_by_reqid.pop(req_id, None)
+            self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
+            return None
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
         ready_result = self._clamp_ready_result_to_authoritative_summary(
@@ -3059,6 +3075,20 @@ class HiRadixCache(RadixCache):
             match_result,
             input_len=(len(params.req.fill_ids) if params.req is not None else None),
         )
+        if self.pp_device_only_match_fallback:
+            if match_result.host_hit_length > 0:
+                logger.warning_once(
+                    "PP HiCache authoritative replay is disabled; "
+                    "falling back to device-only prefix matching to keep PP "
+                    "stages shape-consistent."
+                )
+            match_result = MatchResult(
+                device_indices=match_result.device_indices,
+                last_device_node=match_result.last_device_node,
+                last_host_node=match_result.last_device_node,
+                host_hit_length=0,
+                mamba_branching_seqlen=match_result.mamba_branching_seqlen,
+            )
 
         if (
             os.getenv("SGLANG_DEBUG_HICACHE_MATCH", "0") == "1"
