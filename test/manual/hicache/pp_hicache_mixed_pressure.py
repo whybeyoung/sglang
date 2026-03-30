@@ -57,6 +57,7 @@ class MismatchRecord:
     rid: str
     cp: int
     tp: int
+    pair_index: int
     pp0: MatchRecord
     pp1: MatchRecord
 
@@ -74,8 +75,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7, help="Random seed")
     parser.add_argument("--long-hot-count", type=int, default=8, help="Reusable long prompt pool size")
     parser.add_argument("--short-hot-count", type=int, default=32, help="Reusable short prompt pool size")
-    parser.add_argument("--long-token-len", type=int, default=8192, help="Approximate token count for long prompts")
-    parser.add_argument("--short-token-len", type=int, default=192, help="Approximate token count for short prompts")
+    parser.add_argument("--long-token-len", type=int, default=4096, help="Approximate token count for long prompts")
+    parser.add_argument("--short-token-len", type=int, default=128, help="Approximate token count for short prompts")
     parser.add_argument("--long-hot-weight", type=float, default=0.35, help="Traffic weight for reusable long prompts")
     parser.add_argument("--long-churn-weight", type=float, default=0.35, help="Traffic weight for unique-ish long prompts")
     parser.add_argument("--short-hot-weight", type=float, default=0.15, help="Traffic weight for reusable short prompts")
@@ -93,7 +94,18 @@ def build_prompt(label: str, approx_tokens: int, salt: str) -> str:
         f"Scenario salt: {salt}\n"
         "Context begins below.\n"
     )
-    body = " ".join(f"{label}_tok_{i % 4096}" for i in range(approx_tokens))
+    marker_interval = 256
+    body_parts: List[str] = []
+    remaining = approx_tokens
+    marker_idx = 0
+    while remaining > 0:
+        chunk = min(marker_interval, remaining)
+        body_parts.append(" hi" * chunk)
+        remaining -= chunk
+        if remaining > 0:
+            body_parts.append(f" marker_{label}_{salt}_{marker_idx}")
+            marker_idx += 1
+    body = "".join(body_parts)
     footer = (
         "\nQuestion: Summarize the repeated pattern in one sentence and report the salt.\n"
         "Answer:"
@@ -196,29 +208,44 @@ def parse_match_records(log_file: Path, start_offset: int) -> List[MatchRecord]:
     return records
 
 
-def find_mismatches(records: List[MatchRecord]) -> Tuple[List[MismatchRecord], int]:
-    by_key: Dict[Tuple[str, int, int], Dict[int, MatchRecord]] = defaultdict(dict)
+def find_mismatches(
+    records: List[MatchRecord],
+) -> Tuple[List[MismatchRecord], int, int]:
+    by_key: Dict[Tuple[str, int, int], Dict[int, List[MatchRecord]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for record in records:
-        by_key[(record.rid, record.cp, record.tp)][record.pp] = record
+        by_key[(record.rid, record.cp, record.tp)][record.pp].append(record)
 
     mismatches: List[MismatchRecord] = []
     paired = 0
+    unpaired = 0
     for (rid, cp, tp), pp_map in by_key.items():
-        if 0 not in pp_map or 1 not in pp_map:
-            continue
-        paired += 1
-        pp0 = pp_map[0]
-        pp1 = pp_map[1]
-        if (
-            pp0.device_hit != pp1.device_hit
-            or pp0.host_hit != pp1.host_hit
-            or pp0.total_cached != pp1.total_cached
-            or pp0.last_host_node != pp1.last_host_node
-        ):
-            mismatches.append(
-                MismatchRecord(rid=rid, cp=cp, tp=tp, pp0=pp0, pp1=pp1)
-            )
-    return mismatches, paired
+        pp0_records = pp_map.get(0, [])
+        pp1_records = pp_map.get(1, [])
+        pair_count = min(len(pp0_records), len(pp1_records))
+        paired += pair_count
+        unpaired += abs(len(pp0_records) - len(pp1_records))
+        for pair_index in range(pair_count):
+            pp0 = pp0_records[pair_index]
+            pp1 = pp1_records[pair_index]
+            if (
+                pp0.device_hit != pp1.device_hit
+                or pp0.host_hit != pp1.host_hit
+                or pp0.total_cached != pp1.total_cached
+                or pp0.last_host_node != pp1.last_host_node
+            ):
+                mismatches.append(
+                    MismatchRecord(
+                        rid=rid,
+                        cp=cp,
+                        tp=tp,
+                        pair_index=pair_index,
+                        pp0=pp0,
+                        pp1=pp1,
+                    )
+                )
+    return mismatches, paired, unpaired
 
 
 def summarize_records(records: List[MatchRecord]) -> Dict[str, int]:
@@ -291,13 +318,14 @@ def main() -> int:
             executor.submit(worker, worker_id)
 
     records = parse_match_records(log_file, start_offset)
-    mismatches, paired = find_mismatches(records)
+    mismatches, paired, unpaired = find_mismatches(records)
     if mismatches:
         mismatch_preview = [
             {
                 "rid": item.rid,
                 "cp": item.cp,
                 "tp": item.tp,
+                "pair_index": item.pair_index,
                 "pp0": asdict(item.pp0),
                 "pp1": asdict(item.pp1),
             }
@@ -319,6 +347,7 @@ def main() -> int:
         "p50_latency_ms": p50_ms,
         "p95_latency_ms": p95_ms,
         "paired_keys": paired,
+        "unpaired_records": unpaired,
         "mismatch_count": len(mismatches),
         "match_summary": summarize_records(records),
         "request_mix": {
