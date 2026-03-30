@@ -2295,14 +2295,23 @@ class HiRadixCache(RadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
+        archive_transfers = self.nsa_archive_transfers(node)
 
-        operation_id = self.cache_controller.write_storage(
-            node.host_value,
-            node.key,
-            node.hash_value,
-            prefix_keys,
-            extra_pools=self.nsa_archive_transfers(node),
-        )
+        if archive_transfers:
+            operation_id = self.cache_controller.write_storage(
+                node.host_value,
+                node.key,
+                node.hash_value,
+                prefix_keys,
+                extra_pools=archive_transfers,
+            )
+        else:
+            operation_id = self.cache_controller.write_storage(
+                node.host_value,
+                node.key,
+                node.hash_value,
+                prefix_keys,
+            )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 
@@ -3113,14 +3122,24 @@ class HiRadixCache(RadixCache):
             self.prefetch_skipped_rids.add(req_id)
             return
         self.prefetch_skipped_rids.discard(req_id)
-        operation = self.cache_controller.prefetch(
-            req_id,
-            host_indices,
-            new_input_tokens,
-            last_hash,
-            prefix_keys,
-            extra_pools=self.nsa_prefetch_transfers(),
-        )
+        prefetch_transfers = self.nsa_prefetch_transfers()
+        if prefetch_transfers:
+            operation = self.cache_controller.prefetch(
+                req_id,
+                host_indices,
+                new_input_tokens,
+                last_hash,
+                prefix_keys,
+                extra_pools=prefetch_transfers,
+            )
+        else:
+            operation = self.cache_controller.prefetch(
+                req_id,
+                host_indices,
+                new_input_tokens,
+                last_hash,
+                prefix_keys,
+            )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
