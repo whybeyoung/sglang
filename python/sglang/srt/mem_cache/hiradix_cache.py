@@ -2958,10 +2958,19 @@ class HiRadixCache(RadixCache):
             self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
             return None
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
-        ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
-        ready_result = self._clamp_ready_result_to_authoritative_summary(
-            req_id, ready_result
-        )
+        ready_result: Optional[LatchedPrefetchReadyResult] = None
+        if self.authoritative_tree.enabled and req is not None:
+            # Under PP authoritative mode, do not expose rank-local latched ready
+            # results before a committed summary exists, otherwise PP stages can
+            # consume different host/storage interpretations for the same req.
+            ready_result = self.build_authoritative_prefetch_ready_result(req)
+            if ready_result is not None:
+                self.prefetch_ready_results_by_reqid.pop(req_id, None)
+        else:
+            ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
+            ready_result = self._clamp_ready_result_to_authoritative_summary(
+                req_id, ready_result
+            )
         if (
             ready_result is not None
             and os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1"
