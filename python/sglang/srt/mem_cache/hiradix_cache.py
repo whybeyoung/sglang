@@ -149,10 +149,14 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
-        # In PP mode, HiCache needs a committed tree-state barrier so host/storage
-        # visibility follows a deterministic replay order instead of local async timing.
+        # The authoritative PP replay path is still experimental. Keep it opt-in so
+        # default HiCache service startup does not introduce extra PP collectives in
+        # the scheduler event loop.
         self.authoritative_tree = AuthoritativeTreeCoordinator(
-            enabled=self.pp_size > 1
+            enabled=(
+                self.pp_size > 1
+                and os.getenv("SGLANG_ENABLE_HICACHE_AUTHORITATIVE_PP", "0") == "1"
+            )
         )
 
         (
