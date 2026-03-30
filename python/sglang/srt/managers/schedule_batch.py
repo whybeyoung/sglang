@@ -885,7 +885,7 @@ class Req(ReqDllmMixin):
                     tree_cache, "pop_prefetch_ready_result", None
                 )
                 if pop_prefetch_ready_result is not None:
-                    ready_result = pop_prefetch_ready_result(self.rid)
+                    ready_result = pop_prefetch_ready_result(self.rid, req=self)
                     if ready_result is not None:
                         match_result = ready_result.match_result
                         self.storage_hit_length = ready_result.storage_hit_length

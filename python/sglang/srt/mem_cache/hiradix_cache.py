@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.mem_cache.hicache_authoritative import (
+    AuthoritativePrefetchReadySummary,
+    AuthoritativeTreeCoordinator,
+    AuthoritativeTreeOp,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -65,6 +70,7 @@ logger = logging.getLogger(__name__)
 class LatchedPrefetchReadyResult:
     match_result: MatchResult
     storage_hit_length: int
+    input_len: Optional[int] = None
 
 
 class HiRadixCache(RadixCache):
@@ -143,6 +149,11 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
+        # In PP mode, HiCache needs a committed tree-state barrier so host/storage
+        # visibility follows a deterministic replay order instead of local async timing.
+        self.authoritative_tree = AuthoritativeTreeCoordinator(
+            enabled=self.pp_size > 1
+        )
 
         (
             extra_config,
@@ -245,6 +256,24 @@ class HiRadixCache(RadixCache):
         self.prefetch_ready_results_by_reqid: dict[
             str, LatchedPrefetchReadyResult
         ] = {}
+        self.authoritative_prefetch_ready_by_reqid: dict[
+            str, AuthoritativePrefetchReadySummary
+        ] = {}
+        self.authoritative_prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.authoritative_host_insert_rebuild_by_reqid: dict[str, dict[str, object]] = {}
+        self.authoritative_host_insert_skeleton_by_reqid: dict[
+            str, list[dict[str, object]]
+        ] = {}
+        self.authoritative_host_insert_missing_by_reqid: dict[
+            str, list[dict[str, object]]
+        ] = {}
+        self.authoritative_pending_backup_refs: dict[str, dict[str, object]] = {}
+        self.authoritative_pending_backup_node_ids: set[int] = set()
+        self.authoritative_pending_backup_reasons: dict[str, str] = {}
+        self.authoritative_backuped_node_ids: set[int] = set()
+        self.authoritative_host_visible_node_ids: set[int] = set()
+        self.authoritative_resolution_stats: dict[str, int] = {}
+        self._last_authoritative_resolution_log_ts = 0.0
         # track requests whose prefetch was skipped (alloc failure, threshold, rate limit)
         self.prefetch_skipped_rids: set[str] = set()
         # todo: dynamically adjust the threshold
@@ -277,6 +306,1387 @@ class HiRadixCache(RadixCache):
                 waited = True
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
+
+    def queue_authoritative_tree_op(self, op_type: str, **payload) -> None:
+        if not getattr(self.authoritative_tree, "enabled", False):
+            return
+        self.authoritative_tree.queue_local(op_type, payload)
+
+    def apply_authoritative_tree_op(self, op: AuthoritativeTreeOp) -> None:
+        """Apply a committed tree op.
+
+        The initial integration wires up sequencing and barrier placement first.
+        Concrete mutations are gradually migrated from local async paths onto this
+        replay layer; unknown ops are ignored so partial rollout stays compatible.
+        """
+        if op.op_type == "BARRIER":
+            return
+        if op.op_type == "PREFETCH_READY_SUMMARY":
+            req_id = op.payload["req_id"]
+            if not self._is_authoritative_ready_stable(req_id):
+                self._record_authoritative_resolution("prefetch_ready.defer_unstable")
+                return
+            self.authoritative_prefetch_ready_by_reqid[req_id] = (
+                AuthoritativePrefetchReadySummary(
+                    req_id=req_id,
+                    prefix_len=op.payload["prefix_len"],
+                    host_hit_length=op.payload["host_hit_length"],
+                    storage_hit_length=op.payload["storage_hit_length"],
+                    input_len=op.payload.get("input_len"),
+                    last_host_node_ref=op.payload.get("last_host_node_ref"),
+                )
+            )
+            return
+        if op.op_type == "HOST_BACKUP_COMMIT":
+            node = self._resolve_authoritative_node_ref(
+                node_id=op.payload.get("node_id"),
+                last_hash=op.payload.get("last_hash"),
+            )
+            if node is not None:
+                self._record_authoritative_resolution("host_backup_commit.node_ref")
+            if node is None:
+                node = self._recover_backup_commit_node_from_payload(op.payload)
+                if node is not None:
+                    self._record_authoritative_resolution(
+                        "host_backup_commit.payload_recover"
+                    )
+            if node is not None:
+                backup_ref = self._make_authoritative_node_ref(node)
+                backup_key = self._make_pending_backup_key(
+                    node_ref=backup_ref, node=node
+                )
+                self.authoritative_pending_backup_refs[backup_key] = backup_ref
+                self.authoritative_pending_backup_node_ids.add(node.id)
+                self.authoritative_pending_backup_reasons[backup_key] = "await_stable"
+                self._record_authoritative_resolution("host_backup_commit.defer_visible")
+            else:
+                repaired = self._repair_backup_commit_subtree_from_payload(op.payload)
+                if repaired:
+                    self._record_authoritative_resolution(
+                        "host_backup_commit.payload_repair"
+                    )
+                    if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                        logger.warning(
+                            "[HiCacheAuthoritative] repaired HOST_BACKUP_COMMIT subtree: "
+                            "node_id=%s last_hash=%s pp=%s cp=%s tp=%s",
+                            op.payload.get("node_id"),
+                            op.payload.get("last_hash"),
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            getattr(self.cache_controller, "tp_rank", None),
+                        )
+                else:
+                    self._record_authoritative_resolution("host_backup_commit.unresolved")
+                    if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                        logger.warning(
+                            "[HiCacheAuthoritative] unresolved HOST_BACKUP_COMMIT node: "
+                            "node_id=%s last_hash=%s pp=%s cp=%s tp=%s",
+                            op.payload.get("node_id"),
+                            op.payload.get("last_hash"),
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            getattr(self.cache_controller, "tp_rank", None),
+                        )
+            return
+        if op.op_type == "HOST_INSERT_FROM_STORAGE":
+            req_id = op.payload.get("req_id")
+            if req_id is not None:
+                self.authoritative_prefetch_loaded_tokens_by_reqid[req_id] = int(
+                    op.payload.get("loaded_from_storage", 0)
+                )
+                self._clear_host_insert_rebuild_blueprint(req_id)
+            resolved_nodes: list[TreeNode] = []
+            node_refs = op.payload.get("node_refs")
+            if node_refs is None:
+                node_refs = [
+                    {"node_id": node_id, "last_hash": None}
+                    for node_id in op.payload.get("node_ids", [])
+                ]
+            for node_ref in node_refs:
+                node = self._resolve_authoritative_node_ref(node_ref=node_ref)
+                if node is not None:
+                    self._record_authoritative_resolution("host_insert.node_ref")
+                    resolved_nodes.append(node)
+                elif os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                    logger.warning(
+                        "[HiCacheAuthoritative] unresolved HOST_INSERT node_ref=%s "
+                        "rid=%s pp=%s cp=%s tp=%s",
+                        node_ref,
+                        req_id,
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        getattr(self.cache_controller, "tp_rank", None),
+                    )
+            recovered_nodes: list[TreeNode] = []
+            if resolved_nodes and self._validate_host_insert_nodes_from_payload(
+                resolved_nodes, op.payload
+            ):
+                for node in resolved_nodes:
+                    self.authoritative_host_visible_node_ids.add(node.id)
+            else:
+                if resolved_nodes:
+                    self._record_authoritative_resolution("host_insert.partial_mismatch")
+                recovered_nodes = self._recover_host_insert_visible_nodes_from_payload(
+                    op.payload
+                )
+                if recovered_nodes:
+                    self._record_authoritative_resolution(
+                        "host_insert.payload_recover"
+                    )
+                    if req_id is not None:
+                        self._clear_host_insert_rebuild_blueprint(req_id)
+                else:
+                    repaired = self._repair_host_insert_subtree_from_payload(
+                        op.payload
+                    )
+                    if repaired:
+                        self._record_authoritative_resolution(
+                            "host_insert.payload_repair"
+                        )
+                        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                            logger.warning(
+                                "[HiCacheAuthoritative] repaired HOST_INSERT subtree: "
+                                "rid=%s pp=%s cp=%s tp=%s",
+                                req_id,
+                                self.pp_rank,
+                                self.attn_cp_rank,
+                                getattr(self.cache_controller, "tp_rank", None),
+                            )
+                        self._stage_host_insert_rebuild_blueprint(op.payload)
+                    else:
+                        self._record_authoritative_resolution(
+                            "host_insert.unresolved"
+                        )
+                for node in recovered_nodes:
+                    self.authoritative_host_visible_node_ids.add(node.id)
+            return
+        if op.op_type == "HOST_EVICT":
+            node_refs = op.payload.get("node_refs")
+            if node_refs is None:
+                node_refs = [
+                    {"node_id": node_id, "last_hash": None}
+                    for node_id in op.payload.get("node_ids", [])
+                ]
+            for node_ref in node_refs:
+                self._apply_authoritative_host_evict(node_ref=node_ref)
+            return
+        if op.op_type == "DEVICE_EVICT":
+            node_refs = op.payload.get("node_refs")
+            if node_refs is None:
+                node_refs = [
+                    {"node_id": node_id, "last_hash": None}
+                    for node_id in op.payload.get("node_ids", [])
+                ]
+            for node_ref in node_refs:
+                self._apply_authoritative_device_evict(node_ref=node_ref)
+            return
+        logger.debug(
+            "Apply authoritative HiCache op seq=%s type=%s payload=%s",
+            op.op_seq,
+            op.op_type,
+            op.payload,
+        )
+
+    def sync_authoritative_state(self):
+        if not getattr(self.authoritative_tree, "enabled", False):
+            return None
+        return self.authoritative_tree.sync(
+            self.apply_authoritative_tree_op,
+            transform_fn=self._materialize_authoritative_tree_ops,
+        )
+
+    def _materialize_authoritative_tree_ops(
+        self, pending_ops: list[AuthoritativeTreeOp]
+    ) -> list[AuthoritativeTreeOp]:
+        materialized: list[AuthoritativeTreeOp] = []
+        for op in pending_ops:
+            if op.op_type == "HOST_EVICT_REQUEST":
+                node_ids = self._select_authoritative_host_evict_node_ids(
+                    op.payload["num_tokens"]
+                )
+                materialized.append(
+                    AuthoritativeTreeOp(
+                        op_type="HOST_EVICT",
+                        payload={
+                            "node_refs": [
+                                self._make_authoritative_node_ref(
+                                    self._find_node_by_id(node_id)
+                                )
+                                for node_id in node_ids
+                            ]
+                        },
+                    )
+                )
+                continue
+            if op.op_type == "DEVICE_EVICT_REQUEST":
+                node_ids = self._select_authoritative_device_evict_node_ids(
+                    op.payload["num_tokens"]
+                )
+                materialized.append(
+                    AuthoritativeTreeOp(
+                        op_type="DEVICE_EVICT",
+                        payload={
+                            "node_refs": [
+                                self._make_authoritative_node_ref(
+                                    self._find_node_by_id(node_id)
+                                )
+                                for node_id in node_ids
+                            ]
+                        },
+                    )
+                )
+                continue
+            materialized.append(op)
+        return materialized
+
+    def _iter_nodes(self):
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            yield node
+            stack.extend(reversed(list(node.children.values())))
+
+    def _find_node_by_id(self, node_id: int) -> Optional[TreeNode]:
+        for node in self._iter_nodes():
+            if getattr(node, "id", None) == node_id:
+                return node
+        return None
+
+    def _find_node_by_last_hash(self, last_hash: Optional[str]) -> Optional[TreeNode]:
+        if not last_hash:
+            return None
+        for node in self._iter_nodes():
+            if node.get_last_hash_value() == last_hash:
+                return node
+        return None
+
+    def _make_authoritative_node_ref(
+        self, node: Optional[TreeNode]
+    ) -> dict[str, Optional[object]]:
+        if node is None:
+            return {"node_id": None, "last_hash": None}
+        return {
+            "node_id": getattr(node, "id", None),
+            "last_hash": node.get_last_hash_value(),
+        }
+
+    def _make_pending_backup_key(
+        self,
+        node_ref: Optional[dict[str, object]] = None,
+        *,
+        node: Optional[TreeNode] = None,
+    ) -> str:
+        if node_ref is None and node is not None:
+            node_ref = self._make_authoritative_node_ref(node)
+        node_ref = node_ref or {}
+        last_hash = node_ref.get("last_hash")
+        node_id = node_ref.get("node_id")
+        if last_hash:
+            return f"h:{last_hash}"
+        return f"i:{node_id}"
+
+    def _resolve_authoritative_node_ref(
+        self,
+        node_ref: Optional[dict[str, object]] = None,
+        *,
+        node_id: Optional[int] = None,
+        last_hash: Optional[str] = None,
+    ) -> Optional[TreeNode]:
+        if node_ref is not None:
+            node_id = node_ref.get("node_id")  # type: ignore[assignment]
+            last_hash = node_ref.get("last_hash")  # type: ignore[assignment]
+        node = self._find_node_by_id(node_id) if node_id is not None else None
+        if node is not None:
+            return node
+        return self._find_node_by_last_hash(last_hash)
+
+    def _find_exact_host_path_nodes(
+        self, anchor_node: Optional[TreeNode], token_ids: List[int]
+    ) -> list[TreeNode]:
+        if anchor_node is None:
+            return []
+        if len(token_ids) == 0:
+            return []
+
+        key = RadixKey(token_ids=list(token_ids), extra_key=anchor_node.key.extra_key)
+        nodes: list[TreeNode] = []
+        node = anchor_node
+        child_key = self.get_child_key_fn(key)
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            prefix_len = self.key_match_fn(child.key, key)
+            if prefix_len < len(child.key):
+                break
+            nodes.append(child)
+            node = child
+            key = key[prefix_len:]
+            if len(key) > 0:
+                child_key = self.get_child_key_fn(key)
+        return nodes
+
+    def _recover_host_insert_visible_nodes_from_payload(
+        self, payload: dict[str, object]
+    ) -> list[TreeNode]:
+        anchor_node = self._resolve_authoritative_node_ref(
+            node_ref=payload.get("anchor_node_ref")
+        )
+        if anchor_node is None:
+            return []
+
+        fetched_token_ids = list(payload.get("fetched_token_ids") or [])
+        matched_length = int(payload.get("matched_length", 0))
+        committed_tokens = int(payload.get("committed_tokens", 0))
+        if committed_tokens <= matched_length:
+            return []
+
+        suffix_tokens = fetched_token_ids[matched_length:committed_tokens]
+        path_nodes = self._find_exact_host_path_nodes(anchor_node, suffix_tokens)
+        candidate_nodes = [
+            node
+            for node in path_nodes
+            if node.evicted and node.backuped and len(node.host_value) > 0
+        ]
+        expected_hashes = list(payload.get("fetched_hash_value") or [])
+        if not expected_hashes:
+            return candidate_nodes
+
+        matched_pages = matched_length // self.page_size
+        expected_suffix_hashes = expected_hashes[matched_pages:]
+        candidate_hashes: list[str] = []
+        for node in candidate_nodes:
+            if node.hash_value:
+                candidate_hashes.extend(node.hash_value)
+        if candidate_hashes[: len(expected_suffix_hashes)] != expected_suffix_hashes:
+            self._record_authoritative_resolution("host_insert.hash_mismatch")
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                logger.warning(
+                    "[HiCacheAuthoritative] HOST_INSERT hash mismatch: "
+                    "expected=%s actual=%s pp=%s cp=%s tp=%s",
+                    expected_suffix_hashes,
+                    candidate_hashes,
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    getattr(self.cache_controller, "tp_rank", None),
+                )
+            return []
+        return candidate_nodes
+
+    def _validate_host_insert_nodes_from_payload(
+        self, nodes: list[TreeNode], payload: dict[str, object]
+    ) -> bool:
+        matched_length = int(payload.get("matched_length", 0))
+        committed_tokens = int(payload.get("committed_tokens", 0))
+        expected_tokens = committed_tokens - matched_length
+        if expected_tokens <= 0:
+            return True
+
+        candidate_nodes = [
+            node
+            for node in nodes
+            if node.evicted and node.backuped and len(node.host_value) > 0
+        ]
+        if sum(len(node.host_value) for node in candidate_nodes) < expected_tokens:
+            return False
+
+        expected_hashes = list(payload.get("fetched_hash_value") or [])
+        if not expected_hashes:
+            return True
+
+        matched_pages = matched_length // self.page_size
+        expected_suffix_hashes = expected_hashes[matched_pages:]
+        candidate_hashes: list[str] = []
+        for node in candidate_nodes:
+            if node.hash_value:
+                candidate_hashes.extend(node.hash_value)
+        return candidate_hashes[: len(expected_suffix_hashes)] == expected_suffix_hashes
+
+    def _can_repair_authoritative_host_subtree(self, node: Optional[TreeNode]) -> bool:
+        if node is None or node == self.root_node:
+            return False
+
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if (
+                not current.evicted
+                or not current.backuped
+                or getattr(current, "lock_ref", 0) > 0
+                or current.host_ref_counter > 0
+            ):
+                return False
+            stack.extend(current.children.values())
+        return True
+
+    def _prune_authoritative_host_subtree(self, node: Optional[TreeNode]) -> bool:
+        if not self._can_repair_authoritative_host_subtree(node):
+            return False
+
+        assert node is not None
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            stack.extend(current.children.values())
+            if current.backuped and len(current.host_value) > 0:
+                self.cache_controller.evict_host(current.host_value)
+                current.host_value = None
+            self._discard_authoritative_visibility(current)
+            if current in self.evictable_host_leaves:
+                self.evictable_host_leaves.remove(current)
+
+        parent = node.parent
+        if parent is None:
+            return False
+        key = self.get_child_key_fn(node.key)
+        popped = parent.children.pop(key, None)
+        if popped is not node:
+            return False
+        self._update_host_leaf_status(parent)
+        self._update_leaf_status(parent)
+        return True
+
+    def _repair_host_insert_subtree_from_payload(
+        self, payload: dict[str, object]
+    ) -> bool:
+        anchor_node = self._resolve_authoritative_node_ref(
+            node_ref=payload.get("anchor_node_ref")
+        )
+        if anchor_node is None:
+            return False
+
+        fetched_token_ids = list(payload.get("fetched_token_ids") or [])
+        matched_length = int(payload.get("matched_length", 0))
+        committed_tokens = int(payload.get("committed_tokens", 0))
+        if committed_tokens <= matched_length:
+            return False
+
+        expected_hashes = list(payload.get("fetched_hash_value") or [])
+        matched_pages = matched_length // self.page_size
+        remaining_hashes = expected_hashes[matched_pages:]
+        remaining_tokens = fetched_token_ids[matched_length:committed_tokens]
+
+        parent = anchor_node
+        key = RadixKey(
+            token_ids=list(remaining_tokens), extra_key=anchor_node.key.extra_key
+        )
+        while len(key) > 0:
+            child_key = self.get_child_key_fn(key)
+            child = parent.children.get(child_key)
+            if child is None:
+                return False
+
+            prefix_len = self.key_match_fn(child.key, key)
+            if prefix_len < len(child.key):
+                return self._prune_authoritative_host_subtree(child)
+
+            consumed_pages = len(child.key) // self.page_size
+            expected_child_hashes = remaining_hashes[:consumed_pages]
+            actual_child_hashes = list(child.hash_value or [])[:consumed_pages]
+            if expected_child_hashes and actual_child_hashes != expected_child_hashes:
+                return self._prune_authoritative_host_subtree(child)
+
+            key = key[prefix_len:]
+            remaining_hashes = remaining_hashes[consumed_pages:]
+            parent = child
+
+        return False
+
+    def _build_host_backup_commit_payload(self, node: TreeNode) -> dict[str, object]:
+        return {
+            "node_id": getattr(node, "id", None),
+            "last_hash": node.get_last_hash_value(),
+            "node_ref": self._make_authoritative_node_ref(node),
+            "parent_node_ref": self._make_authoritative_node_ref(node.parent),
+            "node_key_tokens": list(getattr(node.key, "token_ids", [])),
+            "node_hash_value": list(node.hash_value or []),
+            "key_len": len(getattr(node, "key", [])),
+        }
+
+    def _build_host_insert_rebuild_blueprint(
+        self, payload: dict[str, object]
+    ) -> Optional[dict[str, object]]:
+        req_id = payload.get("req_id")
+        anchor_node_ref = payload.get("anchor_node_ref")
+        fetched_token_ids = list(payload.get("fetched_token_ids") or [])
+        fetched_hash_value = list(payload.get("fetched_hash_value") or [])
+        matched_length = int(payload.get("matched_length", 0))
+        committed_tokens = int(payload.get("committed_tokens", 0))
+        if req_id is None or anchor_node_ref is None or committed_tokens <= matched_length:
+            return None
+        segment_plan = self._build_host_insert_segment_plan(
+            fetched_token_ids=fetched_token_ids,
+            fetched_hash_value=fetched_hash_value,
+            matched_length=matched_length,
+            committed_tokens=committed_tokens,
+        )
+        return {
+            "req_id": req_id,
+            "anchor_node_ref": anchor_node_ref,
+            "fetched_token_ids": fetched_token_ids,
+            "fetched_hash_value": fetched_hash_value,
+            "matched_length": matched_length,
+            "committed_tokens": committed_tokens,
+            "segment_plan": segment_plan,
+        }
+
+    def _build_host_insert_segment_plan(
+        self,
+        *,
+        fetched_token_ids: list[int],
+        fetched_hash_value: list[str],
+        matched_length: int,
+        committed_tokens: int,
+    ) -> list[dict[str, object]]:
+        suffix_tokens = fetched_token_ids[matched_length:committed_tokens]
+        matched_pages = matched_length // self.page_size
+        suffix_hashes = fetched_hash_value[matched_pages:]
+        segments: list[dict[str, object]] = []
+        if not suffix_tokens:
+            return segments
+        for page_idx, start in enumerate(range(0, len(suffix_tokens), self.page_size)):
+            token_slice = suffix_tokens[start : start + self.page_size]
+            hash_slice = suffix_hashes[page_idx : page_idx + 1]
+            segments.append(
+                {
+                    "token_ids": list(token_slice),
+                    "hash_value": list(hash_slice),
+                    "page_index": matched_pages + page_idx,
+                }
+            )
+        return segments
+
+    def _stage_host_insert_rebuild_blueprint(
+        self, payload: dict[str, object]
+    ) -> bool:
+        blueprint = self._build_host_insert_rebuild_blueprint(payload)
+        if blueprint is None:
+            return False
+        req_id = blueprint["req_id"]
+        self.authoritative_host_insert_rebuild_by_reqid[req_id] = blueprint
+        self.authoritative_host_insert_skeleton_by_reqid[req_id] = list(
+            blueprint.get("segment_plan", [])
+        )
+        self.authoritative_host_insert_missing_by_reqid[req_id] = []
+        self._record_authoritative_resolution("host_insert.blueprint_stage")
+        return True
+
+    def _clear_host_insert_rebuild_blueprint(self, req_id: Optional[str]) -> None:
+        if req_id is None:
+            return
+        self.authoritative_host_insert_rebuild_by_reqid.pop(req_id, None)
+        self.authoritative_host_insert_skeleton_by_reqid.pop(req_id, None)
+        self.authoritative_host_insert_missing_by_reqid.pop(req_id, None)
+
+    def _try_apply_host_insert_rebuild_blueprint(
+        self, req_id: str, blueprint: dict[str, object]
+    ) -> bool:
+        focus_blueprint = self._build_host_insert_focus_blueprint(req_id, blueprint)
+        if focus_blueprint is not blueprint:
+            self._record_authoritative_resolution("host_insert.blueprint_focus")
+        normalized = self._normalize_host_insert_subtree_from_payload(focus_blueprint)
+        if normalized:
+            self._record_authoritative_resolution("host_insert.blueprint_normalize")
+        recovered_nodes = self._recover_host_insert_visible_nodes_from_payload(
+            focus_blueprint
+        )
+        if not recovered_nodes:
+            return False
+        for node in recovered_nodes:
+            self.authoritative_host_visible_node_ids.add(node.id)
+        self._clear_host_insert_rebuild_blueprint(req_id)
+        self._record_authoritative_resolution("host_insert.blueprint_apply")
+        return True
+
+    def _replay_pending_host_insert_blueprints(self) -> None:
+        pending_items = list(self.authoritative_host_insert_rebuild_by_reqid.items())
+        for req_id, blueprint in pending_items:
+            self._advance_host_insert_skeleton(req_id, blueprint)
+            self._try_apply_host_insert_rebuild_blueprint(req_id, blueprint)
+        self._maybe_commit_stable_prefetch_ready_summaries()
+
+    def _is_backup_node_stable(self, node: Optional[TreeNode]) -> bool:
+        if node is None:
+            return False
+        return (
+            node.backuped
+            and len(node.host_value) > 0
+            and getattr(node, "host_ref_counter", 0) == 0
+        )
+
+    def _promote_stable_backup_visibility(self) -> None:
+        current_pending_ids: set[int] = set()
+        pending_items = list(self.authoritative_pending_backup_refs.items())
+        for backup_key, node_ref in pending_items:
+            node = self._resolve_authoritative_node_ref(node_ref=node_ref)
+            if not self._is_backup_node_stable(node):
+                self.authoritative_pending_backup_reasons[backup_key] = (
+                    self._describe_pending_backup_reason(node)
+                )
+                if node is not None:
+                    current_pending_ids.add(node.id)
+                continue
+            self.authoritative_pending_backup_refs.pop(backup_key, None)
+            self.authoritative_pending_backup_reasons.pop(backup_key, None)
+            if node is None:
+                continue
+            self.authoritative_backuped_node_ids.add(node.id)
+            self.authoritative_host_visible_node_ids.add(node.id)
+            self._record_authoritative_resolution("host_backup_commit.promote_visible")
+        self.authoritative_pending_backup_node_ids = current_pending_ids
+
+    def _maybe_commit_stable_prefetch_ready_summaries(self) -> None:
+        if not getattr(self.authoritative_tree, "enabled", False):
+            return
+        for req_id, ready_result in list(self.prefetch_ready_results_by_reqid.items()):
+            if not self._is_authoritative_ready_stable(req_id):
+                continue
+            if req_id in self.authoritative_prefetch_ready_by_reqid:
+                continue
+            self.queue_authoritative_tree_op(
+                "PREFETCH_READY_SUMMARY",
+                req_id=req_id,
+                prefix_len=len(ready_result.match_result.device_indices),
+                host_hit_length=ready_result.match_result.host_hit_length,
+                storage_hit_length=ready_result.storage_hit_length,
+                input_len=ready_result.input_len,
+                last_host_node_ref=self._make_authoritative_node_ref(
+                    ready_result.match_result.last_host_node
+                ),
+            )
+            self._record_authoritative_resolution("prefetch_ready.requeue_stable")
+
+    def _build_host_insert_focus_blueprint(
+        self, req_id: str, blueprint: dict[str, object]
+    ) -> dict[str, object]:
+        focus_state = self._build_host_insert_focus_state(req_id, blueprint)
+        if focus_state is None:
+            return blueprint
+
+        first_missing, remaining_segments = focus_state
+        fetched_token_ids: list[int] = []
+        fetched_hash_value: list[str] = []
+        for segment in remaining_segments:
+            fetched_token_ids.extend(list(segment.get("token_ids") or []))
+            fetched_hash_value.extend(list(segment.get("hash_value") or []))
+
+        if not fetched_token_ids:
+            return blueprint
+
+        return {
+            "req_id": req_id,
+            "anchor_node_ref": first_missing.get(
+                "parent_node_ref", blueprint.get("anchor_node_ref")
+            ),
+            "fetched_token_ids": fetched_token_ids,
+            "fetched_hash_value": fetched_hash_value,
+            "matched_length": 0,
+            "committed_tokens": len(fetched_token_ids),
+        }
+
+    def _build_host_insert_focus_state(
+        self, req_id: str, blueprint: dict[str, object]
+    ) -> Optional[tuple[dict[str, object], list[dict[str, object]]]]:
+        missing_segments = self.authoritative_host_insert_missing_by_reqid.get(req_id)
+        remaining_segments = self.authoritative_host_insert_skeleton_by_reqid.get(req_id)
+        if not missing_segments or not remaining_segments:
+            return None
+        sorted_missing = self._sort_host_insert_missing_segments(missing_segments)
+        first_missing = sorted_missing[0]
+        missing_page = first_missing.get("page_index")
+        focused_segments = [
+            segment
+            for segment in remaining_segments
+            if segment.get("page_index") is None
+            or missing_page is None
+            or segment.get("page_index") >= missing_page
+        ]
+        return first_missing, focused_segments
+
+    def _host_insert_missing_priority(self, reason: Optional[str]) -> int:
+        priorities = {
+            "key_mismatch": 0,
+            "hash_mismatch": 1,
+            "non_host_node": 2,
+            "missing_child": 3,
+        }
+        return priorities.get(reason or "", 99)
+
+    def _sort_host_insert_missing_segments(
+        self, missing_segments: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
+        return sorted(
+            missing_segments,
+            key=lambda segment: (
+                segment.get("page_index")
+                if segment.get("page_index") is not None
+                else 1 << 30,
+                self._host_insert_missing_priority(segment.get("reason")),
+                tuple(segment.get("token_ids") or []),
+            ),
+        )
+
+    def _describe_host_insert_missing_segment(
+        self,
+        *,
+        reason: str,
+        req_id: str,
+        segment: dict[str, object],
+        parent: Optional[TreeNode],
+    ) -> dict[str, object]:
+        return {
+            "reason": reason,
+            "req_id": req_id,
+            "parent_node_ref": self._make_authoritative_node_ref(parent),
+            "token_ids": list(segment.get("token_ids") or []),
+            "hash_value": list(segment.get("hash_value") or []),
+            "page_index": segment.get("page_index"),
+        }
+
+    def _advance_host_insert_skeleton(
+        self, req_id: str, blueprint: dict[str, object]
+    ) -> bool:
+        focus_state = self._build_host_insert_focus_state(req_id, blueprint)
+        if focus_state is not None:
+            first_missing, segment_plan = focus_state
+            anchor_ref = first_missing.get(
+                "parent_node_ref", blueprint.get("anchor_node_ref")
+            )
+            self._record_authoritative_resolution("host_insert.skeleton_focus")
+        else:
+            segment_plan = list(
+                self.authoritative_host_insert_skeleton_by_reqid.get(
+                    req_id, blueprint.get("segment_plan", [])
+                )
+            )
+            anchor_ref = blueprint.get("anchor_node_ref")
+
+        anchor_node = self._resolve_authoritative_node_ref(node_ref=anchor_ref)
+        if anchor_node is None:
+            return False
+
+        if not segment_plan:
+            return False
+
+        parent = anchor_node
+        advanced = False
+        remaining_segments: list[dict[str, object]] = []
+        missing_segments: list[dict[str, object]] = []
+        for idx, segment in enumerate(segment_plan):
+            token_ids = list(segment.get("token_ids") or [])
+            if not token_ids:
+                continue
+            key = RadixKey(token_ids=token_ids, extra_key=parent.key.extra_key)
+            child_key = self.get_child_key_fn(key)
+            child = parent.children.get(child_key)
+            if child is None:
+                missing_segments.append(
+                    self._describe_host_insert_missing_segment(
+                        reason="missing_child",
+                        req_id=req_id,
+                        segment=segment,
+                        parent=parent,
+                    )
+                )
+                remaining_segments.append(segment)
+                remaining_segments.extend(segment_plan[idx + 1 :])
+                break
+
+            prefix_len = self.key_match_fn(child.key, key)
+            if prefix_len <= 0:
+                missing_segments.append(
+                    self._describe_host_insert_missing_segment(
+                        reason="key_mismatch",
+                        req_id=req_id,
+                        segment=segment,
+                        parent=parent,
+                    )
+                )
+                remaining_segments.append(segment)
+                remaining_segments.extend(segment_plan[idx + 1 :])
+                break
+            if prefix_len < len(child.key):
+                if not child.evicted or not child.backuped:
+                    missing_segments.append(
+                        self._describe_host_insert_missing_segment(
+                            reason="non_host_node",
+                            req_id=req_id,
+                            segment=segment,
+                            parent=parent,
+                        )
+                    )
+                    remaining_segments.append(segment)
+                    remaining_segments.extend(segment_plan[idx + 1 :])
+                    break
+                child = self._split_node(child.key, child, prefix_len)
+                advanced = True
+
+            expected_hash = list(segment.get("hash_value") or [])
+            actual_hash = list(child.hash_value or [])[: len(expected_hash)]
+            if expected_hash and actual_hash != expected_hash:
+                missing_segments.append(
+                    self._describe_host_insert_missing_segment(
+                        reason="hash_mismatch",
+                        req_id=req_id,
+                        segment=segment,
+                        parent=parent,
+                    )
+                )
+                remaining_segments.append(segment)
+                remaining_segments.extend(segment_plan[idx + 1 :])
+                break
+            parent = child
+        else:
+            remaining_segments = []
+
+        self.authoritative_host_insert_skeleton_by_reqid[req_id] = remaining_segments
+        self.authoritative_host_insert_missing_by_reqid[req_id] = (
+            self._sort_host_insert_missing_segments(missing_segments)
+        )
+        if advanced:
+            self._record_authoritative_resolution("host_insert.skeleton_advance")
+        if missing_segments:
+            self._record_authoritative_resolution("host_insert.skeleton_missing")
+        if not remaining_segments:
+            self._record_authoritative_resolution("host_insert.skeleton_complete")
+        return advanced
+
+    def _normalize_host_insert_subtree_from_payload(
+        self, payload: dict[str, object]
+    ) -> bool:
+        anchor_node = self._resolve_authoritative_node_ref(
+            node_ref=payload.get("anchor_node_ref")
+        )
+        if anchor_node is None:
+            return False
+
+        fetched_token_ids = list(payload.get("fetched_token_ids") or [])
+        matched_length = int(payload.get("matched_length", 0))
+        committed_tokens = int(payload.get("committed_tokens", 0))
+        if committed_tokens <= matched_length:
+            return False
+
+        expected_hashes = list(payload.get("fetched_hash_value") or [])
+        matched_pages = matched_length // self.page_size
+        remaining_hashes = expected_hashes[matched_pages:]
+        remaining_tokens = fetched_token_ids[matched_length:committed_tokens]
+        key = RadixKey(
+            token_ids=list(remaining_tokens), extra_key=anchor_node.key.extra_key
+        )
+        parent = anchor_node
+        normalized = False
+
+        while len(key) > 0:
+            child_key = self.get_child_key_fn(key)
+            child = parent.children.get(child_key)
+            if child is None:
+                return normalized
+
+            prefix_len = self.key_match_fn(child.key, key)
+            if prefix_len <= 0:
+                return normalized
+            if prefix_len < len(child.key):
+                if not child.evicted or not child.backuped:
+                    return normalized
+                child = self._split_node(child.key, child, prefix_len)
+                normalized = True
+
+            consumed_pages = len(child.key) // self.page_size
+            expected_child_hashes = remaining_hashes[:consumed_pages]
+            actual_child_hashes = list(child.hash_value or [])[:consumed_pages]
+            if expected_child_hashes and actual_child_hashes != expected_child_hashes:
+                return normalized
+
+            key = key[prefix_len:]
+            remaining_hashes = remaining_hashes[consumed_pages:]
+            parent = child
+
+        return normalized
+
+    def _recover_backup_commit_node_from_payload(
+        self, payload: dict[str, object]
+    ) -> Optional[TreeNode]:
+        parent_node = self._resolve_authoritative_node_ref(
+            node_ref=payload.get("parent_node_ref")
+        )
+        node_key_tokens = list(payload.get("node_key_tokens") or [])
+        if parent_node is None or not node_key_tokens:
+            return None
+
+        candidates = self._find_exact_host_path_nodes(parent_node, node_key_tokens)
+        if len(candidates) != 1:
+            return None
+
+        candidate = candidates[0]
+        expected_hash_value = list(payload.get("node_hash_value") or [])
+        if expected_hash_value and list(candidate.hash_value or []) != expected_hash_value:
+            return None
+        if not candidate.backuped:
+            return None
+        return candidate
+
+    def _repair_backup_commit_subtree_from_payload(
+        self, payload: dict[str, object]
+    ) -> bool:
+        parent_node = self._resolve_authoritative_node_ref(
+            node_ref=payload.get("parent_node_ref")
+        )
+        node_key_tokens = list(payload.get("node_key_tokens") or [])
+        if parent_node is None or not node_key_tokens:
+            return False
+
+        key = RadixKey(
+            token_ids=node_key_tokens, extra_key=parent_node.key.extra_key
+        )
+        child_key = self.get_child_key_fn(key)
+        child = parent_node.children.get(child_key)
+        if child is None:
+            return False
+
+        prefix_len = self.key_match_fn(child.key, key)
+        if prefix_len < len(child.key):
+            return self._prune_authoritative_host_subtree(child)
+
+        expected_hash_value = list(payload.get("node_hash_value") or [])
+        actual_hash_value = list(child.hash_value or [])
+        if expected_hash_value and actual_hash_value != expected_hash_value:
+            return self._prune_authoritative_host_subtree(child)
+
+        return False
+
+    def _select_authoritative_host_evict_node_ids(self, num_tokens: int) -> list[int]:
+        leaves = list(self.evictable_host_leaves)
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
+        selected: list[int] = []
+        num_evicted = 0
+        while num_evicted < num_tokens and eviction_heap:
+            _priority, node = heapq.heappop(eviction_heap)
+            if node == self.root_node or not node.evicted or node.host_ref_counter > 0:
+                continue
+            selected.append(node.id)
+            num_evicted += len(node.host_value)
+        return selected
+
+    def _select_authoritative_device_evict_node_ids(
+        self, num_tokens: int
+    ) -> list[int]:
+        leaves = list(self.evictable_leaves)
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
+        selected: list[int] = []
+        num_evicted = 0
+        while num_evicted < num_tokens and eviction_heap:
+            _priority, node = heapq.heappop(eviction_heap)
+            if node.lock_ref > 0 or node.evicted:
+                continue
+            selected.append(node.id)
+            num_evicted += len(node.value)
+        return selected
+
+    def _apply_authoritative_host_evict(
+        self,
+        node_id: Optional[int] = None,
+        *,
+        node_ref: Optional[dict[str, object]] = None,
+    ) -> None:
+        node = self._resolve_authoritative_node_ref(node_ref=node_ref, node_id=node_id)
+        if node is None:
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                logger.warning(
+                    "[HiCacheAuthoritative] unresolved HOST_EVICT node_ref=%s "
+                    "node_id=%s pp=%s cp=%s tp=%s",
+                    node_ref,
+                    node_id,
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    getattr(self.cache_controller, "tp_rank", None),
+                )
+            return
+        if node == self.root_node or not node.evicted:
+            return
+        if node.host_ref_counter > 0:
+            return
+        self.cache_controller.evict_host(node.host_value)
+        self._discard_authoritative_visibility(node)
+        key = self.get_child_key_fn(node.key)
+        popped = node.parent.children.pop(key, None)
+        if popped is not node:
+            return
+        if node in self.evictable_host_leaves:
+            self.evictable_host_leaves.remove(node)
+        self._update_host_leaf_status(node.parent)
+
+    def _apply_authoritative_device_evict(
+        self,
+        node_id: Optional[int] = None,
+        *,
+        node_ref: Optional[dict[str, object]] = None,
+    ) -> None:
+        node = self._resolve_authoritative_node_ref(node_ref=node_ref, node_id=node_id)
+        if node is None:
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                logger.warning(
+                    "[HiCacheAuthoritative] unresolved DEVICE_EVICT node_ref=%s "
+                    "node_id=%s pp=%s cp=%s tp=%s",
+                    node_ref,
+                    node_id,
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    getattr(self.cache_controller, "tp_rank", None),
+                )
+            return
+        if node.evicted or node.lock_ref > 0:
+            return
+        if node.backuped:
+            self._evict_backuped(node)
+        else:
+            self._evict_regular(node)
+
+    def _node_backup_visible(self, node: TreeNode) -> bool:
+        if not getattr(self.authoritative_tree, "enabled", False):
+            return node.backuped
+        return (
+            node.id in self.authoritative_backuped_node_ids
+            or node.id in self.authoritative_host_visible_node_ids
+        )
+
+    def _discard_authoritative_visibility(self, node: Optional[TreeNode]) -> None:
+        if node is None:
+            return
+        node_id = getattr(node, "id", None)
+        if node_id is None:
+            return
+        self.authoritative_pending_backup_node_ids.discard(node_id)
+        pending_keys_to_remove = []
+        for backup_key, node_ref in self.authoritative_pending_backup_refs.items():
+            if (
+                node_ref.get("node_id") == node_id
+                or node_ref.get("last_hash") == node.get_last_hash_value()
+            ):
+                pending_keys_to_remove.append(backup_key)
+        for backup_key in pending_keys_to_remove:
+            self.authoritative_pending_backup_refs.pop(backup_key, None)
+            self.authoritative_pending_backup_reasons.pop(backup_key, None)
+        self.authoritative_backuped_node_ids.discard(node_id)
+        self.authoritative_host_visible_node_ids.discard(node_id)
+
+    def _record_authoritative_resolution(self, name: str) -> None:
+        self.authoritative_resolution_stats[name] = (
+            self.authoritative_resolution_stats.get(name, 0) + 1
+        )
+
+    def get_authoritative_resolution_stats(self) -> dict[str, int]:
+        return dict(self.authoritative_resolution_stats)
+
+    def get_host_insert_missing_segments(
+        self, req_id: Optional[str] = None
+    ) -> dict[str, list[dict[str, object]]] | list[dict[str, object]]:
+        if req_id is None:
+            return {
+                rid: list(segments)
+                for rid, segments in self.authoritative_host_insert_missing_by_reqid.items()
+            }
+        return list(self.authoritative_host_insert_missing_by_reqid.get(req_id, []))
+
+    def get_pending_backup_node_ids(self) -> list[int]:
+        return sorted(self.authoritative_pending_backup_node_ids)
+
+    def get_pending_backup_reasons(self) -> dict[str, str]:
+        return dict(self.authoritative_pending_backup_reasons)
+
+    def _iter_pending_backup_nodes(self) -> list[TreeNode]:
+        nodes: list[TreeNode] = []
+        for node_ref in self.authoritative_pending_backup_refs.values():
+            node = self._resolve_authoritative_node_ref(node_ref=node_ref)
+            if node is not None:
+                nodes.append(node)
+        return nodes
+
+    def _is_ancestor_node(
+        self, ancestor: Optional[TreeNode], node: Optional[TreeNode]
+    ) -> bool:
+        while node is not None and node != self.root_node:
+            if node == ancestor:
+                return True
+            node = node.parent
+        return ancestor == self.root_node and ancestor is not None
+
+    def _has_relevant_pending_backup(
+        self,
+        req_id: Optional[str] = None,
+        *,
+        host_node: Optional[TreeNode] = None,
+    ) -> bool:
+        if not self.authoritative_pending_backup_refs:
+            return False
+        if host_node is None and req_id is not None:
+            summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
+            if summary is not None and summary.last_host_node_ref is not None:
+                host_node = self._resolve_authoritative_node_ref(
+                    node_ref=summary.last_host_node_ref
+                )
+        if host_node is None and req_id is not None:
+            ready_result = self.prefetch_ready_results_by_reqid.get(req_id)
+            if ready_result is not None:
+                host_node = ready_result.match_result.last_host_node
+        if host_node is None or host_node == self.root_node:
+            return False
+        for pending_node in self._iter_pending_backup_nodes():
+            if self._is_ancestor_node(pending_node, host_node):
+                return True
+        return False
+
+    def _describe_pending_backup_reason(self, node: Optional[TreeNode]) -> str:
+        if node is None:
+            return "node_missing"
+        if not node.backuped or len(node.host_value) == 0:
+            return "missing_host_value"
+        if getattr(node, "host_ref_counter", 0) > 0:
+            return "host_ref"
+        return "await_stable"
+
+    def _is_authoritative_ready_stable(self, req_id: Optional[str]) -> bool:
+        if req_id is None:
+            return True
+        has_blueprint = req_id in self.authoritative_host_insert_rebuild_by_reqid
+        has_skeleton = bool(self.authoritative_host_insert_skeleton_by_reqid.get(req_id))
+        has_missing = bool(self.authoritative_host_insert_missing_by_reqid.get(req_id))
+        has_pending_backup = self._has_relevant_pending_backup(req_id)
+        return not (has_blueprint or has_skeleton or has_missing or has_pending_backup)
+
+    def _format_authoritative_resolution_stats(self, limit: int = 6) -> str:
+        stats = self.get_authoritative_resolution_stats()
+        if not stats:
+            return "none"
+        items = sorted(stats.items(), key=lambda item: (-item[1], item[0]))
+        return ",".join(f"{key}={value}" for key, value in items[:limit])
+
+    def _format_host_insert_missing_segments(
+        self, req_id: Optional[str], limit: int = 2
+    ) -> str:
+        if req_id is None:
+            return "none"
+        segments = self.get_host_insert_missing_segments(req_id)
+        if not segments:
+            return "none"
+        parts = []
+        for segment in segments[:limit]:
+            parts.append(
+                f"{segment.get('reason')}@p{segment.get('page_index')}:{segment.get('token_ids')}"
+            )
+        return ";".join(parts)
+
+    def _format_pending_backup_nodes(self, limit: int = 4) -> str:
+        if not self.authoritative_pending_backup_refs:
+            return "none"
+        pending = sorted(self.authoritative_pending_backup_refs.items())
+        preview = ",".join(
+            (
+                f"{(self._resolve_authoritative_node_ref(node_ref=node_ref).id if self._resolve_authoritative_node_ref(node_ref=node_ref) is not None else backup_key)}:"
+                f"{self.authoritative_pending_backup_reasons.get(backup_key, 'unknown')}"
+            )
+            for backup_key, node_ref in pending[:limit]
+        )
+        if len(pending) > limit:
+            preview += ",..."
+        return preview
+
+    def _format_match_authoritative_gates(
+        self,
+        req_id: Optional[str],
+        *,
+        pre_clamp_device_hit: Optional[int] = None,
+        pre_clamp_host_hit: Optional[int] = None,
+        match_result: Optional[MatchResult] = None,
+    ) -> str:
+        gates: list[str] = []
+        if req_id is not None and not self._is_authoritative_ready_stable(req_id):
+            gates.append("unstable_ready")
+        if req_id is not None and self.authoritative_host_insert_missing_by_reqid.get(req_id):
+            gates.append("missing_gap")
+        if (
+            match_result is not None
+            and self._has_relevant_pending_backup(
+                req_id, host_node=match_result.last_host_node
+            )
+        ):
+            gates.append("pending_backup")
+        if (
+            match_result is not None
+            and pre_clamp_device_hit is not None
+            and pre_clamp_host_hit is not None
+            and (
+                pre_clamp_device_hit != len(match_result.device_indices)
+                or pre_clamp_host_hit != match_result.host_hit_length
+            )
+        ):
+            gates.append("summary_clamp")
+        return ",".join(gates) if gates else "none"
+
+    def _format_match_clamp_delta(
+        self,
+        *,
+        pre_clamp_device_hit: int,
+        pre_clamp_host_hit: int,
+        match_result: MatchResult,
+    ) -> str:
+        post_device_hit = len(match_result.device_indices)
+        post_host_hit = match_result.host_hit_length
+        if (
+            pre_clamp_device_hit == post_device_hit
+            and pre_clamp_host_hit == post_host_hit
+        ):
+            return "none"
+        return (
+            f"device:{pre_clamp_device_hit}->{post_device_hit},"
+            f"host:{pre_clamp_host_hit}->{post_host_hit}"
+        )
+
+    def _maybe_log_authoritative_resolution_stats(self) -> None:
+        interval_s = float(
+            os.getenv("SGLANG_DEBUG_HICACHE_AUTHORITATIVE_STATS_INTERVAL", "0")
+        )
+        if interval_s <= 0:
+            return
+        now = time.monotonic()
+        if now - self._last_authoritative_resolution_log_ts < interval_s:
+            return
+        self._last_authoritative_resolution_log_ts = now
+        logger.warning(
+            "[HiCacheAuthoritativeStats] stats=%s pp=%s cp=%s tp=%s",
+            self._format_authoritative_resolution_stats(limit=12),
+            self.pp_rank,
+            self.attn_cp_rank,
+            getattr(self.cache_controller, "tp_rank", None),
+        )
+
+    def _find_last_visible_host_ancestor(self, node: Optional[TreeNode]) -> TreeNode:
+        while node is not None and node != self.root_node:
+            if self._node_backup_visible(node):
+                return node
+            node = node.parent
+        return self.root_node
+
+    def _select_last_host_node_for_hit_length(
+        self, deepest_visible_host_node: Optional[TreeNode], host_hit_length: int
+    ) -> TreeNode:
+        if (
+            deepest_visible_host_node is None
+            or deepest_visible_host_node == self.root_node
+            or host_hit_length <= 0
+        ):
+            return self.root_node
+
+        chain: list[TreeNode] = []
+        cursor = deepest_visible_host_node
+        while (
+            cursor is not None
+            and cursor != self.root_node
+            and cursor.evicted
+            and self._node_backup_visible(cursor)
+        ):
+            chain.append(cursor)
+            cursor = cursor.parent
+
+        if not chain:
+            return self.root_node
+
+        accumulated = 0
+        selected = self.root_node
+        for node in reversed(chain):
+            accumulated += len(node.host_value)
+            selected = node
+            if accumulated >= host_hit_length:
+                break
+        return selected
+
+    def _build_host_insert_from_storage_payload(
+        self,
+        *,
+        req_id: str,
+        anchor_node: TreeNode,
+        fetched_token_ids: List[int],
+        fetched_hash_value: List[str],
+        inserted_nodes: list[TreeNode],
+        loaded_from_storage: int,
+        matched_length: int,
+        committed_tokens: int,
+    ) -> dict[str, object]:
+        return {
+            "req_id": req_id,
+            "anchor_node_ref": self._make_authoritative_node_ref(anchor_node),
+            "fetched_token_ids": list(fetched_token_ids),
+            "fetched_hash_value": list(fetched_hash_value),
+            "loaded_from_storage": loaded_from_storage,
+            "matched_length": matched_length,
+            "committed_tokens": committed_tokens,
+            "node_ids": [getattr(node, "id", None) for node in inserted_nodes],
+            "node_refs": [
+                self._make_authoritative_node_ref(node) for node in inserted_nodes
+            ],
+        }
+
+    def _clamp_ready_result_to_authoritative_summary(
+        self,
+        req_id: str,
+        ready_result: Optional[LatchedPrefetchReadyResult],
+    ) -> Optional[LatchedPrefetchReadyResult]:
+        if ready_result is None:
+            return None
+        summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
+        if summary is None:
+            return ready_result
+        if (
+            ready_result.input_len is not None
+            and summary.input_len is not None
+            and summary.input_len != ready_result.input_len
+        ):
+            return ready_result
+        return LatchedPrefetchReadyResult(
+            match_result=self._clamp_match_result_to_authoritative_summary(
+                req_id, ready_result.match_result, input_len=ready_result.input_len
+            ),
+            storage_hit_length=summary.storage_hit_length,
+            input_len=ready_result.input_len,
+        )
+
+    def _clamp_match_result_to_authoritative_summary(
+        self,
+        req_id: Optional[str],
+        match_result: MatchResult,
+        *,
+        input_len: Optional[int] = None,
+    ) -> MatchResult:
+        if req_id is None:
+            return match_result
+        summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
+        if summary is None:
+            return match_result
+        if (
+            input_len is not None
+            and summary.input_len is not None
+            and summary.input_len != input_len
+        ):
+            return match_result
+
+        device_indices = match_result.device_indices
+        if len(device_indices) > summary.prefix_len:
+            device_indices = device_indices[: summary.prefix_len]
+
+        host_hit_length = min(match_result.host_hit_length, summary.host_hit_length)
+        last_host_node = self._select_last_host_node_for_hit_length(
+            match_result.last_host_node, host_hit_length
+        )
+        return MatchResult(
+            device_indices=device_indices,
+            last_device_node=match_result.last_device_node,
+            last_host_node=last_host_node,
+            host_hit_length=host_hit_length,
+            mamba_branching_seqlen=match_result.mamba_branching_seqlen,
+        )
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -539,6 +1949,9 @@ class HiRadixCache(RadixCache):
                 self.ongoing_prefetch.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
                 self.prefetch_ready_results_by_reqid.pop(req_id, None)
+                self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
+                self.authoritative_prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+                self._clear_host_insert_rebuild_blueprint(req_id)
                 self.prefetch_skipped_rids.discard(req_id)
         except Exception:
             logger.exception("Force release pending prefetch ops failed.")
@@ -593,6 +2006,9 @@ class HiRadixCache(RadixCache):
                 info = self.ongoing_prefetch.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
                 self.prefetch_ready_results_by_reqid.pop(req_id, None)
+                self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
+                self.authoritative_prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+                self._clear_host_insert_rebuild_blueprint(req_id)
                 self.prefetch_skipped_rids.discard(req_id)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
@@ -719,6 +2135,17 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.prefetch_ready_results_by_reqid.clear()
+        self.authoritative_prefetch_ready_by_reqid.clear()
+        self.authoritative_prefetch_loaded_tokens_by_reqid.clear()
+        self.authoritative_host_insert_rebuild_by_reqid.clear()
+        self.authoritative_host_insert_skeleton_by_reqid.clear()
+        self.authoritative_host_insert_missing_by_reqid.clear()
+        self.authoritative_pending_backup_node_ids.clear()
+        self.authoritative_pending_backup_reasons.clear()
+        self.authoritative_backuped_node_ids.clear()
+        self.authoritative_host_visible_node_ids.clear()
+        self.authoritative_resolution_stats.clear()
+        self._last_authoritative_resolution_log_ts = 0.0
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -741,6 +2168,7 @@ class HiRadixCache(RadixCache):
         return LatchedPrefetchReadyResult(
             match_result=match_result,
             storage_hit_length=storage_hit_length,
+            input_len=len(req.fill_ids),
         )
 
     def get_height(self, node: TreeNode):
@@ -856,6 +2284,10 @@ class HiRadixCache(RadixCache):
             finish_event.synchronize()
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
+                self.queue_authoritative_tree_op(
+                    "HOST_BACKUP_COMMIT",
+                    **self._build_host_backup_commit_payload(backuped_node),
+                )
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
@@ -930,7 +2362,16 @@ class HiRadixCache(RadixCache):
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
 
+    def _delete_leaf(self, node):
+        self._discard_authoritative_visibility(node)
+        super()._delete_leaf(node)
+
     def evict(self, params: EvictParams) -> EvictResult:
+        if getattr(self.authoritative_tree, "enabled", False):
+            self.queue_authoritative_tree_op(
+                "DEVICE_EVICT_REQUEST",
+                num_tokens=params.num_tokens,
+            )
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
@@ -996,6 +2437,11 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def evict_host(self, num_tokens: int):
+        if getattr(self.authoritative_tree, "enabled", False):
+            self.queue_authoritative_tree_op(
+                "HOST_EVICT_REQUEST",
+                num_tokens=num_tokens,
+            )
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -1016,6 +2462,7 @@ class HiRadixCache(RadixCache):
                 continue
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
+            self._discard_authoritative_visibility(x)
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -1038,7 +2485,7 @@ class HiRadixCache(RadixCache):
         nodes_to_load = []
         while node.evicted:
             assert (
-                node.backuped
+                self._node_backup_visible(node)
             ), "No backup available on evicted nodes, should not happen"
             nodes_to_load.insert(0, node)
             node = node.parent
@@ -1168,6 +2615,12 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+        # Keep authoritative visibility reconciliation inside the HiCache event
+        # loop instead of introducing extra PP scheduler barriers.
+        self.sync_authoritative_state()
+        self._promote_stable_backup_visibility()
+        self._replay_pending_host_insert_blueprints()
+        self._maybe_log_authoritative_resolution_stats()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1279,6 +2732,7 @@ class HiRadixCache(RadixCache):
         min_completed_tokens = completed_tokens_tensor.item()
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
+        inserted_nodes: list[TreeNode] = []
         matched_length = self._insert_helper_host(
             last_host_node,
             RadixKey(
@@ -1286,6 +2740,7 @@ class HiRadixCache(RadixCache):
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+            inserted_nodes=inserted_nodes,
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
@@ -1298,10 +2753,34 @@ class HiRadixCache(RadixCache):
 
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
+        self.queue_authoritative_tree_op(
+            "HOST_INSERT_FROM_STORAGE",
+            **self._build_host_insert_from_storage_payload(
+                req_id=req_id,
+                anchor_node=last_host_node,
+                fetched_token_ids=fetched_token_ids,
+                fetched_hash_value=hash_value[: min_completed_tokens // self.page_size],
+                inserted_nodes=inserted_nodes,
+                loaded_from_storage=loaded_from_storage,
+                matched_length=matched_length,
+                committed_tokens=min_completed_tokens,
+            ),
+        )
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         if req is not None:
             ready_result = self._build_latched_prefetch_ready_result(
                 req, loaded_from_storage
+            )
+            self.queue_authoritative_tree_op(
+                "PREFETCH_READY_SUMMARY",
+                req_id=req_id,
+                prefix_len=len(ready_result.match_result.device_indices),
+                host_hit_length=ready_result.match_result.host_hit_length,
+                storage_hit_length=ready_result.storage_hit_length,
+                input_len=ready_result.input_len,
+                last_host_node_ref=self._make_authoritative_node_ref(
+                    ready_result.match_result.last_host_node
+                ),
             )
             self.prefetch_ready_results_by_reqid[req_id] = ready_result
             if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
@@ -1324,7 +2803,8 @@ class HiRadixCache(RadixCache):
             logger.warning(
                 "[HiCacheMatchChain] prefetch finalize: rid=%s completed_tokens=%s "
                 "min_completed_tokens=%s matched_length=%s loaded_from_storage=%s "
-                "requested_tokens=%s hash_pages=%s pp=%s cp=%s tp=%s",
+                "requested_tokens=%s hash_pages=%s auth_stats=%s missing_segments=%s "
+                "pending_backups=%s pp=%s cp=%s tp=%s",
                 req_id,
                 completed_tokens,
                 min_completed_tokens,
@@ -1332,6 +2812,9 @@ class HiRadixCache(RadixCache):
                 loaded_from_storage,
                 len(token_ids),
                 len(hash_value),
+                self._format_authoritative_resolution_stats(),
+                self._format_host_insert_missing_segments(req_id),
+                self._format_pending_backup_nodes(),
                 self.pp_rank,
                 self.attn_cp_rank,
                 getattr(self.cache_controller, "tp_rank", None),
@@ -1357,13 +2840,22 @@ class HiRadixCache(RadixCache):
         Returns 0 if no prefetch was done or was revoked.
         This should be called after check_prefetch_progress() returns True.
         """
-        return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+        local_loaded = self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+        return self.authoritative_prefetch_loaded_tokens_by_reqid.pop(
+            req_id, local_loaded
+        )
 
     def pop_prefetch_ready_result(
-        self, req_id: str
+        self, req_id: str, req: Optional[Req] = None
     ) -> Optional[LatchedPrefetchReadyResult]:
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
+        if ready_result is None and req is not None:
+            ready_result = self.build_authoritative_prefetch_ready_result(req)
+        ready_result = self._clamp_ready_result_to_authoritative_summary(
+            req_id, ready_result
+        )
+        self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
         if (
             ready_result is not None
             and os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1"
@@ -1371,18 +2863,60 @@ class HiRadixCache(RadixCache):
             logger.warning(
                 "[HiCacheMatchChain] consume latched ready result: rid=%s "
                 "prefix_len=%s host_hit=%s storage_hit=%s "
-                "last_device_node=%s last_host_node=%s pp=%s cp=%s tp=%s",
+                "last_device_node=%s last_host_node=%s auth_stats=%s missing_segments=%s "
+                "pending_backups=%s pp=%s cp=%s tp=%s",
                 req_id,
                 len(ready_result.match_result.device_indices),
                 ready_result.match_result.host_hit_length,
                 ready_result.storage_hit_length,
                 getattr(ready_result.match_result.last_device_node, "id", None),
                 getattr(ready_result.match_result.last_host_node, "id", None),
+                self._format_authoritative_resolution_stats(),
+                self._format_host_insert_missing_segments(req_id),
+                self._format_pending_backup_nodes(),
                 self.pp_rank,
                 self.attn_cp_rank,
                 getattr(self.cache_controller, "tp_rank", None),
             )
         return ready_result
+
+    def get_authoritative_prefetch_ready_summary(
+        self, req_id: str
+    ) -> Optional[AuthoritativePrefetchReadySummary]:
+        return self.authoritative_prefetch_ready_by_reqid.get(req_id)
+
+    def build_authoritative_prefetch_ready_result(
+        self, req: Req
+    ) -> Optional[LatchedPrefetchReadyResult]:
+        """Reconcile a local live match with the PP-authoritative ready summary.
+
+        The full authoritative tree replay is still being migrated. Until then we
+        consume the committed ready summary and conservatively clamp the local
+        match result so every PP stage shapes the next batch against the same
+        ready-prefix upper bound.
+        """
+        summary = self.authoritative_prefetch_ready_by_reqid.get(req.rid)
+        if summary is None:
+            return None
+        if not self._is_authoritative_ready_stable(req.rid):
+            self._record_authoritative_resolution("prefetch_ready.skip_unstable")
+            return None
+        req_input_len = len(req.fill_ids)
+        if summary.input_len is not None and summary.input_len != req_input_len:
+            self.authoritative_prefetch_ready_by_reqid.pop(req.rid, None)
+            self._record_authoritative_resolution("prefetch_ready.skip_stale")
+            return None
+
+        local_ready = self._build_latched_prefetch_ready_result(
+            req, summary.storage_hit_length
+        )
+        return LatchedPrefetchReadyResult(
+            match_result=self._clamp_match_result_to_authoritative_summary(
+                req.rid, local_ready.match_result, input_len=local_ready.input_len
+            ),
+            storage_hit_length=summary.storage_hit_length,
+            input_len=local_ready.input_len,
+        )
 
     def was_prefetch_skipped(self, req_id: str) -> bool:
         """Return True if prefetch was skipped for this request
@@ -1391,6 +2925,7 @@ class HiRadixCache(RadixCache):
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
+        req_id = params.req.rid if params.req is not None else None
         original_key_len = len(key)
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key, _ = self.maybe_bigram_convert(key)
@@ -1417,41 +2952,65 @@ class HiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
+            if not self._node_backup_visible(last_node):
+                break
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
-        while not last_host_node.backuped:
-            last_host_node = last_host_node.parent
+        last_host_node = self._find_last_visible_host_ancestor(last_host_node)
 
-        if (
-            os.getenv("SGLANG_DEBUG_HICACHE_MATCH", "0") == "1"
-            and self.pp_size > 1
-        ):
-            req_id = params.req.rid if params.req is not None else None
-            tp_rank = getattr(self.cache_controller, "tp_rank", None)
-            logger.warning(
-                "[HiCacheMatch] rid=%s key_len=%s aligned_len=%s device_hit=%s "
-                "host_hit=%s total_cached=%s page_size=%s pp=%s cp=%s tp=%s "
-                "last_device_node=%s last_host_node=%s",
-                req_id,
-                original_key_len,
-                page_aligned_len,
-                len(value),
-                host_hit_length,
-                len(value) + host_hit_length,
-                self.page_size,
-                self.pp_rank,
-                self.attn_cp_rank,
-                tp_rank,
-                getattr(last_node, "id", None),
-                getattr(last_host_node, "id", None),
-            )
-
-        return MatchResult(
+        match_result = MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
         )
+        pre_clamp_device_hit = len(match_result.device_indices)
+        pre_clamp_host_hit = match_result.host_hit_length
+        match_result = self._clamp_match_result_to_authoritative_summary(
+            req_id,
+            match_result,
+            input_len=(len(params.req.fill_ids) if params.req is not None else None),
+        )
+
+        if (
+            os.getenv("SGLANG_DEBUG_HICACHE_MATCH", "0") == "1"
+            and self.pp_size > 1
+        ):
+            tp_rank = getattr(self.cache_controller, "tp_rank", None)
+            logger.warning(
+                "[HiCacheMatch] rid=%s key_len=%s aligned_len=%s device_hit=%s "
+                "host_hit=%s total_cached=%s page_size=%s pp=%s cp=%s tp=%s "
+                "last_device_node=%s last_host_node=%s auth_stats=%s missing_segments=%s "
+                "pending_backups=%s gates=%s clamp_delta=%s",
+                req_id,
+                original_key_len,
+                page_aligned_len,
+                len(match_result.device_indices),
+                match_result.host_hit_length,
+                len(match_result.device_indices) + match_result.host_hit_length,
+                self.page_size,
+                self.pp_rank,
+                self.attn_cp_rank,
+                tp_rank,
+                getattr(match_result.last_device_node, "id", None),
+                getattr(match_result.last_host_node, "id", None),
+                self._format_authoritative_resolution_stats(),
+                self._format_host_insert_missing_segments(req_id),
+                self._format_pending_backup_nodes(),
+                self._format_match_authoritative_gates(
+                    req_id,
+                    pre_clamp_device_hit=pre_clamp_device_hit,
+                    pre_clamp_host_hit=pre_clamp_host_hit,
+                    match_result=match_result,
+                ),
+                self._format_match_clamp_delta(
+                    pre_clamp_device_hit=pre_clamp_device_hit,
+                    pre_clamp_host_hit=pre_clamp_host_hit,
+                    match_result=match_result,
+                ),
+            )
+
+        return match_result
 
     def prefetch_from_storage(
         self,
@@ -1550,7 +3109,12 @@ class HiRadixCache(RadixCache):
         ]
 
     def _insert_helper_host(
-        self, node: TreeNode, key: RadixKey, host_value, hash_value
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        host_value,
+        hash_value,
+        inserted_nodes: Optional[list[TreeNode]] = None,
     ):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
@@ -1570,6 +3134,12 @@ class HiRadixCache(RadixCache):
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
+                if (
+                    inserted_nodes is not None
+                    and new_node.evicted
+                    and new_node.backuped
+                ):
+                    inserted_nodes.append(new_node)
                 node = new_node
 
             if len(key):
@@ -1583,6 +3153,8 @@ class HiRadixCache(RadixCache):
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
+            if inserted_nodes is not None:
+                inserted_nodes.append(new_node)
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -1596,6 +3168,8 @@ class HiRadixCache(RadixCache):
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
+            if child.evicted and not self._node_backup_visible(child):
+                break
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
@@ -1617,6 +3191,12 @@ class HiRadixCache(RadixCache):
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
+        child_backup_visible = getattr(child, "id", None) in getattr(
+            self, "authoritative_backuped_node_ids", set()
+        )
+        child_host_visible = getattr(child, "id", None) in getattr(
+            self, "authoritative_host_visible_node_ids", set()
+        )
         new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -1640,6 +3220,10 @@ class HiRadixCache(RadixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        if child_backup_visible:
+            self.authoritative_backuped_node_ids.add(new_node.id)
+        if child_host_visible:
+            self.authoritative_host_visible_node_ids.add(new_node.id)
         return new_node
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1727,6 +3311,9 @@ class HiRadixCache(RadixCache):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_ready_results_by_reqid.pop(rid, None)
+        self.authoritative_prefetch_ready_by_reqid.pop(rid, None)
+        self.authoritative_prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self._clear_host_insert_rebuild_blueprint(rid)
         self.prefetch_skipped_rids.discard(rid)
 
         if rid not in self.ongoing_prefetch:

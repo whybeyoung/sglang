@@ -208,6 +208,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def sync_authoritative_state(self) -> Any:
+        """Synchronize an authoritative committed cache-state view across PP stages."""
+        return None
+
     def is_load_ready(self, consumer_index: Any) -> bool:
         """
         Return whether the given hicache load batch has completed.
