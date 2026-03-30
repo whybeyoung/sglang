@@ -2311,6 +2311,8 @@ class HiRadixCache(RadixCache):
         host_hit_length = min(
             committed_tokens, sum(len(node.host_value) for node in host_nodes)
         )
+        for node in host_nodes:
+            self.authoritative_host_visible_node_ids.add(node.id)
         last_host_node = host_nodes[-1] if host_nodes else self.root_node
         return LatchedPrefetchReadyResult(
             match_result=MatchResult(
