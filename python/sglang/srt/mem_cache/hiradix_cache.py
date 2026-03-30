@@ -2718,6 +2718,9 @@ class HiRadixCache(RadixCache):
             offset += len(node.host_value)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+        if self.authoritative_tree.enabled:
+            for loaded_node in nodes_to_load:
+                self.authoritative_host_visible_node_ids.discard(loaded_node.id)
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
