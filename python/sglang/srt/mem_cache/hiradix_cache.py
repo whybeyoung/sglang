@@ -2546,64 +2546,40 @@ class HiRadixCache(RadixCache):
             + base_ready.match_result.host_hit_length
         )
 
-        recovered_full = self._recover_prefetch_committed_match_result(
-            anchor_node=anchor_node,
-            fetched_token_ids=fetched_token_ids,
-            committed_tokens=committed_tokens,
-        )
         recovered_matched = None
-        if matched_length > 0 and matched_length < committed_tokens:
+        if matched_length > 0:
             recovered_matched = self._recover_prefetch_committed_match_result(
                 anchor_node=anchor_node,
                 fetched_token_ids=fetched_token_ids,
                 committed_tokens=matched_length,
             )
-        elif matched_length > 0:
-            recovered_matched = recovered_full
 
-        recovered_candidate = None
-        recovered_prefix_len = 0
-        for candidate in (recovered_full, recovered_matched):
-            if candidate is None:
-                continue
-            candidate_match_result, candidate_prefix_len = candidate
-            if candidate_prefix_len > recovered_prefix_len:
-                recovered_candidate = candidate_match_result
-                recovered_prefix_len = candidate_prefix_len
+        if recovered_matched is not None:
+            recovered_candidate, recovered_prefix_len = recovered_matched
+        else:
+            recovered_candidate = None
+            recovered_prefix_len = 0
 
-        if recovered_candidate is not None and recovered_prefix_len >= max(
-            base_prefix_len, matched_length
-        ):
+        if recovered_candidate is not None and recovered_prefix_len >= matched_length:
             return LatchedPrefetchReadyResult(
                 match_result=recovered_candidate,
                 storage_hit_length=max(storage_hit_length - recovered_prefix_len, 0),
                 input_len=base_ready.input_len,
             )
 
-        host_nodes = self._recover_prefetch_committed_host_nodes(
-            anchor_node=anchor_node,
-            fetched_token_ids=fetched_token_ids,
-            fetched_hash_value=fetched_hash_value,
-            committed_tokens=committed_tokens,
-        )
-        if host_nodes:
-            host_hit_length = sum(len(node.host_value) for node in host_nodes)
-            last_host_node = host_nodes[-1]
-            storage_hit_length = max(storage_hit_length - host_hit_length, 0)
-        else:
-            # Request-scoped stable ready may expose host hits only when we can
-            # recover the exact committed host path. Otherwise keep the prefetched
-            # portion as storage-ready to avoid leaking per-rank local tree shape
-            # into PP-visible semantics.
-            host_hit_length = 0
-            last_host_node = self.root_node
+        # Request-scoped ready must be deterministic across PP ranks. We only
+        # promote the committed lower bound proven by `matched_length`; the
+        # storage-only portion of a prefetch stays as storage-hit and must not be
+        # upgraded into a local host-hit just because one rank recovered a
+        # prefetch-only subtree earlier than another.
+        base_match_result = base_ready.match_result
         return LatchedPrefetchReadyResult(
             match_result=MatchResult(
-                device_indices=base_ready.match_result.device_indices,
-                last_device_node=base_ready.match_result.last_device_node,
-                last_host_node=last_host_node,
-                host_hit_length=host_hit_length,
-                mamba_branching_seqlen=base_ready.match_result.mamba_branching_seqlen,
+                device_indices=base_match_result.device_indices,
+                last_device_node=base_match_result.last_device_node,
+                last_host_node=base_match_result.last_device_node,
+                host_hit_length=0,
+                mamba_branching_seqlen=base_match_result.mamba_branching_seqlen,
             ),
             storage_hit_length=storage_hit_length,
             input_len=base_ready.input_len,
