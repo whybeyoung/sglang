@@ -2760,6 +2760,59 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(canonical.match_result.host_hit_length, 512)
         self.assertIs(canonical.match_result.last_host_node, host_node)
 
+    def test_canonicalize_prefetch_ready_result_caps_host_hit_below_full_prefix(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        root = types.SimpleNamespace(id=0)
+        device_node = types.SimpleNamespace(id=1)
+
+        class Node:
+            def __init__(self, node_id):
+                self.id = node_id
+                self.evicted = True
+                self.parent = root
+                self.host_value = torch.arange(10, dtype=torch.int64)
+
+            def get_last_hash_value(self):
+                return None
+
+        host_node = Node(7)
+        cache.root_node = root
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.authoritative_prefetch_ready_by_reqid = {}
+        cache._clamp_match_result_to_authoritative_summary = (
+            lambda req_id, ready_result, input_len=None, include_prefetch_visible=True: ready_result
+        )
+        cache._visible_host_hit_length_to_node = (
+            lambda node, include_prefetch_visible=True: 10
+        )
+        cache._select_last_host_node_for_hit_length = (
+            lambda node, host_hit_length, include_prefetch_visible=True: host_node
+            if host_hit_length > 0
+            else device_node
+        )
+        cache.is_prefetch_ready_result_usable = lambda ready_result: True
+
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.arange(3, dtype=torch.int64),
+                last_device_node=device_node,
+                last_host_node=host_node,
+                host_hit_length=10,
+            ),
+            storage_hit_length=0,
+            input_len=8,
+        )
+
+        canonical = cache.canonicalize_prefetch_ready_result("rid", ready)
+
+        self.assertIsNotNone(canonical)
+        self.assertEqual(len(canonical.match_result.device_indices), 3)
+        self.assertEqual(canonical.match_result.host_hit_length, 4)
+
     def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 

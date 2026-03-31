@@ -1970,6 +1970,41 @@ class HiRadixCache(RadixCache):
             )
             else ready_result.storage_hit_length
         )
+        if ready_result.input_len is not None:
+            max_ready_prefix_len = max(ready_result.input_len - 1, 0)
+            device_prefix_len = len(canonical_match_result.device_indices)
+            if device_prefix_len > max_ready_prefix_len:
+                canonical_match_result = MatchResult(
+                    device_indices=canonical_match_result.device_indices[
+                        :max_ready_prefix_len
+                    ],
+                    last_device_node=canonical_match_result.last_device_node,
+                    last_host_node=canonical_match_result.last_device_node,
+                    host_hit_length=0,
+                    mamba_branching_seqlen=canonical_match_result.mamba_branching_seqlen,
+                )
+            else:
+                max_host_hit_length = max(max_ready_prefix_len - device_prefix_len, 0)
+                if canonical_match_result.host_hit_length > max_host_hit_length:
+                    capped_host_hit_length = min(
+                        max_host_hit_length,
+                        self._visible_host_hit_length_to_node(
+                            canonical_match_result.last_host_node,
+                            include_prefetch_visible=True,
+                        ),
+                    )
+                    capped_host_node = self._select_last_host_node_for_hit_length(
+                        canonical_match_result.last_host_node,
+                        capped_host_hit_length,
+                        include_prefetch_visible=True,
+                    )
+                    canonical_match_result = MatchResult(
+                        device_indices=canonical_match_result.device_indices,
+                        last_device_node=canonical_match_result.last_device_node,
+                        last_host_node=capped_host_node,
+                        host_hit_length=capped_host_hit_length,
+                        mamba_branching_seqlen=canonical_match_result.mamba_branching_seqlen,
+                    )
         # In PP authoritative mode, a request-scoped ready snapshot with no stable
         # device prefix must not independently trigger host load-back on only one
         # rank. Keep the ready snapshot replayable by suppressing host-only ready
