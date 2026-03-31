@@ -2276,7 +2276,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(value, [])
         self.assertIs(last_node, root)
 
-    def test_authoritative_prefetch_finalize_ready_is_storage_only(self):
+    def test_authoritative_prefetch_finalize_ready_restores_request_scoped_host_hit(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         root = object()
         cache.root_node = root
@@ -2290,6 +2290,41 @@ class TestHiCacheAuthoritative(CustomTestCase):
             storage_hit_length=storage_hit,
             input_len=17,
         )
+        host_node_a = types.SimpleNamespace(host_value=[1, 2], id=11)
+        host_node_b = types.SimpleNamespace(host_value=[3, 4], id=12)
+        cache._recover_prefetch_committed_host_nodes = lambda **kwargs: [
+            host_node_a,
+            host_node_b,
+        ]
+
+        ready = cache._build_authoritative_ready_result_from_prefetch_finalize(
+            req=object(),
+            anchor_node=object(),
+            fetched_token_ids=[1, 2, 3, 4],
+            fetched_hash_value=["h1"],
+            committed_tokens=64,
+            storage_hit_length=64,
+        )
+
+        self.assertEqual(ready.storage_hit_length, 60)
+        self.assertEqual(ready.match_result.host_hit_length, 4)
+        self.assertIs(ready.match_result.last_host_node, host_node_b)
+
+    def test_authoritative_prefetch_finalize_ready_falls_back_to_storage_when_no_host_path(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        root = object()
+        cache.root_node = root
+        cache._build_latched_prefetch_ready_result = lambda req, storage_hit: LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64),
+                last_device_node=root,
+                last_host_node="local-host-node",
+                host_hit_length=256,
+            ),
+            storage_hit_length=storage_hit,
+            input_len=17,
+        )
+        cache._recover_prefetch_committed_host_nodes = lambda **kwargs: []
 
         ready = cache._build_authoritative_ready_result_from_prefetch_finalize(
             req=object(),
@@ -2321,6 +2356,63 @@ class TestHiCacheAuthoritative(CustomTestCase):
         cache.authoritative_prefetch_visible_node_ids = {7}
 
         self.assertFalse(cache._node_backup_visible(Node(7)))
+
+    def test_prefetch_visible_nodes_count_as_request_ready_visible(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        class Node:
+            def __init__(self, node_id):
+                self.id = node_id
+                self.backuped = False
+
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_prefetch_visible_node_ids = {7}
+
+        self.assertTrue(cache._node_request_ready_visible(Node(7)))
+
+    def test_prefetch_ready_result_usable_accepts_request_scoped_prefetch_visible_node(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        class Node:
+            def __init__(self, node_id):
+                self.id = node_id
+                self.evicted = True
+                self.backuped = False
+                self.parent = None
+
+            def get_last_hash_value(self):
+                return None
+
+        host_node = Node(7)
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_prefetch_visible_node_ids = {7}
+        cache._make_authoritative_node_ref = (
+            lambda node: {"node_id": getattr(node, "id", None), "last_hash": None}
+        )
+        cache._resolve_authoritative_node_ref = lambda node_ref=None, **kwargs: host_node
+
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64),
+                last_device_node=None,
+                last_host_node=host_node,
+                host_hit_length=64,
+            ),
+            storage_hit_length=0,
+            input_len=65,
+        )
+
+        self.assertTrue(cache.is_prefetch_ready_result_usable(ready))
 
     def test_authoritative_live_match_is_device_only(self):
         cache = HiRadixCache.__new__(HiRadixCache)

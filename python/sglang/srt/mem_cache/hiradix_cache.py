@@ -1433,6 +1433,13 @@ class HiRadixCache(RadixCache):
             or node.id in self.authoritative_host_visible_node_ids
         )
 
+    def _node_request_ready_visible(self, node: TreeNode) -> bool:
+        if self._node_backup_visible(node):
+            return True
+        if not getattr(self.authoritative_tree, "enabled", False):
+            return node.backuped
+        return node.id in self.authoritative_prefetch_visible_node_ids
+
     def _discard_authoritative_visibility(self, node: Optional[TreeNode]) -> None:
         if node is None:
             return
@@ -1686,15 +1693,25 @@ class HiRadixCache(RadixCache):
             getattr(self.cache_controller, "tp_rank", None),
         )
 
-    def _find_last_visible_host_ancestor(self, node: Optional[TreeNode]) -> TreeNode:
+    def _find_last_visible_host_ancestor(
+        self, node: Optional[TreeNode], *, include_prefetch_visible: bool = False
+    ) -> TreeNode:
         while node is not None and node != self.root_node:
-            if self._node_backup_visible(node):
+            if (
+                self._node_request_ready_visible(node)
+                if include_prefetch_visible
+                else self._node_backup_visible(node)
+            ):
                 return node
             node = node.parent
         return self.root_node
 
     def _select_last_host_node_for_hit_length(
-        self, deepest_visible_host_node: Optional[TreeNode], host_hit_length: int
+        self,
+        deepest_visible_host_node: Optional[TreeNode],
+        host_hit_length: int,
+        *,
+        include_prefetch_visible: bool = False,
     ) -> TreeNode:
         if (
             deepest_visible_host_node is None
@@ -1709,7 +1726,11 @@ class HiRadixCache(RadixCache):
             cursor is not None
             and cursor != self.root_node
             and cursor.evicted
-            and self._node_backup_visible(cursor)
+            and (
+                self._node_request_ready_visible(cursor)
+                if include_prefetch_visible
+                else self._node_backup_visible(cursor)
+            )
         ):
             chain.append(cursor)
             cursor = cursor.parent
@@ -1726,7 +1747,9 @@ class HiRadixCache(RadixCache):
                 break
         return selected
 
-    def _visible_host_hit_length_to_node(self, node: Optional[TreeNode]) -> int:
+    def _visible_host_hit_length_to_node(
+        self, node: Optional[TreeNode], *, include_prefetch_visible: bool = False
+    ) -> int:
         if node is None or node == self.root_node:
             return 0
         total = 0
@@ -1735,7 +1758,11 @@ class HiRadixCache(RadixCache):
             cursor is not None
             and cursor != self.root_node
             and cursor.evicted
-            and self._node_backup_visible(cursor)
+            and (
+                self._node_request_ready_visible(cursor)
+                if include_prefetch_visible
+                else self._node_backup_visible(cursor)
+            )
         ):
             total += len(cursor.host_value)
             cursor = cursor.parent
@@ -1785,7 +1812,10 @@ class HiRadixCache(RadixCache):
             return ready_result
         return LatchedPrefetchReadyResult(
             match_result=self._clamp_match_result_to_authoritative_summary(
-                req_id, ready_result.match_result, input_len=ready_result.input_len
+                req_id,
+                ready_result.match_result,
+                input_len=ready_result.input_len,
+                include_prefetch_visible=True,
             ),
             storage_hit_length=summary.storage_hit_length,
             input_len=ready_result.input_len,
@@ -1819,6 +1849,7 @@ class HiRadixCache(RadixCache):
         match_result: MatchResult,
         *,
         input_len: Optional[int] = None,
+        include_prefetch_visible: bool = False,
     ) -> MatchResult:
         if req_id is None:
             return match_result
@@ -1841,20 +1872,31 @@ class HiRadixCache(RadixCache):
             summary.host_hit_length > 0
             and summary_host_node is not None
             and getattr(summary_host_node, "evicted", False)
-            and self._node_backup_visible(summary_host_node)
+            and (
+                self._node_request_ready_visible(summary_host_node)
+                if include_prefetch_visible
+                else self._node_backup_visible(summary_host_node)
+            )
         ):
             host_hit_length = summary.host_hit_length
             last_host_node = self._select_last_host_node_for_hit_length(
-                summary_host_node, host_hit_length
+                summary_host_node,
+                host_hit_length,
+                include_prefetch_visible=include_prefetch_visible,
             )
         else:
             host_hit_length = min(match_result.host_hit_length, summary.host_hit_length)
             deepest_host_node = summary_host_node or match_result.last_host_node
             last_host_node = self._select_last_host_node_for_hit_length(
-                deepest_host_node, host_hit_length
+                deepest_host_node,
+                host_hit_length,
+                include_prefetch_visible=include_prefetch_visible,
             )
         host_hit_length = min(
-            host_hit_length, self._visible_host_hit_length_to_node(last_host_node)
+            host_hit_length,
+            self._visible_host_hit_length_to_node(
+                last_host_node, include_prefetch_visible=include_prefetch_visible
+            ),
         )
         return MatchResult(
             device_indices=device_indices,
@@ -1870,7 +1912,10 @@ class HiRadixCache(RadixCache):
         if ready_result is None:
             return None
         canonical_match_result = self._clamp_match_result_to_authoritative_summary(
-            req_id, ready_result.match_result, input_len=ready_result.input_len
+            req_id,
+            ready_result.match_result,
+            input_len=ready_result.input_len,
+            include_prefetch_visible=True,
         )
         if canonical_match_result == ready_result.match_result:
             return ready_result
@@ -2427,14 +2472,23 @@ class HiRadixCache(RadixCache):
         storage_hit_length: int,
     ) -> LatchedPrefetchReadyResult:
         base_ready = self._build_latched_prefetch_ready_result(req, storage_hit_length)
-        # In PP authoritative mode we currently only have per-rank local replay,
-        # not a centralized cross-PP committed tree. Deriving ready-time host hits
-        # from locally recovered host paths can therefore diverge across PP stages
-        # even for the same request flow. Keep the ready snapshot deterministic by
-        # exposing the prefetched portion as storage-ready only; later live match
-        # can still observe host-visible nodes once both ranks converge locally.
-        host_hit_length = 0
-        last_host_node = self.root_node
+        host_nodes = self._recover_prefetch_committed_host_nodes(
+            anchor_node=anchor_node,
+            fetched_token_ids=fetched_token_ids,
+            fetched_hash_value=fetched_hash_value,
+            committed_tokens=committed_tokens,
+        )
+        if host_nodes:
+            host_hit_length = sum(len(node.host_value) for node in host_nodes)
+            last_host_node = host_nodes[-1]
+            storage_hit_length = max(storage_hit_length - host_hit_length, 0)
+        else:
+            # Request-scoped stable ready may expose host hits only when we can
+            # recover the exact committed host path. Otherwise keep the prefetched
+            # portion as storage-ready to avoid leaking per-rank local tree shape
+            # into PP-visible semantics.
+            host_hit_length = 0
+            last_host_node = self.root_node
         return LatchedPrefetchReadyResult(
             match_result=MatchResult(
                 device_indices=base_ready.match_result.device_indices,
@@ -2793,7 +2847,7 @@ class HiRadixCache(RadixCache):
         nodes_to_load = []
         while node.evicted:
             assert (
-                self._node_backup_visible(node)
+                self._node_request_ready_visible(node)
             ), "No backup available on evicted nodes, should not happen"
             nodes_to_load.insert(0, node)
             node = node.parent
@@ -3262,7 +3316,7 @@ class HiRadixCache(RadixCache):
             return True
         if not getattr(last_host_node, "evicted", False):
             return False
-        if not self._node_backup_visible(last_host_node):
+        if not self._node_request_ready_visible(last_host_node):
             return False
         return True
 
@@ -3298,7 +3352,10 @@ class HiRadixCache(RadixCache):
         )
         return LatchedPrefetchReadyResult(
             match_result=self._clamp_match_result_to_authoritative_summary(
-                req.rid, local_ready.match_result, input_len=local_ready.input_len
+                req.rid,
+                local_ready.match_result,
+                input_len=local_ready.input_len,
+                include_prefetch_visible=True,
             ),
             storage_hit_length=summary.storage_hit_length,
             input_len=local_ready.input_len,
