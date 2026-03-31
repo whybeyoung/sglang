@@ -2424,18 +2424,14 @@ class HiRadixCache(RadixCache):
         storage_hit_length: int,
     ) -> LatchedPrefetchReadyResult:
         base_ready = self._build_latched_prefetch_ready_result(req, storage_hit_length)
-        host_nodes = self._recover_prefetch_committed_host_nodes(
-            anchor_node=anchor_node,
-            fetched_token_ids=fetched_token_ids,
-            fetched_hash_value=fetched_hash_value,
-            committed_tokens=committed_tokens,
-        )
-        host_hit_length = min(
-            committed_tokens, sum(len(node.host_value) for node in host_nodes)
-        )
-        for node in host_nodes:
-            self.authoritative_host_visible_node_ids.add(node.id)
-        last_host_node = host_nodes[-1] if host_nodes else self.root_node
+        # In PP authoritative mode we currently only have per-rank local replay,
+        # not a centralized cross-PP committed tree. Deriving ready-time host hits
+        # from locally recovered host paths can therefore diverge across PP stages
+        # even for the same request flow. Keep the ready snapshot deterministic by
+        # exposing the prefetched portion as storage-ready only; later live match
+        # can still observe host-visible nodes once both ranks converge locally.
+        host_hit_length = 0
+        last_host_node = self.root_node
         return LatchedPrefetchReadyResult(
             match_result=MatchResult(
                 device_indices=base_ready.match_result.device_indices,

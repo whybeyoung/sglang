@@ -2276,6 +2276,34 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(value, [])
         self.assertIs(last_node, root)
 
+    def test_authoritative_prefetch_finalize_ready_is_storage_only(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        root = object()
+        cache.root_node = root
+        cache._build_latched_prefetch_ready_result = lambda req, storage_hit: LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64),
+                last_device_node=root,
+                last_host_node="local-host-node",
+                host_hit_length=256,
+            ),
+            storage_hit_length=storage_hit,
+            input_len=17,
+        )
+
+        ready = cache._build_authoritative_ready_result_from_prefetch_finalize(
+            req=object(),
+            anchor_node=object(),
+            fetched_token_ids=[1, 2, 3, 4],
+            fetched_hash_value=["h1"],
+            committed_tokens=64,
+            storage_hit_length=64,
+        )
+
+        self.assertEqual(ready.storage_hit_length, 64)
+        self.assertEqual(ready.match_result.host_hit_length, 0)
+        self.assertIs(ready.match_result.last_host_node, root)
+
 
 if __name__ == "__main__":
     unittest.main()
