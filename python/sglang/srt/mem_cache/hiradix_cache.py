@@ -3357,6 +3357,18 @@ class HiRadixCache(RadixCache):
             match_result,
             input_len=(len(params.req.fill_ids) if params.req is not None else None),
         )
+        if self.authoritative_tree.enabled:
+            # In PP authoritative mode, generic live_match must not derive host hits
+            # from per-rank local host/device state. Request-scoped ready/sticky
+            # snapshots can still drive load_back, but once we fall back to live
+            # match we only expose deterministic device-visible prefixes.
+            match_result = MatchResult(
+                device_indices=match_result.device_indices,
+                last_device_node=match_result.last_device_node,
+                last_host_node=match_result.last_device_node,
+                host_hit_length=0,
+                mamba_branching_seqlen=match_result.mamba_branching_seqlen,
+            )
         if self.pp_device_only_match_fallback:
             if match_result.host_hit_length > 0:
                 logger.warning_once(
