@@ -3091,10 +3091,10 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         ready_result: Optional[LatchedPrefetchReadyResult] = None
         if self.authoritative_tree.enabled and req is not None:
-            # Keep the deterministic prefetch-finalize result available for every
-            # PP retry of the same request. Popping here can force only one rank
-            # to rebuild from local live match, which reintroduces PP divergence.
-            ready_result = self.prefetch_ready_results_by_reqid.get(req_id, None)
+            # Req now keeps its own sticky ready snapshot across retries. Once a
+            # rank consumes the tree-level latched result, pop it so it cannot be
+            # revived repeatedly after the request-local sticky state is cleared.
+            ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
             ready_result = self._clamp_ready_result_to_authoritative_summary(
                 req_id, ready_result
             )
