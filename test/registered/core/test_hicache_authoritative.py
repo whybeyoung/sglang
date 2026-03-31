@@ -2375,6 +2375,31 @@ class TestHiCacheAuthoritative(CustomTestCase):
 
         self.assertTrue(cache._node_request_ready_visible(Node(7)))
 
+    def test_recover_prefetch_committed_host_nodes_accepts_non_backuped_host_only_nodes(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.page_size = 64
+
+        class Node:
+            def __init__(self, node_id, host_len, hashes):
+                self.id = node_id
+                self.evicted = True
+                self.backuped = False
+                self.host_value = torch.arange(host_len, dtype=torch.int64)
+                self.hash_value = hashes
+
+        node_a = Node(11, 64, ["h1"])
+        node_b = Node(12, 64, ["h2"])
+        cache._find_exact_host_path_nodes = lambda anchor, token_ids: [node_a, node_b]
+
+        recovered = cache._recover_prefetch_committed_host_nodes(
+            anchor_node=object(),
+            fetched_token_ids=list(range(128)),
+            fetched_hash_value=["h1", "h2"],
+            committed_tokens=128,
+        )
+
+        self.assertEqual(recovered, [node_a, node_b])
+
     def test_prefetch_ready_result_usable_accepts_request_scoped_prefetch_visible_node(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 

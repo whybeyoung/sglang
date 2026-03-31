@@ -715,7 +715,7 @@ class HiRadixCache(RadixCache):
         candidate_nodes = [
             node
             for node in path_nodes
-            if node.evicted and node.backuped and len(node.host_value) > 0
+            if node.evicted and len(node.host_value) > 0
         ]
         expected_hashes = list(payload.get("fetched_hash_value") or [])
         if not expected_hashes:
@@ -754,7 +754,7 @@ class HiRadixCache(RadixCache):
         candidate_nodes = [
             node
             for node in nodes
-            if node.evicted and node.backuped and len(node.host_value) > 0
+            if node.evicted and len(node.host_value) > 0
         ]
         if sum(len(node.host_value) for node in candidate_nodes) < expected_tokens:
             return False
@@ -3616,7 +3616,7 @@ class HiRadixCache(RadixCache):
                 if (
                     inserted_nodes is not None
                     and new_node.evicted
-                    and new_node.backuped
+                    and len(new_node.host_value) > 0
                 ):
                     inserted_nodes.append(new_node)
                 node = new_node
