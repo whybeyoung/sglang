@@ -1911,6 +1911,28 @@ class HiRadixCache(RadixCache):
         selected.reverse()
         return selected
 
+    def _collect_stable_ready_visible_nodes(
+        self,
+        ready_result: Optional[LatchedPrefetchReadyResult],
+        *,
+        matched_length: int,
+    ) -> list[TreeNode]:
+        if not getattr(self.authoritative_tree, "enabled", False):
+            return []
+        if ready_result is None:
+            return []
+        if not self.is_prefetch_ready_result_usable(ready_result):
+            return []
+        ready_host_hit = getattr(ready_result.match_result, "host_hit_length", 0)
+        if ready_host_hit <= 0:
+            return []
+        ready_prefix_len = (
+            len(ready_result.match_result.device_indices) + ready_host_hit
+        )
+        if matched_length < ready_prefix_len:
+            return []
+        return self._collect_request_ready_visible_nodes(ready_result)
+
     def _clamp_ready_result_to_authoritative_summary(
         self,
         req_id: str,
@@ -3449,14 +3471,10 @@ class HiRadixCache(RadixCache):
                 )
             ready_result = self.canonicalize_prefetch_ready_result(req_id, ready_result)
         ready_visible_nodes = self._collect_request_ready_visible_nodes(ready_result)
-        stable_visible_nodes: list[TreeNode] = []
-        if (
-            self.authoritative_tree.enabled
-            and ready_result is not None
-            and ready_result.storage_hit_length == 0
-            and self.is_prefetch_ready_result_usable(ready_result)
-        ):
-            stable_visible_nodes = list(ready_visible_nodes)
+        stable_visible_nodes = self._collect_stable_ready_visible_nodes(
+            ready_result,
+            matched_length=matched_length,
+        )
         self.queue_authoritative_tree_op(
             "HOST_INSERT_FROM_STORAGE",
             **self._build_host_insert_from_storage_payload(

@@ -3105,6 +3105,50 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(cache.authoritative_prefetch_visible_node_ids, set())
         self.assertEqual(cleared, [8])
 
+    def test_collect_stable_ready_visible_nodes_requires_matched_lower_bound(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        root = types.SimpleNamespace(id=0)
+        host_node = types.SimpleNamespace(
+            id=7,
+            evicted=True,
+            parent=root,
+            host_value=torch.arange(8, dtype=torch.int64),
+        )
+        cache.root_node = root
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_prefetch_visible_node_ids = {7}
+        cache.is_prefetch_ready_result_usable = lambda ready_result: True
+
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.arange(4, dtype=torch.int64),
+                last_device_node=root,
+                last_host_node=host_node,
+                host_hit_length=8,
+            ),
+            storage_hit_length=32,
+            input_len=64,
+        )
+
+        self.assertEqual(
+            cache._collect_stable_ready_visible_nodes(
+                ready,
+                matched_length=11,
+            ),
+            [],
+        )
+        promoted = cache._collect_stable_ready_visible_nodes(
+            ready,
+            matched_length=12,
+        )
+        self.assertEqual(promoted, [host_node])
+
     def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
