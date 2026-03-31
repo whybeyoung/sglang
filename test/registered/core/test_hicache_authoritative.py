@@ -2653,6 +2653,46 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(canonical.match_result.host_hit_length, 0)
         self.assertIs(canonical.match_result.last_host_node, device_node)
 
+    def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        class Node:
+            def __init__(self, node_id):
+                self.id = node_id
+
+        device_node = Node(1)
+        host_node = Node(2)
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.prefetch_ready_results_by_reqid = {
+            "rid": LatchedPrefetchReadyResult(
+                match_result=MatchResult(
+                    device_indices=torch.empty((0,), dtype=torch.int64),
+                    last_device_node=device_node,
+                    last_host_node=host_node,
+                    host_hit_length=512,
+                ),
+                storage_hit_length=576,
+                input_len=2623,
+            )
+        }
+        cache.authoritative_prefetch_ready_by_reqid = {}
+        cache._drop_stale_prefetch_ready_state = lambda req_id, input_len=None: None
+        cache._clamp_ready_result_to_authoritative_summary = (
+            lambda req_id, ready_result: ready_result
+        )
+
+        ready = cache._lookup_prefetch_ready_result(
+            "rid",
+            req=types.SimpleNamespace(fill_ids=list(range(2623))),
+        )
+
+        self.assertIsNotNone(ready)
+        self.assertEqual(ready.match_result.host_hit_length, 0)
+        self.assertIs(ready.match_result.last_host_node, device_node)
+
 
 if __name__ == "__main__":
     unittest.main()

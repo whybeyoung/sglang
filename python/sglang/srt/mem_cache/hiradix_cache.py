@@ -3293,6 +3293,7 @@ class HiRadixCache(RadixCache):
                 ready_result = self._build_latched_prefetch_ready_result(
                     req, loaded_from_storage
                 )
+            ready_result = self.canonicalize_prefetch_ready_result(req_id, ready_result)
             self.queue_authoritative_tree_op(
                 "PREFETCH_READY_SUMMARY",
                 req_id=req_id,
@@ -3390,6 +3391,7 @@ class HiRadixCache(RadixCache):
         ready_result = self._clamp_ready_result_to_authoritative_summary(
             req_id, ready_result
         )
+        ready_result = self.canonicalize_prefetch_ready_result(req_id, ready_result)
         if ready_result is None and self.authoritative_tree.enabled and req is not None:
             ready_result = self.build_authoritative_prefetch_ready_result(req)
         return ready_result
