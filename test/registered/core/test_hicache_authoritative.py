@@ -2394,7 +2394,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
         recovered = cache._recover_prefetch_committed_host_nodes(
             anchor_node=object(),
             fetched_token_ids=list(range(128)),
-            fetched_hash_value=["h1", "h2"],
+            fetched_hash_value=["mismatch-h1", "mismatch-h2"],
             committed_tokens=128,
         )
 

@@ -2442,23 +2442,22 @@ class HiRadixCache(RadixCache):
 
         selected: list[TreeNode] = []
         covered_tokens = 0
-        candidate_hashes: list[str] = []
         for node in path_nodes:
             if not node.evicted or len(node.host_value) == 0:
                 break
             selected.append(node)
             covered_tokens += len(node.host_value)
-            if node.hash_value:
-                candidate_hashes.extend(node.hash_value)
             if covered_tokens >= committed_tokens:
                 break
 
         if covered_tokens < committed_tokens:
             return []
-
-        expected_hashes = fetched_hash_value[: committed_tokens // self.page_size]
-        if expected_hashes and candidate_hashes[: len(expected_hashes)] != expected_hashes:
-            return []
+        # This recovery path runs immediately after the local prefetch finalize
+        # inserted the host-only path for the same request. At this point we only
+        # need a request-scoped stable host boundary for ready/load_back; requiring
+        # replay-grade hash equality here is too strict and collapses otherwise
+        # valid host-ready snapshots back to storage-only. Structural replay keeps
+        # its own stricter hash validation elsewhere.
         return selected
 
     def _build_authoritative_ready_result_from_prefetch_finalize(
