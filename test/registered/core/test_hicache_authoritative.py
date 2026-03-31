@@ -696,6 +696,35 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertTrue(cache._node_backup_visible(Node(32)))
         self.assertFalse(cache._node_backup_visible(Node(33)))
 
+    def test_stable_host_visibility_can_follow_last_hash(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class Tree:
+            enabled = True
+
+        class Node:
+            def __init__(self, node_id, last_hash):
+                self.id = node_id
+                self._last_hash = last_hash
+                self.host_value = [1]
+
+            @property
+            def backuped(self):
+                return True
+
+            def get_last_hash_value(self):
+                return self._last_hash
+
+        cache.authoritative_tree = Tree()
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_backuped_last_hashes = set()
+        cache.authoritative_host_visible_last_hashes = {"stable-hash"}
+
+        self.assertTrue(cache._node_stable_host_visible(Node(41, "stable-hash")))
+        self.assertTrue(cache._node_backup_visible(Node(41, "stable-hash")))
+        self.assertFalse(cache._node_stable_host_visible(Node(42, "other-hash")))
+
     def test_make_authoritative_node_ref_carries_last_hash(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 

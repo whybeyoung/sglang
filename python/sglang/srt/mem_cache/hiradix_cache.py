@@ -301,7 +301,9 @@ class HiRadixCache(RadixCache):
         self.authoritative_pending_backup_node_ids: set[int] = set()
         self.authoritative_pending_backup_reasons: dict[str, str] = {}
         self.authoritative_backuped_node_ids: set[int] = set()
+        self.authoritative_backuped_last_hashes: set[str] = set()
         self.authoritative_host_visible_node_ids: set[int] = set()
+        self.authoritative_host_visible_last_hashes: set[str] = set()
         self.authoritative_prefetch_visible_node_ids: set[int] = set()
         self.authoritative_resolution_stats: dict[str, int] = {}
         self._last_authoritative_resolution_log_ts = 0.0
@@ -580,7 +582,8 @@ class HiRadixCache(RadixCache):
         if node_id is None:
             return
         self._authoritative_node_by_id[node_id] = node
-        last_hash = node.get_last_hash_value()
+        last_hash_getter = getattr(node, "get_last_hash_value", None)
+        last_hash = last_hash_getter() if callable(last_hash_getter) else None
         if last_hash:
             self._authoritative_node_by_last_hash[last_hash] = node
             self._authoritative_last_hash_by_node_id[node_id] = last_hash
@@ -1011,8 +1014,8 @@ class HiRadixCache(RadixCache):
             self.authoritative_pending_backup_reasons.pop(backup_key, None)
             if node is None:
                 continue
-            self.authoritative_backuped_node_ids.add(node.id)
-            self.authoritative_host_visible_node_ids.add(node.id)
+            self._mark_authoritative_backup_visible(node)
+            self._mark_authoritative_host_visible(node)
             self._record_authoritative_resolution("host_backup_commit.promote_visible")
         self.authoritative_pending_backup_node_ids = current_pending_ids
 
@@ -1433,19 +1436,77 @@ class HiRadixCache(RadixCache):
         else:
             self._evict_regular(node)
 
+    def _mark_authoritative_backup_visible(self, node: Optional[TreeNode]) -> None:
+        if node is None:
+            return
+        if not hasattr(self, "authoritative_backuped_node_ids"):
+            self.authoritative_backuped_node_ids = set()
+        if not hasattr(self, "authoritative_backuped_last_hashes"):
+            self.authoritative_backuped_last_hashes = set()
+        self.authoritative_backuped_node_ids.add(node.id)
+        last_hash_getter = getattr(node, "get_last_hash_value", None)
+        last_hash = last_hash_getter() if callable(last_hash_getter) else None
+        if last_hash is not None:
+            self.authoritative_backuped_last_hashes.add(last_hash)
+
+    def _mark_authoritative_host_visible(self, node: Optional[TreeNode]) -> None:
+        if node is None:
+            return
+        if not hasattr(self, "authoritative_host_visible_node_ids"):
+            self.authoritative_host_visible_node_ids = set()
+        if not hasattr(self, "authoritative_host_visible_last_hashes"):
+            self.authoritative_host_visible_last_hashes = set()
+        self.authoritative_host_visible_node_ids.add(node.id)
+        last_hash_getter = getattr(node, "get_last_hash_value", None)
+        last_hash = last_hash_getter() if callable(last_hash_getter) else None
+        if last_hash is not None:
+            self.authoritative_host_visible_last_hashes.add(last_hash)
+
     def _node_backup_visible(self, node: TreeNode) -> bool:
         if not getattr(self.authoritative_tree, "enabled", False):
             return node.backuped
-        return node.id in self.authoritative_backuped_node_ids or self._node_stable_host_visible(
-            node
+        authoritative_backuped_node_ids = getattr(
+            self, "authoritative_backuped_node_ids", set()
+        )
+        authoritative_backuped_last_hashes = getattr(
+            self, "authoritative_backuped_last_hashes", set()
+        )
+        last_hash = node.get_last_hash_value()
+        return (
+            node.id in authoritative_backuped_node_ids
+            or (
+                last_hash is not None
+                and last_hash in authoritative_backuped_last_hashes
+            )
+            or self._node_stable_host_visible(node)
         )
 
     def _node_stable_host_visible(self, node: TreeNode) -> bool:
         if not getattr(self.authoritative_tree, "enabled", False):
             return node.backuped
+        authoritative_backuped_node_ids = getattr(
+            self, "authoritative_backuped_node_ids", set()
+        )
+        authoritative_host_visible_node_ids = getattr(
+            self, "authoritative_host_visible_node_ids", set()
+        )
+        authoritative_backuped_last_hashes = getattr(
+            self, "authoritative_backuped_last_hashes", set()
+        )
+        authoritative_host_visible_last_hashes = getattr(
+            self, "authoritative_host_visible_last_hashes", set()
+        )
+        last_hash = node.get_last_hash_value()
         return (
-            node.id in self.authoritative_backuped_node_ids
-            or node.id in self.authoritative_host_visible_node_ids
+            node.id in authoritative_backuped_node_ids
+            or node.id in authoritative_host_visible_node_ids
+            or (
+                last_hash is not None
+                and (
+                    last_hash in authoritative_backuped_last_hashes
+                    or last_hash in authoritative_host_visible_last_hashes
+                )
+            )
         )
 
     def _node_request_ready_visible(self, node: TreeNode) -> bool:
@@ -1475,6 +1536,10 @@ class HiRadixCache(RadixCache):
         self.authoritative_backuped_node_ids.discard(node_id)
         self.authoritative_host_visible_node_ids.discard(node_id)
         self.authoritative_prefetch_visible_node_ids.discard(node_id)
+        last_hash = node.get_last_hash_value()
+        if last_hash is not None:
+            self.authoritative_backuped_last_hashes.discard(last_hash)
+            self.authoritative_host_visible_last_hashes.discard(last_hash)
 
     def _record_authoritative_resolution(self, name: str) -> None:
         self.authoritative_resolution_stats[name] = (
@@ -1541,7 +1606,7 @@ class HiRadixCache(RadixCache):
         for node in ready_visible_nodes:
             self.authoritative_prefetch_visible_node_ids.add(node.id)
         for node in stable_visible_nodes or []:
-            self.authoritative_host_visible_node_ids.add(node.id)
+            self._mark_authoritative_host_visible(node)
 
     def get_authoritative_resolution_stats(self) -> dict[str, int]:
         return dict(self.authoritative_resolution_stats)
@@ -2567,7 +2632,9 @@ class HiRadixCache(RadixCache):
         self.authoritative_pending_backup_node_ids.clear()
         self.authoritative_pending_backup_reasons.clear()
         self.authoritative_backuped_node_ids.clear()
+        self.authoritative_backuped_last_hashes.clear()
         self.authoritative_host_visible_node_ids.clear()
+        self.authoritative_host_visible_last_hashes.clear()
         self.authoritative_prefetch_visible_node_ids.clear()
         self.authoritative_resolution_stats.clear()
         self._last_authoritative_resolution_log_ts = 0.0
@@ -4046,9 +4113,9 @@ class HiRadixCache(RadixCache):
         self._refresh_authoritative_node_index(new_node)
         self._refresh_authoritative_node_index(child)
         if child_backup_visible:
-            self.authoritative_backuped_node_ids.add(new_node.id)
+            self._mark_authoritative_backup_visible(new_node)
         if child_host_visible:
-            self.authoritative_host_visible_node_ids.add(new_node.id)
+            self._mark_authoritative_host_visible(new_node)
         if child_prefetch_visible:
             self.authoritative_prefetch_visible_node_ids.add(new_node.id)
         self._update_host_leaf_status(child)
