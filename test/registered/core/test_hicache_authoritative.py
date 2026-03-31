@@ -618,6 +618,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
             matched_length=2,
             committed_tokens=3,
             ready_visible_nodes=visible,
+            stable_visible_nodes=visible[:1],
         )
 
         self.assertEqual(
@@ -625,6 +626,12 @@ class TestHiCacheAuthoritative(CustomTestCase):
             [
                 {"node_id": 21, "last_hash": "h21"},
                 {"node_id": 22, "last_hash": "h22"},
+            ],
+        )
+        self.assertEqual(
+            payload["stable_visible_node_refs"],
+            [
+                {"node_id": 21, "last_hash": "h21"},
             ],
         )
 
@@ -3063,16 +3070,56 @@ class TestHiCacheAuthoritative(CustomTestCase):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.authoritative_prefetch_visible_node_ids = set()
         cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_host_visible_last_hashes = set()
 
-        ready_node = types.SimpleNamespace(id=7)
+        ready_node = types.SimpleNamespace(id=7, get_last_hash_value=lambda: "h7")
         ready_node_2 = types.SimpleNamespace(id=8)
+        stable_node = types.SimpleNamespace(id=9, get_last_hash_value=lambda: "h9")
 
         cache._stage_ready_visible_nodes(
             [ready_node, ready_node_2],
+            stable_visible_nodes=[stable_node],
         )
 
         self.assertEqual(cache.authoritative_prefetch_visible_node_ids, {7, 8})
-        self.assertEqual(cache.authoritative_host_visible_node_ids, set())
+        self.assertEqual(cache.authoritative_host_visible_node_ids, {9})
+        self.assertEqual(cache.authoritative_host_visible_last_hashes, {"h9"})
+
+    def test_collect_stable_ready_visible_nodes_requires_matched_prefix_bound(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class Node:
+            def __init__(self, node_id, parent=None):
+                self.id = node_id
+                self.parent = parent
+                self.evicted = True
+                self.host_value = torch.tensor([node_id])
+
+        root = object()
+        host_1 = Node(11, root)
+        host_2 = Node(12, host_1)
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64),
+                last_device_node=root,
+                last_host_node=host_2,
+                host_hit_length=2,
+            ),
+            storage_hit_length=5,
+            input_len=10,
+        )
+
+        stable = cache._collect_stable_ready_visible_nodes(
+            ready,
+            matched_length=2,
+        )
+        unstable = cache._collect_stable_ready_visible_nodes(
+            ready,
+            matched_length=1,
+        )
+
+        self.assertEqual([node.id for node in stable], [11, 12])
+        self.assertEqual(unstable, [])
 
     def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)

@@ -441,9 +441,15 @@ class HiRadixCache(RadixCache):
                 node = self._resolve_authoritative_node_ref(node_ref=node_ref)
                 if node is not None:
                     ready_visible_nodes.append(node)
+            stable_visible_nodes: list[TreeNode] = []
+            for node_ref in op.payload.get("stable_visible_node_refs") or []:
+                node = self._resolve_authoritative_node_ref(node_ref=node_ref)
+                if node is not None:
+                    stable_visible_nodes.append(node)
             if ready_visible_nodes:
                 self._stage_ready_visible_nodes(
                     ready_visible_nodes,
+                    stable_visible_nodes=stable_visible_nodes,
                 )
                 self._record_authoritative_resolution("host_insert.ready_visible")
                 return
@@ -1924,6 +1930,7 @@ class HiRadixCache(RadixCache):
         matched_length: int,
         committed_tokens: int,
         ready_visible_nodes: Optional[list[TreeNode]] = None,
+        stable_visible_nodes: Optional[list[TreeNode]] = None,
     ) -> dict[str, object]:
         return {
             "req_id": req_id,
@@ -1940,6 +1947,10 @@ class HiRadixCache(RadixCache):
             "ready_visible_node_refs": [
                 self._make_authoritative_node_ref(node)
                 for node in (ready_visible_nodes or [])
+            ],
+            "stable_visible_node_refs": [
+                self._make_authoritative_node_ref(node)
+                for node in (stable_visible_nodes or [])
             ],
         }
 
@@ -1971,6 +1982,25 @@ class HiRadixCache(RadixCache):
             return []
         selected.reverse()
         return selected
+
+    def _collect_stable_ready_visible_nodes(
+        self,
+        ready_result: Optional[LatchedPrefetchReadyResult],
+        *,
+        matched_length: int,
+    ) -> list[TreeNode]:
+        if ready_result is None or matched_length <= 0:
+            return []
+        prefix_len = (
+            len(ready_result.match_result.device_indices)
+            + ready_result.match_result.host_hit_length
+        )
+        if (
+            ready_result.match_result.host_hit_length <= 0
+            or prefix_len > matched_length
+        ):
+            return []
+        return self._collect_request_ready_visible_nodes(ready_result)
 
     def _clamp_ready_result_to_authoritative_summary(
         self,
@@ -3512,9 +3542,14 @@ class HiRadixCache(RadixCache):
                 )
             ready_result = self.canonicalize_prefetch_ready_result(req_id, ready_result)
         ready_visible_nodes = self._collect_request_ready_visible_nodes(ready_result)
+        stable_visible_nodes = self._collect_stable_ready_visible_nodes(
+            ready_result,
+            matched_length=matched_length,
+        )
         if self.authoritative_tree.enabled and ready_visible_nodes:
             self._stage_ready_visible_nodes(
                 ready_visible_nodes,
+                stable_visible_nodes=stable_visible_nodes,
             )
         self.queue_authoritative_tree_op(
             "HOST_INSERT_FROM_STORAGE",
@@ -3528,6 +3563,7 @@ class HiRadixCache(RadixCache):
                 matched_length=matched_length,
                 committed_tokens=min_completed_tokens,
                 ready_visible_nodes=ready_visible_nodes,
+                stable_visible_nodes=stable_visible_nodes,
             ),
         )
         self.prefetch_loaded_tokens_by_reqid[req_id] = ready_storage_hit_length
