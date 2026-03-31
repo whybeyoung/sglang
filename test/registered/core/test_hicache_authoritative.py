@@ -2304,6 +2304,24 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(ready.match_result.host_hit_length, 0)
         self.assertIs(ready.match_result.last_host_node, root)
 
+    def test_prefetch_visible_nodes_do_not_count_as_backup_visible(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        class Node:
+            def __init__(self, node_id):
+                self.id = node_id
+                self.backuped = True
+
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_prefetch_visible_node_ids = {7}
+
+        self.assertFalse(cache._node_backup_visible(Node(7)))
+
 
 if __name__ == "__main__":
     unittest.main()

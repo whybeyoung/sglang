@@ -287,6 +287,7 @@ class HiRadixCache(RadixCache):
         self.authoritative_pending_backup_reasons: dict[str, str] = {}
         self.authoritative_backuped_node_ids: set[int] = set()
         self.authoritative_host_visible_node_ids: set[int] = set()
+        self.authoritative_prefetch_visible_node_ids: set[int] = set()
         self.authoritative_resolution_stats: dict[str, int] = {}
         self._last_authoritative_resolution_log_ts = 0.0
         self._authoritative_node_by_id: dict[int, TreeNode] = {}
@@ -440,7 +441,7 @@ class HiRadixCache(RadixCache):
                 resolved_nodes, op.payload
             ):
                 for node in resolved_nodes:
-                    self.authoritative_host_visible_node_ids.add(node.id)
+                    self.authoritative_prefetch_visible_node_ids.add(node.id)
             else:
                 if resolved_nodes:
                     self._record_authoritative_resolution("host_insert.partial_mismatch")
@@ -476,7 +477,7 @@ class HiRadixCache(RadixCache):
                             "host_insert.unresolved"
                         )
                 for node in recovered_nodes:
-                    self.authoritative_host_visible_node_ids.add(node.id)
+                    self.authoritative_prefetch_visible_node_ids.add(node.id)
             return
         if op.op_type == "HOST_EVICT":
             node_refs = op.payload.get("node_refs")
@@ -961,7 +962,7 @@ class HiRadixCache(RadixCache):
         if not recovered_nodes:
             return False
         for node in recovered_nodes:
-            self.authoritative_host_visible_node_ids.add(node.id)
+            self.authoritative_prefetch_visible_node_ids.add(node.id)
         self._clear_host_insert_rebuild_blueprint(req_id)
         self._record_authoritative_resolution("host_insert.blueprint_apply")
         return True
@@ -1451,6 +1452,7 @@ class HiRadixCache(RadixCache):
             self.authoritative_pending_backup_reasons.pop(backup_key, None)
         self.authoritative_backuped_node_ids.discard(node_id)
         self.authoritative_host_visible_node_ids.discard(node_id)
+        self.authoritative_prefetch_visible_node_ids.discard(node_id)
 
     def _record_authoritative_resolution(self, name: str) -> None:
         self.authoritative_resolution_stats[name] = (
@@ -2345,6 +2347,7 @@ class HiRadixCache(RadixCache):
         self.authoritative_pending_backup_reasons.clear()
         self.authoritative_backuped_node_ids.clear()
         self.authoritative_host_visible_node_ids.clear()
+        self.authoritative_prefetch_visible_node_ids.clear()
         self.authoritative_resolution_stats.clear()
         self._last_authoritative_resolution_log_ts = 0.0
         self._authoritative_node_by_id.clear()
@@ -2861,6 +2864,9 @@ class HiRadixCache(RadixCache):
         if self.authoritative_tree.enabled:
             for loaded_node in nodes_to_load:
                 self.authoritative_host_visible_node_ids.discard(loaded_node.id)
+                self.authoritative_prefetch_visible_node_ids.discard(
+                    loaded_node.id
+                )
             self._clear_prefetch_ready_for_host_node(last_hit_node)
 
         if self.metrics_collector is not None:
@@ -3607,6 +3613,9 @@ class HiRadixCache(RadixCache):
         child_host_visible = getattr(child, "id", None) in getattr(
             self, "authoritative_host_visible_node_ids", set()
         )
+        child_prefetch_visible = getattr(child, "id", None) in getattr(
+            self, "authoritative_prefetch_visible_node_ids", set()
+        )
         new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -3636,6 +3645,8 @@ class HiRadixCache(RadixCache):
             self.authoritative_backuped_node_ids.add(new_node.id)
         if child_host_visible:
             self.authoritative_host_visible_node_ids.add(new_node.id)
+        if child_prefetch_visible:
+            self.authoritative_prefetch_visible_node_ids.add(new_node.id)
         self._update_host_leaf_status(child)
         self._update_host_leaf_status(new_node)
         if old_parent is not None:
