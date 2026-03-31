@@ -2460,10 +2460,10 @@ class HiRadixCache(RadixCache):
         # its own stricter hash validation elsewhere.
         return selected
 
-    def _recover_prefetch_committed_match_result(
+    def _recover_prefetch_committed_match_result_from_anchor(
         self,
         *,
-        anchor_node: TreeNode,
+        anchor_node: Optional[TreeNode],
         fetched_token_ids: List[int],
         committed_tokens: int,
     ) -> Optional[tuple[MatchResult, int]]:
@@ -2528,6 +2528,35 @@ class HiRadixCache(RadixCache):
             ),
             covered_tokens,
         )
+
+    def _recover_prefetch_committed_match_result(
+        self,
+        *,
+        anchor_node: TreeNode,
+        fetched_token_ids: List[int],
+        committed_tokens: int,
+    ) -> Optional[tuple[MatchResult, int]]:
+        recovered = self._recover_prefetch_committed_match_result_from_anchor(
+            anchor_node=anchor_node,
+            fetched_token_ids=fetched_token_ids,
+            committed_tokens=committed_tokens,
+        )
+        if (
+            recovered is not None
+            and recovered[1] >= committed_tokens
+        ) or anchor_node == self.root_node:
+            return recovered
+
+        recovered_from_root = self._recover_prefetch_committed_match_result_from_anchor(
+            anchor_node=self.root_node,
+            fetched_token_ids=fetched_token_ids,
+            committed_tokens=committed_tokens,
+        )
+        if recovered_from_root is None:
+            return recovered
+        if recovered is None or recovered_from_root[1] > recovered[1]:
+            return recovered_from_root
+        return recovered
 
     def _build_authoritative_ready_result_from_prefetch_finalize(
         self,

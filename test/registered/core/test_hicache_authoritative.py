@@ -2434,6 +2434,44 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(ready.match_result.host_hit_length, 0)
         self.assertEqual(ready.storage_hit_length, 60)
 
+    def test_recover_prefetch_committed_match_result_falls_back_to_root_path(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.device = torch.device("cpu")
+        cache.root_node = TreeNode(id=0)
+        cache.root_node.key = RadixKey([], None)
+        cache.root_node.parent = None
+        cache.get_child_key_fn = lambda key: key.token_ids[0]
+        cache.key_match_fn = (
+            lambda key0, key1: sum(
+                1 for a, b in zip(key0.token_ids, key1.token_ids) if a == b
+            )
+        )
+
+        anchor = TreeNode(id=1)
+        anchor.key = RadixKey([], None)
+        anchor.parent = cache.root_node
+        cache.root_node.children[-1] = anchor
+
+        child = TreeNode(id=8)
+        child.key = RadixKey([1, 2, 3, 4], None)
+        child.value = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+        child.host_value = torch.empty((0,), dtype=torch.int64)
+        child.parent = cache.root_node
+        cache.root_node.children[1] = child
+
+        recovered = cache._recover_prefetch_committed_match_result(
+            anchor_node=anchor,
+            fetched_token_ids=[1, 2, 3, 4],
+            committed_tokens=4,
+        )
+
+        self.assertIsNotNone(recovered)
+        match_result, covered_tokens = recovered
+        self.assertEqual(covered_tokens, 4)
+        self.assertEqual(match_result.host_hit_length, 0)
+        self.assertEqual(match_result.device_indices.tolist(), [10, 11, 12, 13])
+        self.assertIs(match_result.last_device_node, child)
+
     def test_prefetch_visible_nodes_do_not_count_as_backup_visible(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
