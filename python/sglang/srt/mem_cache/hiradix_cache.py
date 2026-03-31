@@ -1774,6 +1774,28 @@ class HiRadixCache(RadixCache):
             input_len=ready_result.input_len,
         )
 
+    def _resolve_summary_host_node(
+        self,
+        req_id: Optional[str],
+        *,
+        input_len: Optional[int] = None,
+    ) -> Optional[TreeNode]:
+        if req_id is None:
+            return None
+        summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
+        if summary is None:
+            return None
+        if (
+            input_len is not None
+            and summary.input_len is not None
+            and summary.input_len != input_len
+        ):
+            return None
+        node_ref = getattr(summary, "last_host_node_ref", None)
+        if node_ref is None:
+            return None
+        return self._resolve_authoritative_node_ref(node_ref=node_ref)
+
     def _clamp_match_result_to_authoritative_summary(
         self,
         req_id: Optional[str],
@@ -1797,16 +1819,56 @@ class HiRadixCache(RadixCache):
         if len(device_indices) > summary.prefix_len:
             device_indices = device_indices[: summary.prefix_len]
 
-        host_hit_length = min(match_result.host_hit_length, summary.host_hit_length)
-        last_host_node = self._select_last_host_node_for_hit_length(
-            match_result.last_host_node, host_hit_length
-        )
+        summary_host_node = self._resolve_summary_host_node(req_id, input_len=input_len)
+        if (
+            summary.host_hit_length > 0
+            and summary_host_node is not None
+            and getattr(summary_host_node, "evicted", False)
+            and self._node_backup_visible(summary_host_node)
+        ):
+            host_hit_length = summary.host_hit_length
+            last_host_node = self._select_last_host_node_for_hit_length(
+                summary_host_node, host_hit_length
+            )
+        else:
+            host_hit_length = min(match_result.host_hit_length, summary.host_hit_length)
+            deepest_host_node = summary_host_node or match_result.last_host_node
+            last_host_node = self._select_last_host_node_for_hit_length(
+                deepest_host_node, host_hit_length
+            )
         return MatchResult(
             device_indices=device_indices,
             last_device_node=match_result.last_device_node,
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
             mamba_branching_seqlen=match_result.mamba_branching_seqlen,
+        )
+
+    def canonicalize_prefetch_ready_result(
+        self, req_id: str, ready_result: Optional[LatchedPrefetchReadyResult]
+    ) -> Optional[LatchedPrefetchReadyResult]:
+        if ready_result is None:
+            return None
+        canonical_match_result = self._clamp_match_result_to_authoritative_summary(
+            req_id, ready_result.match_result, input_len=ready_result.input_len
+        )
+        if canonical_match_result == ready_result.match_result:
+            return ready_result
+        summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
+        storage_hit_length = (
+            summary.storage_hit_length
+            if summary is not None
+            and (
+                ready_result.input_len is None
+                or summary.input_len is None
+                or summary.input_len == ready_result.input_len
+            )
+            else ready_result.storage_hit_length
+        )
+        return LatchedPrefetchReadyResult(
+            match_result=canonical_match_result,
+            storage_hit_length=storage_hit_length,
+            input_len=ready_result.input_len,
         )
 
     def shutdown(self):
@@ -3157,6 +3219,11 @@ class HiRadixCache(RadixCache):
         if ready_result is None:
             return False
         last_host_node = getattr(ready_result.match_result, "last_host_node", None)
+        if last_host_node is not None and self.authoritative_tree.enabled:
+            node_ref = self._make_authoritative_node_ref(last_host_node)
+            canonical_node = self._resolve_authoritative_node_ref(node_ref=node_ref)
+            if canonical_node is not None:
+                last_host_node = canonical_node
         if last_host_node is None:
             return True
         if not getattr(last_host_node, "evicted", False):

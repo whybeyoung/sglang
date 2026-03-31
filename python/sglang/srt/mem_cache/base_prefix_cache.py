@@ -212,6 +212,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Synchronize an authoritative committed cache-state view across PP stages."""
         return None
 
+    def canonicalize_prefetch_ready_result(self, req_id: str, ready_result: Any) -> Any:
+        """Optionally refresh a latched HiCache ready result against the current cache view."""
+        return ready_result
+
     def is_load_ready(self, consumer_index: Any) -> bool:
         """
         Return whether the given hicache load batch has completed.

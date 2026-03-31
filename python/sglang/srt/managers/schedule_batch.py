@@ -891,6 +891,9 @@ class Req(ReqDllmMixin):
                 pop_prefetch_ready_result = getattr(
                     tree_cache, "pop_prefetch_ready_result", None
                 )
+                canonicalize_prefetch_ready_result = getattr(
+                    tree_cache, "canonicalize_prefetch_ready_result", None
+                )
                 is_prefetch_ready_result_usable = getattr(
                     tree_cache, "is_prefetch_ready_result_usable", None
                 )
@@ -900,6 +903,10 @@ class Req(ReqDllmMixin):
                     and self._latched_hicache_ready_input_len == input_len
                 ):
                     candidate_ready = self._latched_hicache_ready_result
+                    if canonicalize_prefetch_ready_result is not None:
+                        candidate_ready = canonicalize_prefetch_ready_result(
+                            self.rid, candidate_ready
+                        )
                     if (
                         is_prefetch_ready_result_usable is None
                         or is_prefetch_ready_result_usable(candidate_ready)
@@ -910,6 +917,13 @@ class Req(ReqDllmMixin):
                         self.clear_latched_hicache_ready()
                 elif pop_prefetch_ready_result is not None:
                     candidate_ready = pop_prefetch_ready_result(self.rid, req=self)
+                    if (
+                        candidate_ready is not None
+                        and canonicalize_prefetch_ready_result is not None
+                    ):
+                        candidate_ready = canonicalize_prefetch_ready_result(
+                            self.rid, candidate_ready
+                        )
                     if (
                         candidate_ready is not None
                         and (
