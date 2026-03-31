@@ -1724,6 +1724,21 @@ class HiRadixCache(RadixCache):
                 break
         return selected
 
+    def _visible_host_hit_length_to_node(self, node: Optional[TreeNode]) -> int:
+        if node is None or node == self.root_node:
+            return 0
+        total = 0
+        cursor = node
+        while (
+            cursor is not None
+            and cursor != self.root_node
+            and cursor.evicted
+            and self._node_backup_visible(cursor)
+        ):
+            total += len(cursor.host_value)
+            cursor = cursor.parent
+        return total
+
     def _build_host_insert_from_storage_payload(
         self,
         *,
@@ -1836,6 +1851,9 @@ class HiRadixCache(RadixCache):
             last_host_node = self._select_last_host_node_for_hit_length(
                 deepest_host_node, host_hit_length
             )
+        host_hit_length = min(
+            host_hit_length, self._visible_host_hit_length_to_node(last_host_node)
+        )
         return MatchResult(
             device_indices=device_indices,
             last_device_node=match_result.last_device_node,

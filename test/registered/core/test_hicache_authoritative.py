@@ -289,6 +289,34 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(len(clamped.device_indices), 2)
         self.assertEqual(clamped.host_hit_length, 1)
 
+    def test_hicache_clamp_drops_host_hit_without_visible_host_boundary(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.root_node = types.SimpleNamespace(id=0)
+        cache.authoritative_prefetch_ready_by_reqid = {
+            "rid-2b": AuthoritativePrefetchReadySummary(
+                req_id="rid-2b",
+                prefix_len=0,
+                host_hit_length=3200,
+                storage_hit_length=3200,
+            )
+        }
+        cache._resolve_summary_host_node = lambda req_id, input_len=None: None
+        cache._select_last_host_node_for_hit_length = lambda node, host_hit_length: cache.root_node
+        cache._node_backup_visible = lambda node: False
+        local_match = MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            last_device_node=None,
+            last_host_node=types.SimpleNamespace(id=98, evicted=True, host_value=[0] * 3200, parent=cache.root_node),
+            host_hit_length=3200,
+        )
+
+        clamped = cache._clamp_match_result_to_authoritative_summary(
+            "rid-2b", local_match
+        )
+
+        self.assertEqual(clamped.host_hit_length, 0)
+        self.assertIs(clamped.last_host_node, cache.root_node)
+
     def test_authoritative_node_indexes_resolve_id_and_hash(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache._authoritative_node_by_id = {}
