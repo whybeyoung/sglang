@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -546,6 +547,26 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
+                if req.to_finish:
+                    req.check_finished()
+                    if req.finished():
+                        if (
+                            self.enable_hicache_storage
+                            and isinstance(req.finished_reason, FINISH_ABORT)
+                        ):
+                            self.tree_cache.release_aborted_request(req.rid)
+                        if (
+                            hasattr(req, "disagg_kv_sender")
+                            and req.disagg_kv_sender is not None
+                            and hasattr(req.disagg_kv_sender, "clear")
+                        ):
+                            req.disagg_kv_sender.clear()
+                        release_kv_cache(req, self.tree_cache)
+                        release_req_to_metadata_buffer(
+                            req, self.req_to_metadata_buffer_idx_allocator
+                        )
+                        req.time_stats.set_completion_time()
+                        continue
                 req.is_chunked -= 1
 
                 if req.return_logprob:
@@ -642,6 +663,8 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 if authoritative_abort:
                     try:

@@ -2934,6 +2934,30 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        def cleanup_prefill_abort_local(
+            req: Req,
+            *,
+            release_tree_kv: bool = False,
+            release_metadata: bool = False,
+        ) -> None:
+            # PP rank 0 should remain authoritative for outward abort propagation,
+            # but every PP rank still needs to clean up its local HiCache/request
+            # state so request-scoped prefetch events and tree protection do not
+            # leak after abort storms or stop-pressure scenarios.
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+
+            if release_tree_kv and req.req_pool_idx is not None:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+
+            if (
+                release_metadata
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+            ):
+                release_req_to_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -2981,6 +3005,7 @@ class Scheduler(
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    cleanup_prefill_abort_local(req, release_metadata=True)
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -2988,6 +3013,7 @@ class Scheduler(
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    cleanup_prefill_abort_local(req)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
@@ -3016,12 +3042,21 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
+        # Snapshot active batch reqs before touching chunked_req. If the current
+        # chunked request is already inside a launched/running batch, defer the
+        # main KV/tree cleanup to the normal finish path of that batch.
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            reqs = self.running_batch.reqs
+        else:
+            reqs = self.running_batch.reqs + self.cur_batch.reqs
+
         # Handle chunked_req abort
         if (
             self.chunked_req is not None
             and (recv_req.abort_all or self.chunked_req.rid.startswith(recv_req.rid))
         ):
             logger.debug(f"Abort chunked request. rid={self.chunked_req.rid}")
+            chunked_req_in_active_batch = self.chunked_req in reqs
             if (
                 self.disaggregation_mode == DisaggregationMode.PREFILL
                 and hasattr(self.chunked_req, "disagg_kv_sender")
@@ -3029,14 +3064,17 @@ class Scheduler(
                 and hasattr(self.chunked_req.disagg_kv_sender, "abort")
             ):
                 self.chunked_req.disagg_kv_sender.abort()
+            if chunked_req_in_active_batch:
+                self.chunked_req.to_finish = FINISH_ABORT()
+            else:
+                cleanup_prefill_abort_local(
+                    self.chunked_req,
+                    release_tree_kv=True,
+                    release_metadata=True,
+                )
             self.chunked_req = None
 
         # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
-        else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
-
         for req in reqs:
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)

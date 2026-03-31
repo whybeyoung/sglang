@@ -152,11 +152,12 @@ class HiRadixCache(RadixCache):
         # The authoritative PP replay path is still experimental. Keep it opt-in so
         # default HiCache service startup does not introduce extra PP collectives in
         # the scheduler event loop.
+        authoritative_env = os.getenv("SGLANG_ENABLE_HICACHE_AUTHORITATIVE_PP", "0")
+        disable_fallback_env = os.getenv(
+            "SGLANG_DISABLE_PP_HICACHE_DEVICE_ONLY_FALLBACK", "0"
+        )
         self.authoritative_tree = AuthoritativeTreeCoordinator(
-            enabled=(
-                self.pp_size > 1
-                and os.getenv("SGLANG_ENABLE_HICACHE_AUTHORITATIVE_PP", "0") == "1"
-            )
+            enabled=(self.pp_size > 1 and authoritative_env == "1")
         )
         # Until PP authoritative ready/contract replay is fully wired into the
         # main scheduler path, default PP HiCache reads to a conservative
@@ -166,9 +167,23 @@ class HiRadixCache(RadixCache):
         self.pp_device_only_match_fallback = (
             self.pp_size > 1
             and not self.authoritative_tree.enabled
-            and os.getenv("SGLANG_DISABLE_PP_HICACHE_DEVICE_ONLY_FALLBACK", "0")
-            != "1"
+            and disable_fallback_env != "1"
         )
+        if self.pp_size > 1:
+            logger.warning(
+                "[HiCachePPMode] authoritative_env=%s disable_fallback_env=%s "
+                "authoritative_enabled=%s pp_device_only_match_fallback=%s "
+                "pp_rank=%s cp=%s tp=%s",
+                authoritative_env,
+                disable_fallback_env,
+                self.authoritative_tree.enabled,
+                self.pp_device_only_match_fallback,
+                self.pp_rank,
+                self.attn_cp_rank,
+                getattr(self.cache_controller, "tp_rank", None)
+                if hasattr(self, "cache_controller")
+                else None,
+            )
 
         (
             extra_config,
@@ -3998,6 +4013,11 @@ class HiRadixCache(RadixCache):
 
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
+            last_host_node.release_host()
+            del self.ongoing_prefetch[rid]
+            if host_indices is not None:
+                self.cache_controller.mem_pool_host.free(host_indices)
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)

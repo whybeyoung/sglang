@@ -1980,6 +1980,11 @@ class HiMambaRadixCache(MambaRadixCache):
 
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
+            self._release_host_node(last_host_node)
+            del self.ongoing_prefetch[rid]
+            if host_indices is not None:
+                self.cache_controller.mem_pool_host.free(host_indices)
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)

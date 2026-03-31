@@ -16,6 +16,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_ABORT,
     Req,
     ScheduleBatch,
 )
@@ -171,6 +172,11 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        if (
+                            getattr(self, "enable_hicache_storage", False)
+                            and isinstance(req.finished_reason, FINISH_ABORT)
+                        ):
+                            self.tree_cache.release_aborted_request(req.rid)
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
@@ -231,6 +237,18 @@ class SchedulerOutputProcessorMixin:
 
                 else:
                     # being chunked reqs' prefill is not finished
+                    if req.to_finish:
+                        req.check_finished()
+                        if req.finished():
+                            if (
+                                getattr(self, "enable_hicache_storage", False)
+                                and isinstance(req.finished_reason, FINISH_ABORT)
+                            ):
+                                self.tree_cache.release_aborted_request(req.rid)
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
+                            skip_stream_req = req
+                            continue
                     req.is_chunked -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
@@ -295,12 +313,28 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        if (
+                            getattr(self, "enable_hicache_storage", False)
+                            and isinstance(req.finished_reason, FINISH_ABORT)
+                        ):
+                            self.tree_cache.release_aborted_request(req.rid)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
                     # being chunked reqs' prefill is not finished
+                    if req.to_finish:
+                        req.check_finished()
+                        if req.finished():
+                            if (
+                                getattr(self, "enable_hicache_storage", False)
+                                and isinstance(req.finished_reason, FINISH_ABORT)
+                            ):
+                                self.tree_cache.release_aborted_request(req.rid)
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
+                            continue
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
