@@ -788,6 +788,11 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                clear_latched_hicache_ready = getattr(
+                    req, "clear_latched_hicache_ready", None
+                )
+                if clear_latched_hicache_ready is not None:
+                    clear_latched_hicache_ready()
                 if os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1":
                     logger.warning(
                         "[PPShape] add_one_req after init_load_back: rid=%s "

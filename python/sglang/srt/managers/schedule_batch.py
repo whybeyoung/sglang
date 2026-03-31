@@ -647,9 +647,11 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
-        # Avoid re-consuming the same latched HiCache ready snapshot on every
-        # scheduler retry for an unchanged request input.
-        self._latched_hicache_consumed_input_len: Optional[int] = None
+        # Keep one authoritative HiCache ready snapshot sticky across scheduler
+        # retries for the same request input until the request actually
+        # load-backs that host prefix.
+        self._latched_hicache_ready_input_len: Optional[int] = None
+        self._latched_hicache_ready_result = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -873,8 +875,8 @@ class Req(ReqDllmMixin):
             self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
-        if self._latched_hicache_consumed_input_len != input_len:
-            self._latched_hicache_consumed_input_len = None
+        if self._latched_hicache_ready_input_len != input_len:
+            self.clear_latched_hicache_ready()
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
@@ -889,16 +891,22 @@ class Req(ReqDllmMixin):
                 pop_prefetch_ready_result = getattr(
                     tree_cache, "pop_prefetch_ready_result", None
                 )
+                ready_result = None
                 if (
-                    pop_prefetch_ready_result is not None
-                    and self._latched_hicache_consumed_input_len is None
+                    self._latched_hicache_ready_result is not None
+                    and self._latched_hicache_ready_input_len == input_len
                 ):
+                    ready_result = self._latched_hicache_ready_result
+                    match_source = "latched_ready_sticky"
+                elif pop_prefetch_ready_result is not None:
                     ready_result = pop_prefetch_ready_result(self.rid, req=self)
                     if ready_result is not None:
-                        match_result = ready_result.match_result
-                        self.storage_hit_length = ready_result.storage_hit_length
+                        self._latched_hicache_ready_result = ready_result
+                        self._latched_hicache_ready_input_len = input_len
                         match_source = "latched_ready"
-                        self._latched_hicache_consumed_input_len = input_len
+                if ready_result is not None:
+                    match_result = ready_result.match_result
+                    self.storage_hit_length = ready_result.storage_hit_length
             if match_result is None:
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
@@ -970,6 +978,10 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len,
                 self.is_chunked,
             )
+
+    def clear_latched_hicache_ready(self):
+        self._latched_hicache_ready_input_len = None
+        self._latched_hicache_ready_result = None
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
