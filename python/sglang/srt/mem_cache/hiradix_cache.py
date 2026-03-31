@@ -1911,14 +1911,13 @@ class HiRadixCache(RadixCache):
     ) -> Optional[LatchedPrefetchReadyResult]:
         if ready_result is None:
             return None
+        original_match_result = ready_result.match_result
         canonical_match_result = self._clamp_match_result_to_authoritative_summary(
             req_id,
-            ready_result.match_result,
+            original_match_result,
             input_len=ready_result.input_len,
             include_prefetch_visible=True,
         )
-        if canonical_match_result == ready_result.match_result:
-            return ready_result
         summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
         storage_hit_length = (
             summary.storage_hit_length
@@ -1947,6 +1946,11 @@ class HiRadixCache(RadixCache):
                 host_hit_length=0,
                 mamba_branching_seqlen=canonical_match_result.mamba_branching_seqlen,
             )
+        if (
+            canonical_match_result == original_match_result
+            and storage_hit_length == ready_result.storage_hit_length
+        ):
+            return ready_result
         return LatchedPrefetchReadyResult(
             match_result=canonical_match_result,
             storage_hit_length=storage_hit_length,
