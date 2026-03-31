@@ -3006,7 +3006,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertIs(selected_node, host_parent)
         self.assertEqual(len(loading_values), 8)
 
-    def test_promote_loaded_host_visibility_upgrades_prefetch_visible_nodes(self):
+    def test_promote_loaded_host_visibility_clears_request_scoped_visibility_only(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
         class DummyAuthoritative:
@@ -3026,7 +3026,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
             promoted_node,
         )
 
-        self.assertEqual(cache.authoritative_host_visible_node_ids, {7, 8})
+        self.assertEqual(cache.authoritative_host_visible_node_ids, {7})
         self.assertEqual(cache.authoritative_prefetch_visible_node_ids, set())
         self.assertEqual(cleared, [8])
 

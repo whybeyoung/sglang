@@ -1529,8 +1529,6 @@ class HiRadixCache(RadixCache):
         if not getattr(self.authoritative_tree, "enabled", False):
             return
         for loaded_node in nodes_to_load:
-            if loaded_node.id in self.authoritative_prefetch_visible_node_ids:
-                self.authoritative_host_visible_node_ids.add(loaded_node.id)
             self.authoritative_prefetch_visible_node_ids.discard(loaded_node.id)
         self._clear_prefetch_ready_for_host_node(last_hit_node)
 
