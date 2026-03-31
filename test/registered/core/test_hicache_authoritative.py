@@ -102,6 +102,46 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertIsNone(ready_result)
         self.assertIn("rid-pop", cache.authoritative_prefetch_ready_by_reqid)
 
+    def test_pop_prefetch_ready_result_reuses_authoritative_latched_ready(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        ready_result = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64),
+                last_device_node=None,
+                last_host_node=types.SimpleNamespace(id=55),
+                host_hit_length=3712,
+            ),
+            storage_hit_length=3712,
+            input_len=3741,
+        )
+        cache.prefetch_ready_results_by_reqid = {"rid-latched": ready_result}
+        cache.authoritative_prefetch_ready_by_reqid = {
+            "rid-latched": AuthoritativePrefetchReadySummary(
+                req_id="rid-latched",
+                prefix_len=3712,
+                host_hit_length=3712,
+                storage_hit_length=3712,
+                input_len=3741,
+            ),
+        }
+        cache._clamp_ready_result_to_authoritative_summary = (
+            lambda req_id, result: result
+        )
+
+        class Tree:
+            enabled = True
+
+        cache.authoritative_tree = Tree()
+        req = types.SimpleNamespace(rid="rid-latched", fill_ids=list(range(3741)))
+
+        first = cache.pop_prefetch_ready_result("rid-latched", req=req)
+        second = cache.pop_prefetch_ready_result("rid-latched", req=req)
+
+        self.assertIs(first, ready_result)
+        self.assertIs(second, ready_result)
+        self.assertIn("rid-latched", cache.prefetch_ready_results_by_reqid)
+
     def test_hicache_clamps_match_result_with_authoritative_summary(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.authoritative_prefetch_ready_by_reqid = {
