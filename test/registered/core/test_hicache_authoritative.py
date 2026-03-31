@@ -2631,7 +2631,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
 
         self.assertTrue(cache.is_prefetch_ready_result_usable(ready))
 
-    def test_authoritative_live_match_is_device_only(self):
+    def test_authoritative_live_match_preserves_stable_host_visible_hit(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
         class DummyAuthoritative:
@@ -2642,6 +2642,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
         cache.page_size = 1
         cache.authoritative_tree = DummyAuthoritative()
         cache.pp_device_only_match_fallback = False
+        cache.authoritative_host_visible_node_ids = {11}
         cache._clamp_match_result_to_authoritative_summary = (
             lambda req_id, match_result, input_len=None: match_result
         )
@@ -2655,12 +2656,111 @@ class TestHiCacheAuthoritative(CustomTestCase):
             lambda pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
         )
         cache._match_prefix_helper = lambda node, key: ([torch.tensor([1, 2])], root)
-        cache._find_last_visible_host_ancestor = lambda node: "host-node"
+        cache._find_last_visible_host_ancestor = lambda node: node
 
         class Node:
-            evicted = True
-            parent = root
-            host_value = torch.tensor([10, 11])
+            def __init__(self):
+                self.id = 11
+                self.evicted = True
+                self.parent = root
+                self.host_value = torch.tensor([10, 11])
+
+        match_node = Node()
+        cache._match_prefix_helper = lambda node, key: ([torch.tensor([1, 2])], match_node)
+        cache._node_backup_visible = lambda node: True
+
+        result = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=[1, 2], extra_key=None),
+                req=None,
+                cow_mamba=False,
+            )
+        )
+
+        self.assertEqual(result.host_hit_length, 2)
+        self.assertIs(result.last_host_node, match_node)
+
+    def test_authoritative_live_match_preserves_backup_visible_hit(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        root = object()
+        cache.root_node = root
+        cache.page_size = 1
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.pp_device_only_match_fallback = False
+        cache.authoritative_backuped_node_ids = {21}
+        cache.authoritative_host_visible_node_ids = set()
+        cache._clamp_match_result_to_authoritative_summary = (
+            lambda req_id, match_result, input_len=None: match_result
+        )
+        cache._format_authoritative_resolution_stats = lambda: "none"
+        cache._format_host_insert_missing_segments = lambda req_id: "none"
+        cache._format_pending_backup_nodes = lambda: "none"
+        cache._format_match_authoritative_gates = (
+            lambda req_id, pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._format_match_clamp_delta = (
+            lambda pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._find_last_visible_host_ancestor = lambda node: node
+
+        class Node:
+            def __init__(self):
+                self.id = 21
+                self.evicted = True
+                self.parent = root
+                self.host_value = torch.tensor([10, 11])
+
+        match_node = Node()
+        cache._match_prefix_helper = lambda node, key: ([torch.tensor([1, 2])], match_node)
+        cache._node_backup_visible = lambda node: True
+
+        result = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=[1, 2], extra_key=None),
+                req=None,
+                cow_mamba=False,
+            )
+        )
+
+        self.assertEqual(result.host_hit_length, 2)
+        self.assertIs(result.last_host_node, match_node)
+
+    def test_authoritative_live_match_suppresses_prefetch_only_host_hit(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        root = object()
+        cache.root_node = root
+        cache.page_size = 1
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.pp_device_only_match_fallback = False
+        cache.authoritative_host_visible_node_ids = set()
+        cache._clamp_match_result_to_authoritative_summary = (
+            lambda req_id, match_result, input_len=None: match_result
+        )
+        cache._format_authoritative_resolution_stats = lambda: "none"
+        cache._format_host_insert_missing_segments = lambda req_id: "none"
+        cache._format_pending_backup_nodes = lambda: "none"
+        cache._format_match_authoritative_gates = (
+            lambda req_id, pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._format_match_clamp_delta = (
+            lambda pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._find_last_visible_host_ancestor = lambda node: node
+
+        class Node:
+            def __init__(self):
+                self.id = 12
+                self.evicted = True
+                self.parent = root
+                self.host_value = torch.tensor([10, 11])
 
         match_node = Node()
         cache._match_prefix_helper = lambda node, key: ([torch.tensor([1, 2])], match_node)

@@ -1435,6 +1435,13 @@ class HiRadixCache(RadixCache):
     def _node_backup_visible(self, node: TreeNode) -> bool:
         if not getattr(self.authoritative_tree, "enabled", False):
             return node.backuped
+        return node.id in self.authoritative_backuped_node_ids or self._node_stable_host_visible(
+            node
+        )
+
+    def _node_stable_host_visible(self, node: TreeNode) -> bool:
+        if not getattr(self.authoritative_tree, "enabled", False):
+            return node.backuped
         return (
             node.id in self.authoritative_backuped_node_ids
             or node.id in self.authoritative_host_visible_node_ids
@@ -3673,18 +3680,19 @@ class HiRadixCache(RadixCache):
                 host_hit_length=0,
                 mamba_branching_seqlen=match_result.mamba_branching_seqlen,
             )
-        if self.authoritative_tree.enabled:
-            # In PP authoritative mode, generic live_match must not derive host hits
-            # from per-rank local host/device state. Request-scoped ready/sticky
-            # snapshots can still drive load_back, but once we fall back to live
-            # match we only expose deterministic device-visible prefixes.
-            match_result = MatchResult(
-                device_indices=match_result.device_indices,
-                last_device_node=match_result.last_device_node,
-                last_host_node=match_result.last_device_node,
-                host_hit_length=0,
-                mamba_branching_seqlen=match_result.mamba_branching_seqlen,
-            )
+        if self.authoritative_tree.enabled and match_result.host_hit_length > 0:
+            # In PP authoritative mode, generic live_match may only expose host hits
+            # that come from globally stable host-visible state (for example,
+            # promoted backup-visible paths). Request-scoped prefetch-visible nodes
+            # are still excluded earlier via _node_backup_visible().
+            if not self._node_stable_host_visible(match_result.last_host_node):
+                match_result = MatchResult(
+                    device_indices=match_result.device_indices,
+                    last_device_node=match_result.last_device_node,
+                    last_host_node=match_result.last_device_node,
+                    host_hit_length=0,
+                    mamba_branching_seqlen=match_result.mamba_branching_seqlen,
+                )
         if self.pp_device_only_match_fallback:
             if match_result.host_hit_length > 0:
                 logger.warning_once(
