@@ -1761,6 +1761,50 @@ class HiRadixCache(RadixCache):
                 break
         return selected
 
+    def _select_last_host_node_within_hit_length(
+        self,
+        deepest_visible_host_node: Optional[TreeNode],
+        host_hit_length: int,
+        *,
+        include_prefetch_visible: bool = False,
+    ) -> TreeNode:
+        if (
+            deepest_visible_host_node is None
+            or deepest_visible_host_node == self.root_node
+            or host_hit_length <= 0
+        ):
+            return self.root_node
+
+        chain: list[TreeNode] = []
+        cursor = deepest_visible_host_node
+        while (
+            cursor is not None
+            and cursor != self.root_node
+            and cursor.evicted
+            and (
+                self._node_request_ready_visible(cursor)
+                if include_prefetch_visible
+                else self._node_backup_visible(cursor)
+            )
+        ):
+            chain.append(cursor)
+            cursor = cursor.parent
+
+        if not chain:
+            return self.root_node
+
+        accumulated = 0
+        selected = self.root_node
+        for node in reversed(chain):
+            node_len = len(node.host_value)
+            if accumulated + node_len > host_hit_length:
+                break
+            accumulated += node_len
+            selected = node
+            if accumulated == host_hit_length:
+                break
+        return selected
+
     def _visible_host_hit_length_to_node(
         self, node: Optional[TreeNode], *, include_prefetch_visible: bool = False
     ) -> int:
@@ -1993,16 +2037,13 @@ class HiRadixCache(RadixCache):
             else:
                 max_host_hit_length = max(max_ready_prefix_len - device_prefix_len, 0)
                 if canonical_match_result.host_hit_length > max_host_hit_length:
-                    capped_host_hit_length = min(
-                        max_host_hit_length,
-                        self._visible_host_hit_length_to_node(
-                            canonical_match_result.last_host_node,
-                            include_prefetch_visible=True,
-                        ),
-                    )
-                    capped_host_node = self._select_last_host_node_for_hit_length(
+                    capped_host_node = self._select_last_host_node_within_hit_length(
                         canonical_match_result.last_host_node,
-                        capped_host_hit_length,
+                        max_host_hit_length,
+                        include_prefetch_visible=True,
+                    )
+                    capped_host_hit_length = self._visible_host_hit_length_to_node(
+                        capped_host_node,
                         include_prefetch_visible=True,
                     )
                     canonical_match_result = MatchResult(
@@ -3175,7 +3216,14 @@ class HiRadixCache(RadixCache):
         host_hit_length: int,
         mem_quota: Optional[int] = None,
     ):
-        _ = host_hit_length  # unused, but kept for compatibility
+        load_back_node = last_node
+        if load_back_node.evicted and host_hit_length > 0:
+            load_back_node = self._select_last_host_node_within_hit_length(
+                load_back_node,
+                host_hit_length,
+                include_prefetch_visible=self.authoritative_tree.enabled,
+            )
+        last_node = load_back_node
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:

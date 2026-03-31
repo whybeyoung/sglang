@@ -2913,6 +2913,99 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(len(canonical.match_result.device_indices), 3)
         self.assertEqual(canonical.match_result.host_hit_length, 4)
 
+    def test_canonicalize_prefetch_ready_result_caps_host_hit_to_visible_boundary(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        root = types.SimpleNamespace(id=0)
+        device_node = types.SimpleNamespace(id=1)
+
+        class Node:
+            def __init__(self, node_id, parent, token_count):
+                self.id = node_id
+                self.evicted = True
+                self.parent = parent
+                self.host_value = torch.arange(token_count, dtype=torch.int64)
+
+            def get_last_hash_value(self):
+                return None
+
+        host_parent = Node(7, root, 8)
+        host_leaf = Node(8, host_parent, 2)
+        cache.root_node = root
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.authoritative_prefetch_ready_by_reqid = {}
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_prefetch_visible_node_ids = {7, 8}
+        cache._clamp_match_result_to_authoritative_summary = (
+            lambda req_id, ready_result, input_len=None, include_prefetch_visible=True: ready_result
+        )
+        cache.is_prefetch_ready_result_usable = lambda ready_result: True
+
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.arange(3, dtype=torch.int64),
+                last_device_node=device_node,
+                last_host_node=host_leaf,
+                host_hit_length=10,
+            ),
+            storage_hit_length=0,
+            input_len=12,
+        )
+
+        canonical = cache.canonicalize_prefetch_ready_result("rid", ready)
+
+        self.assertIsNotNone(canonical)
+        self.assertEqual(canonical.match_result.host_hit_length, 8)
+        self.assertIs(canonical.match_result.last_host_node, host_parent)
+
+    def test_init_load_back_respects_capped_host_hit_boundary(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        root = types.SimpleNamespace(id=0)
+
+        class Node:
+            def __init__(self, node_id, parent, token_count):
+                self.id = node_id
+                self.evicted = True
+                self.parent = parent
+                self.host_value = torch.arange(token_count, dtype=torch.int64)
+
+            def get_last_hash_value(self):
+                return None
+
+        host_parent = Node(7, root, 8)
+        host_leaf = Node(8, host_parent, 2)
+        cache.root_node = root
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_prefetch_visible_node_ids = {7, 8}
+
+        loaded_nodes = []
+
+        def fake_load_back(node, mem_quota=None):
+            loaded_nodes.append((node.id, mem_quota))
+            return torch.arange(len(node.host_value), dtype=torch.int64)
+
+        cache.load_back = fake_load_back
+
+        loading_values, selected_node = cache.init_load_back(
+            host_leaf,
+            host_hit_length=8,
+            mem_quota=123,
+        )
+
+        self.assertEqual(loaded_nodes, [(7, 123)])
+        self.assertIs(selected_node, host_parent)
+        self.assertEqual(len(loading_values), 8)
+
     def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
