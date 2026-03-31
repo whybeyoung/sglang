@@ -2671,16 +2671,38 @@ class HiRadixCache(RadixCache):
             num_evicted += self.cache_controller.evict_host(x.host_value)
             self._discard_authoritative_visibility(x)
 
+            parent = x.parent
+            if parent is None:
+                if x in self.evictable_host_leaves:
+                    self.evictable_host_leaves.remove(x)
+                self._unregister_authoritative_node(x)
+                continue
+
             key = self.get_child_key_fn(x.key)
-            v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
+            v = parent.children.get(key)
+            if v != x:
+                if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                    logger.warning(
+                        "[HiCacheMatchChain] evict_host stale leaf: node=%s parent=%s key=%s resolved=%s",
+                        getattr(x, "id", None),
+                        getattr(parent, "id", None),
+                        key,
+                        getattr(v, "id", None),
+                    )
+                if x in self.evictable_host_leaves:
+                    self.evictable_host_leaves.remove(x)
+                self._unregister_authoritative_node(x)
+                self._update_host_leaf_status(parent)
+                continue
+            parent.children.pop(key, None)
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
-            self._update_host_leaf_status(x.parent)
+            self._unregister_authoritative_node(x)
+            self._update_host_leaf_status(parent)
 
-            if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+            if len(parent.children) == 0 and parent.evicted:
+                new_priority = self.eviction_strategy.get_priority(parent)
+                heapq.heappush(eviction_heap, (new_priority, parent))
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -3479,6 +3501,11 @@ class HiRadixCache(RadixCache):
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
+        old_parent = child.parent
+        if child in self.evictable_host_leaves:
+            self.evictable_host_leaves.remove(child)
+        if old_parent in self.evictable_host_leaves:
+            self.evictable_host_leaves.remove(old_parent)
         child_backup_visible = getattr(child, "id", None) in getattr(
             self, "authoritative_backuped_node_ids", set()
         )
@@ -3514,6 +3541,10 @@ class HiRadixCache(RadixCache):
             self.authoritative_backuped_node_ids.add(new_node.id)
         if child_host_visible:
             self.authoritative_host_visible_node_ids.add(new_node.id)
+        self._update_host_leaf_status(child)
+        self._update_host_leaf_status(new_node)
+        if old_parent is not None:
+            self._update_host_leaf_status(old_parent)
         return new_node
 
     def insert(self, params: InsertParams) -> InsertResult:
