@@ -1522,6 +1522,17 @@ class HiRadixCache(RadixCache):
             self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
             self.authoritative_prefetch_loaded_tokens_by_reqid.pop(req_id, None)
 
+    def _promote_loaded_host_visibility(
+        self, nodes_to_load: list[TreeNode], last_hit_node: Optional[TreeNode]
+    ) -> None:
+        if not getattr(self.authoritative_tree, "enabled", False):
+            return
+        for loaded_node in nodes_to_load:
+            if loaded_node.id in self.authoritative_prefetch_visible_node_ids:
+                self.authoritative_host_visible_node_ids.add(loaded_node.id)
+            self.authoritative_prefetch_visible_node_ids.discard(loaded_node.id)
+        self._clear_prefetch_ready_for_host_node(last_hit_node)
+
     def get_authoritative_resolution_stats(self) -> dict[str, int]:
         return dict(self.authoritative_resolution_stats)
 
@@ -3184,12 +3195,7 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
         if self.authoritative_tree.enabled:
-            for loaded_node in nodes_to_load:
-                self.authoritative_host_visible_node_ids.discard(loaded_node.id)
-                self.authoritative_prefetch_visible_node_ids.discard(
-                    loaded_node.id
-                )
-            self._clear_prefetch_ready_for_host_node(last_hit_node)
+            self._promote_loaded_host_visibility(nodes_to_load, last_hit_node)
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(

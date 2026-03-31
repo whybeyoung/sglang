@@ -3006,6 +3006,30 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertIs(selected_node, host_parent)
         self.assertEqual(len(loading_values), 8)
 
+    def test_promote_loaded_host_visibility_upgrades_prefetch_visible_nodes(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.authoritative_host_visible_node_ids = {7}
+        cache.authoritative_prefetch_visible_node_ids = {7, 8}
+        cleared = []
+        cache._clear_prefetch_ready_for_host_node = lambda node: cleared.append(node.id)
+
+        stable_node = types.SimpleNamespace(id=7)
+        promoted_node = types.SimpleNamespace(id=8)
+
+        cache._promote_loaded_host_visibility(
+            [stable_node, promoted_node],
+            promoted_node,
+        )
+
+        self.assertEqual(cache.authoritative_host_visible_node_ids, {7, 8})
+        self.assertEqual(cache.authoritative_prefetch_visible_node_ids, set())
+        self.assertEqual(cleared, [8])
+
     def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
