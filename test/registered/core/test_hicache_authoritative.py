@@ -3030,6 +3030,21 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(cache.authoritative_prefetch_visible_node_ids, set())
         self.assertEqual(cleared, [8])
 
+    def test_stage_ready_visible_nodes_marks_local_visibility_immediately(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.authoritative_prefetch_visible_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+
+        ready_node = types.SimpleNamespace(id=7)
+        ready_node_2 = types.SimpleNamespace(id=8)
+
+        cache._stage_ready_visible_nodes(
+            [ready_node, ready_node_2],
+        )
+
+        self.assertEqual(cache.authoritative_prefetch_visible_node_ids, {7, 8})
+        self.assertEqual(cache.authoritative_host_visible_node_ids, set())
+
     def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
