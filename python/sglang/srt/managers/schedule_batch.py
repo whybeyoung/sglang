@@ -891,22 +891,41 @@ class Req(ReqDllmMixin):
                 pop_prefetch_ready_result = getattr(
                     tree_cache, "pop_prefetch_ready_result", None
                 )
+                is_prefetch_ready_result_usable = getattr(
+                    tree_cache, "is_prefetch_ready_result_usable", None
+                )
                 ready_result = None
                 if (
                     self._latched_hicache_ready_result is not None
                     and self._latched_hicache_ready_input_len == input_len
                 ):
-                    ready_result = self._latched_hicache_ready_result
-                    match_source = "latched_ready_sticky"
+                    candidate_ready = self._latched_hicache_ready_result
+                    if (
+                        is_prefetch_ready_result_usable is None
+                        or is_prefetch_ready_result_usable(candidate_ready)
+                    ):
+                        ready_result = candidate_ready
+                        match_source = "latched_ready_sticky"
+                    else:
+                        self.clear_latched_hicache_ready()
                 elif pop_prefetch_ready_result is not None:
-                    ready_result = pop_prefetch_ready_result(self.rid, req=self)
-                    if ready_result is not None:
-                        self._latched_hicache_ready_result = ready_result
+                    candidate_ready = pop_prefetch_ready_result(self.rid, req=self)
+                    if (
+                        candidate_ready is not None
+                        and (
+                            is_prefetch_ready_result_usable is None
+                            or is_prefetch_ready_result_usable(candidate_ready)
+                        )
+                    ):
+                        ready_result = candidate_ready
+                        self._latched_hicache_ready_result = candidate_ready
                         self._latched_hicache_ready_input_len = input_len
                         match_source = "latched_ready"
                 if ready_result is not None:
                     match_result = ready_result.match_result
                     self.storage_hit_length = ready_result.storage_hit_length
+                else:
+                    self.storage_hit_length = 0
             if match_result is None:
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(

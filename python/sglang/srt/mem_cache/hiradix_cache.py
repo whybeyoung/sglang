@@ -3129,6 +3129,20 @@ class HiRadixCache(RadixCache):
             )
         return ready_result
 
+    def is_prefetch_ready_result_usable(
+        self, ready_result: Optional[LatchedPrefetchReadyResult]
+    ) -> bool:
+        if ready_result is None:
+            return False
+        last_host_node = getattr(ready_result.match_result, "last_host_node", None)
+        if last_host_node is None:
+            return True
+        if not getattr(last_host_node, "evicted", False):
+            return False
+        if not self._node_backup_visible(last_host_node):
+            return False
+        return True
+
     def get_authoritative_prefetch_ready_summary(
         self, req_id: str
     ) -> Optional[AuthoritativePrefetchReadySummary]:
