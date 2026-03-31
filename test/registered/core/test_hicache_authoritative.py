@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.hicache_authoritative import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache, LatchedPrefetchReadyResult
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -227,6 +227,59 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertIsNone(ready_result)
         self.assertNotIn("rid-stale", cache.prefetch_ready_results_by_reqid)
         self.assertNotIn("rid-stale", cache.authoritative_prefetch_ready_by_reqid)
+
+    def test_prefetch_finalize_ready_preserves_recovered_prefix_lower_bound(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.page_size = 1
+        cache.device = torch.device("cpu")
+        cache.root_node = TreeNode(id=0)
+        cache.root_node.key = RadixKey([], None)
+        cache.root_node.parent = None
+        cache.key_match_fn = (
+            lambda key0, key1: sum(
+                1 for a, b in zip(key0.token_ids, key1.token_ids) if a == b
+            )
+        )
+        cache.get_child_key_fn = lambda key: key.token_ids[0]
+
+        child = TreeNode(id=40)
+        child.parent = cache.root_node
+        child.key = RadixKey([1, 2, 3, 4], None)
+        child.value = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+        child.host_value = None
+        cache.root_node.children[1] = child
+
+        cache._build_latched_prefetch_ready_result = (
+            lambda req, storage_hit_length: LatchedPrefetchReadyResult(
+                match_result=MatchResult(
+                    device_indices=torch.empty((0,), dtype=torch.int64),
+                    last_device_node=cache.root_node,
+                    last_host_node=cache.root_node,
+                    host_hit_length=0,
+                ),
+                storage_hit_length=storage_hit_length,
+                input_len=len(req.fill_ids),
+            )
+        )
+
+        req = types.SimpleNamespace(fill_ids=[1, 2, 3, 4, 5], return_logprob=False)
+
+        ready_result = cache._build_authoritative_ready_result_from_prefetch_finalize(
+            req,
+            anchor_node=cache.root_node,
+            fetched_token_ids=[1, 2, 3, 4],
+            fetched_hash_value=[],
+            committed_tokens=4,
+            matched_length=4,
+            storage_hit_length=4,
+        )
+
+        self.assertEqual(len(ready_result.match_result.device_indices), 4)
+        self.assertEqual(ready_result.match_result.host_hit_length, 0)
+        self.assertEqual(ready_result.storage_hit_length, 0)
+        self.assertEqual(
+            getattr(ready_result.match_result.last_device_node, "id", None), 40
+        )
 
     def test_clear_prefetch_ready_for_host_node_clears_matching_state(self):
         cache = HiRadixCache.__new__(HiRadixCache)

@@ -2460,6 +2460,75 @@ class HiRadixCache(RadixCache):
         # its own stricter hash validation elsewhere.
         return selected
 
+    def _recover_prefetch_committed_match_result(
+        self,
+        *,
+        anchor_node: TreeNode,
+        fetched_token_ids: List[int],
+        committed_tokens: int,
+    ) -> Optional[tuple[MatchResult, int]]:
+        if committed_tokens <= 0:
+            return None
+
+        path_nodes = self._find_exact_host_path_nodes(
+            anchor_node, fetched_token_ids[:committed_tokens]
+        )
+        if not path_nodes:
+            return None
+
+        device_chunks: list[torch.Tensor] = []
+        covered_tokens = 0
+        host_hit_length = 0
+        last_device_node = (
+            anchor_node if anchor_node is not None and not anchor_node.evicted else self.root_node
+        )
+        last_host_node = last_device_node
+        saw_host_segment = False
+
+        for node in path_nodes:
+            if covered_tokens >= committed_tokens:
+                break
+
+            segment_len = min(len(node.key), committed_tokens - covered_tokens)
+            if segment_len <= 0:
+                break
+
+            if node.evicted:
+                if len(node.host_value) == 0:
+                    break
+                saw_host_segment = True
+                host_hit_length += segment_len
+                last_host_node = node
+            else:
+                if saw_host_segment or node.value is None or len(node.value) < segment_len:
+                    break
+                device_chunks.append(node.value[:segment_len])
+                last_device_node = node
+                last_host_node = node
+
+            covered_tokens += segment_len
+
+        if covered_tokens == 0:
+            return None
+
+        if device_chunks:
+            device_indices = torch.cat(device_chunks)
+        else:
+            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        if host_hit_length == 0:
+            last_host_node = last_device_node
+
+        return (
+            MatchResult(
+                device_indices=device_indices,
+                last_device_node=last_device_node,
+                last_host_node=last_host_node,
+                host_hit_length=host_hit_length,
+            ),
+            covered_tokens,
+        )
+
     def _build_authoritative_ready_result_from_prefetch_finalize(
         self,
         req: Req,
@@ -2468,9 +2537,49 @@ class HiRadixCache(RadixCache):
         fetched_token_ids: List[int],
         fetched_hash_value: List[str],
         committed_tokens: int,
+        matched_length: int,
         storage_hit_length: int,
     ) -> LatchedPrefetchReadyResult:
         base_ready = self._build_latched_prefetch_ready_result(req, storage_hit_length)
+        base_prefix_len = (
+            len(base_ready.match_result.device_indices)
+            + base_ready.match_result.host_hit_length
+        )
+
+        recovered_full = self._recover_prefetch_committed_match_result(
+            anchor_node=anchor_node,
+            fetched_token_ids=fetched_token_ids,
+            committed_tokens=committed_tokens,
+        )
+        recovered_matched = None
+        if matched_length > 0 and matched_length < committed_tokens:
+            recovered_matched = self._recover_prefetch_committed_match_result(
+                anchor_node=anchor_node,
+                fetched_token_ids=fetched_token_ids,
+                committed_tokens=matched_length,
+            )
+        elif matched_length > 0:
+            recovered_matched = recovered_full
+
+        recovered_candidate = None
+        recovered_prefix_len = 0
+        for candidate in (recovered_full, recovered_matched):
+            if candidate is None:
+                continue
+            candidate_match_result, candidate_prefix_len = candidate
+            if candidate_prefix_len > recovered_prefix_len:
+                recovered_candidate = candidate_match_result
+                recovered_prefix_len = candidate_prefix_len
+
+        if recovered_candidate is not None and recovered_prefix_len >= max(
+            base_prefix_len, matched_length
+        ):
+            return LatchedPrefetchReadyResult(
+                match_result=recovered_candidate,
+                storage_hit_length=max(storage_hit_length - recovered_prefix_len, 0),
+                input_len=base_ready.input_len,
+            )
+
         host_nodes = self._recover_prefetch_committed_host_nodes(
             anchor_node=anchor_node,
             fetched_token_ids=fetched_token_ids,
@@ -3155,6 +3264,7 @@ class HiRadixCache(RadixCache):
                     fetched_token_ids=fetched_token_ids,
                     fetched_hash_value=hash_value[: min_completed_tokens // self.page_size],
                     committed_tokens=min_completed_tokens,
+                    matched_length=matched_length,
                     storage_hit_length=ready_storage_hit_length,
                 )
             else:
