@@ -1959,13 +1959,19 @@ class HiRadixCache(RadixCache):
             and len(canonical_match_result.device_indices) == 0
             and canonical_match_result.host_hit_length > 0
         ):
-            canonical_match_result = MatchResult(
-                device_indices=canonical_match_result.device_indices,
-                last_device_node=canonical_match_result.last_device_node,
-                last_host_node=canonical_match_result.last_device_node,
-                host_hit_length=0,
-                mamba_branching_seqlen=canonical_match_result.mamba_branching_seqlen,
+            candidate_ready = LatchedPrefetchReadyResult(
+                match_result=canonical_match_result,
+                storage_hit_length=storage_hit_length,
+                input_len=ready_result.input_len,
             )
+            if not self.is_prefetch_ready_result_usable(candidate_ready):
+                canonical_match_result = MatchResult(
+                    device_indices=canonical_match_result.device_indices,
+                    last_device_node=canonical_match_result.last_device_node,
+                    last_host_node=canonical_match_result.last_device_node,
+                    host_hit_length=0,
+                    mamba_branching_seqlen=canonical_match_result.mamba_branching_seqlen,
+                )
         if (
             canonical_match_result == original_match_result
             and storage_hit_length == ready_result.storage_hit_length
