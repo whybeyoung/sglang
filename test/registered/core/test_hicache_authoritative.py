@@ -188,6 +188,46 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertIs(second, ready_result)
         self.assertIn("rid-latched", cache.prefetch_ready_results_by_reqid)
 
+    def test_pop_prefetch_ready_result_drops_stale_generation_before_lookup(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        stale_ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64),
+                last_device_node=None,
+                last_host_node=None,
+                host_hit_length=1,
+            ),
+            storage_hit_length=64,
+            input_len=100,
+        )
+        cache.prefetch_ready_results_by_reqid = {"rid-stale": stale_ready}
+        cache.authoritative_prefetch_ready_by_reqid = {
+            "rid-stale": AuthoritativePrefetchReadySummary(
+                req_id="rid-stale",
+                prefix_len=64,
+                host_hit_length=64,
+                storage_hit_length=64,
+                input_len=100,
+            )
+        }
+        cache._clamp_ready_result_to_authoritative_summary = (
+            lambda req_id, result: result
+        )
+
+        class Tree:
+            enabled = True
+
+        cache.authoritative_tree = Tree()
+        cache.build_authoritative_prefetch_ready_result = lambda req: None
+
+        req = types.SimpleNamespace(rid="rid-stale", fill_ids=list(range(120)))
+        ready_result = cache.pop_prefetch_ready_result("rid-stale", req=req)
+
+        self.assertIsNone(ready_result)
+        self.assertNotIn("rid-stale", cache.prefetch_ready_results_by_reqid)
+        self.assertNotIn("rid-stale", cache.authoritative_prefetch_ready_by_reqid)
+
     def test_clear_prefetch_ready_for_host_node_clears_matching_state(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         host_node = types.SimpleNamespace(

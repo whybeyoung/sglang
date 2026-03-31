@@ -3164,6 +3164,31 @@ class HiRadixCache(RadixCache):
             req_id, local_loaded
         )
 
+    def _drop_stale_prefetch_ready_state(
+        self, req_id: str, *, input_len: Optional[int]
+    ) -> None:
+        if input_len is None:
+            return
+        ready_result = self.prefetch_ready_results_by_reqid.get(req_id)
+        if ready_result is not None and ready_result.input_len not in (None, input_len):
+            self.prefetch_ready_results_by_reqid.pop(req_id, None)
+        summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
+        if summary is not None and summary.input_len not in (None, input_len):
+            self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
+
+    def _lookup_prefetch_ready_result(
+        self, req_id: str, *, req: Optional[Req] = None
+    ) -> Optional[LatchedPrefetchReadyResult]:
+        input_len = len(req.fill_ids) if req is not None else None
+        self._drop_stale_prefetch_ready_state(req_id, input_len=input_len)
+        ready_result = self.prefetch_ready_results_by_reqid.get(req_id)
+        ready_result = self._clamp_ready_result_to_authoritative_summary(
+            req_id, ready_result
+        )
+        if ready_result is None and self.authoritative_tree.enabled and req is not None:
+            ready_result = self.build_authoritative_prefetch_ready_result(req)
+        return ready_result
+
     def pop_prefetch_ready_result(
         self, req_id: str, req: Optional[Req] = None
     ) -> Optional[LatchedPrefetchReadyResult]:
@@ -3173,22 +3198,11 @@ class HiRadixCache(RadixCache):
             self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
             return None
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
-        ready_result: Optional[LatchedPrefetchReadyResult] = None
-        if self.authoritative_tree.enabled and req is not None:
-            # Req now keeps its own sticky ready snapshot across retries. Once a
-            # rank consumes the tree-level latched result, pop it so it cannot be
-            # revived repeatedly after the request-local sticky state is cleared.
-            ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
-            ready_result = self._clamp_ready_result_to_authoritative_summary(
-                req_id, ready_result
-            )
-            if ready_result is None:
-                ready_result = self.build_authoritative_prefetch_ready_result(req)
-        else:
-            ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
-            ready_result = self._clamp_ready_result_to_authoritative_summary(
-                req_id, ready_result
-            )
+        # The ready result must behave like an L1-only replayable state snapshot:
+        # repeated queries for the same request/input generation should resolve to
+        # the same answer on every PP stage until the request advances or cleanup
+        # explicitly invalidates the snapshot.
+        ready_result = self._lookup_prefetch_ready_result(req_id, req=req)
         if (
             ready_result is not None
             and os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1"
