@@ -79,6 +79,52 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(req.host_hit_length, 1)
         self.assertEqual(req.storage_hit_length, 1)
 
+    def test_req_consumes_latched_hicache_ready_once_per_input_len(self):
+        req = Req(
+            rid="rid-1b",
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3, 4],
+            sampling_params=None,
+        )
+        req.fill_ids = [1, 2, 3, 4]
+        req.output_ids = []
+        req.return_logprob = False
+        req.logprob_start_len = -1
+
+        class DummyTreeCache:
+            def __init__(self):
+                self.calls = 0
+
+            def supports_mamba(self):
+                return False
+
+            def pop_prefetch_ready_result(self, _rid, req=None):
+                assert req is not None
+                self.calls += 1
+                return LatchedPrefetchReadyResult(
+                    match_result=MatchResult(
+                        device_indices=torch.empty((0,), dtype=torch.int64),
+                        last_device_node=None,
+                        last_host_node=None,
+                        host_hit_length=1,
+                    ),
+                    storage_hit_length=1,
+                )
+
+            def match_prefix(self, params):
+                return MatchResult(
+                    device_indices=torch.empty((0,), dtype=torch.int64),
+                    last_device_node=None,
+                    last_host_node=None,
+                    host_hit_length=0,
+                )
+
+        cache = DummyTreeCache()
+        req.init_next_round_input(cache, use_latched_hicache_result=True)
+        req.init_next_round_input(cache, use_latched_hicache_result=True)
+
+        self.assertEqual(cache.calls, 1)
+
     def test_pop_prefetch_ready_result_keeps_authoritative_summary_on_miss(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.prefetch_loaded_tokens_by_reqid = {}

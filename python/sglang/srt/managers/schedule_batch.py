@@ -647,6 +647,9 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Avoid re-consuming the same latched HiCache ready snapshot on every
+        # scheduler retry for an unchanged request input.
+        self._latched_hicache_consumed_input_len: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -870,6 +873,8 @@ class Req(ReqDllmMixin):
             self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
+        if self._latched_hicache_consumed_input_len != input_len:
+            self._latched_hicache_consumed_input_len = None
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
@@ -884,12 +889,16 @@ class Req(ReqDllmMixin):
                 pop_prefetch_ready_result = getattr(
                     tree_cache, "pop_prefetch_ready_result", None
                 )
-                if pop_prefetch_ready_result is not None:
+                if (
+                    pop_prefetch_ready_result is not None
+                    and self._latched_hicache_consumed_input_len is None
+                ):
                     ready_result = pop_prefetch_ready_result(self.rid, req=self)
                     if ready_result is not None:
                         match_result = ready_result.match_result
                         self.storage_hit_length = ready_result.storage_hit_length
                         match_source = "latched_ready"
+                        self._latched_hicache_consumed_input_len = input_len
             if match_result is None:
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
