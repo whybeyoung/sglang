@@ -434,6 +434,16 @@ class HiRadixCache(RadixCache):
                     op.payload.get("loaded_from_storage", 0)
                 )
                 self._clear_host_insert_rebuild_blueprint(req_id)
+            ready_visible_nodes: list[TreeNode] = []
+            for node_ref in op.payload.get("ready_visible_node_refs") or []:
+                node = self._resolve_authoritative_node_ref(node_ref=node_ref)
+                if node is not None:
+                    ready_visible_nodes.append(node)
+            if ready_visible_nodes:
+                for node in ready_visible_nodes:
+                    self.authoritative_prefetch_visible_node_ids.add(node.id)
+                self._record_authoritative_resolution("host_insert.ready_visible")
+                return
             resolved_nodes: list[TreeNode] = []
             node_refs = op.payload.get("node_refs")
             if node_refs is None:
@@ -465,39 +475,16 @@ class HiRadixCache(RadixCache):
             else:
                 if resolved_nodes:
                     self._record_authoritative_resolution("host_insert.partial_mismatch")
-                recovered_nodes = self._recover_host_insert_visible_nodes_from_payload(
-                    op.payload
-                )
-                if recovered_nodes:
-                    self._record_authoritative_resolution(
-                        "host_insert.payload_recover"
+                self._record_authoritative_resolution("host_insert.unresolved")
+                if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                    logger.warning(
+                        "[HiCacheAuthoritative] unresolved HOST_INSERT visible chain: "
+                        "rid=%s pp=%s cp=%s tp=%s",
+                        req_id,
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        getattr(self.cache_controller, "tp_rank", None),
                     )
-                    if req_id is not None:
-                        self._clear_host_insert_rebuild_blueprint(req_id)
-                else:
-                    repaired = self._repair_host_insert_subtree_from_payload(
-                        op.payload
-                    )
-                    if repaired:
-                        self._record_authoritative_resolution(
-                            "host_insert.payload_repair"
-                        )
-                        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
-                            logger.warning(
-                                "[HiCacheAuthoritative] repaired HOST_INSERT subtree: "
-                                "rid=%s pp=%s cp=%s tp=%s",
-                                req_id,
-                                self.pp_rank,
-                                self.attn_cp_rank,
-                                getattr(self.cache_controller, "tp_rank", None),
-                            )
-                        self._stage_host_insert_rebuild_blueprint(op.payload)
-                    else:
-                        self._record_authoritative_resolution(
-                            "host_insert.unresolved"
-                        )
-                for node in recovered_nodes:
-                    self.authoritative_prefetch_visible_node_ids.add(node.id)
             return
         if op.op_type == "HOST_EVICT":
             node_refs = op.payload.get("node_refs")
@@ -1799,6 +1786,7 @@ class HiRadixCache(RadixCache):
         loaded_from_storage: int,
         matched_length: int,
         committed_tokens: int,
+        ready_visible_nodes: Optional[list[TreeNode]] = None,
     ) -> dict[str, object]:
         return {
             "req_id": req_id,
@@ -1812,7 +1800,40 @@ class HiRadixCache(RadixCache):
             "node_refs": [
                 self._make_authoritative_node_ref(node) for node in inserted_nodes
             ],
+            "ready_visible_node_refs": [
+                self._make_authoritative_node_ref(node)
+                for node in (ready_visible_nodes or [])
+            ],
         }
+
+    def _collect_request_ready_visible_nodes(
+        self, ready_result: Optional[LatchedPrefetchReadyResult]
+    ) -> list[TreeNode]:
+        if ready_result is None:
+            return []
+        host_hit_length = getattr(ready_result.match_result, "host_hit_length", 0)
+        if host_hit_length <= 0:
+            return []
+        node = getattr(ready_result.match_result, "last_host_node", None)
+        if node is None or node == self.root_node:
+            return []
+        selected: list[TreeNode] = []
+        covered = 0
+        cursor = node
+        while (
+            cursor is not None
+            and cursor != self.root_node
+            and cursor.evicted
+            and len(cursor.host_value) > 0
+            and covered < host_hit_length
+        ):
+            selected.append(cursor)
+            covered += len(cursor.host_value)
+            cursor = cursor.parent
+        if covered < host_hit_length:
+            return []
+        selected.reverse()
+        return selected
 
     def _clamp_ready_result_to_authoritative_summary(
         self,
@@ -3300,20 +3321,7 @@ class HiRadixCache(RadixCache):
         )
         self.prefetch_revoked_rids.discard(req_id)
         self.prefetch_revoked_token_counts.pop(req_id, None)
-        self.queue_authoritative_tree_op(
-            "HOST_INSERT_FROM_STORAGE",
-            **self._build_host_insert_from_storage_payload(
-                req_id=req_id,
-                anchor_node=last_host_node,
-                fetched_token_ids=fetched_token_ids,
-                fetched_hash_value=hash_value[: min_completed_tokens // self.page_size],
-                inserted_nodes=inserted_nodes,
-                loaded_from_storage=loaded_from_storage,
-                matched_length=matched_length,
-                committed_tokens=min_completed_tokens,
-            ),
-        )
-        self.prefetch_loaded_tokens_by_reqid[req_id] = ready_storage_hit_length
+        ready_result: Optional[LatchedPrefetchReadyResult] = None
         if req is not None:
             if self.authoritative_tree.enabled:
                 ready_result = self._build_authoritative_ready_result_from_prefetch_finalize(
@@ -3330,6 +3338,23 @@ class HiRadixCache(RadixCache):
                     req, loaded_from_storage
                 )
             ready_result = self.canonicalize_prefetch_ready_result(req_id, ready_result)
+        ready_visible_nodes = self._collect_request_ready_visible_nodes(ready_result)
+        self.queue_authoritative_tree_op(
+            "HOST_INSERT_FROM_STORAGE",
+            **self._build_host_insert_from_storage_payload(
+                req_id=req_id,
+                anchor_node=last_host_node,
+                fetched_token_ids=fetched_token_ids,
+                fetched_hash_value=hash_value[: min_completed_tokens // self.page_size],
+                inserted_nodes=inserted_nodes,
+                loaded_from_storage=loaded_from_storage,
+                matched_length=matched_length,
+                committed_tokens=min_completed_tokens,
+                ready_visible_nodes=ready_visible_nodes,
+            ),
+        )
+        self.prefetch_loaded_tokens_by_reqid[req_id] = ready_storage_hit_length
+        if ready_result is not None:
             self.queue_authoritative_tree_op(
                 "PREFETCH_READY_SUMMARY",
                 req_id=req_id,
