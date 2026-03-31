@@ -295,6 +295,10 @@ class HiRadixCache(RadixCache):
         self._authoritative_last_hash_by_node_id: dict[int, str] = {}
         # track requests whose prefetch was skipped (alloc failure, threshold, rate limit)
         self.prefetch_skipped_rids: set[str] = set()
+        # track requests whose prefetch was explicitly revoked for too-few hits.
+        # In PP authoritative mode, these requests should not let a tiny
+        # rank-local live_match residue steer chunking differently across stages.
+        self.prefetch_revoked_rids: set[str] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -2279,6 +2283,7 @@ class HiRadixCache(RadixCache):
                 self.authoritative_prefetch_loaded_tokens_by_reqid.pop(req_id, None)
                 self._clear_host_insert_rebuild_blueprint(req_id)
                 self.prefetch_skipped_rids.discard(req_id)
+                self.prefetch_revoked_rids.add(req_id)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
                     if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
@@ -3268,6 +3273,7 @@ class HiRadixCache(RadixCache):
         ready_storage_hit_length = (
             min_completed_tokens if self.authoritative_tree.enabled else loaded_from_storage
         )
+        self.prefetch_revoked_rids.discard(req_id)
         self.queue_authoritative_tree_op(
             "HOST_INSERT_FROM_STORAGE",
             **self._build_host_insert_from_storage_payload(
@@ -3503,6 +3509,18 @@ class HiRadixCache(RadixCache):
         (host alloc failure, below threshold, or rate-limited)."""
         return req_id in self.prefetch_skipped_rids
 
+    def _should_suppress_revoked_live_match(
+        self, req: Optional[Req], match_result: MatchResult
+    ) -> bool:
+        if req is None or not self.authoritative_tree.enabled:
+            return False
+        if req.rid not in self.prefetch_revoked_rids:
+            return False
+        if getattr(req, "is_chunked", 0) > 0:
+            return False
+        device_hit = len(match_result.device_indices)
+        return 0 < device_hit < self.prefetch_threshold
+
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         req_id = params.req.rid if params.req is not None else None
@@ -3551,6 +3569,14 @@ class HiRadixCache(RadixCache):
             match_result,
             input_len=(len(params.req.fill_ids) if params.req is not None else None),
         )
+        if self._should_suppress_revoked_live_match(params.req, match_result):
+            match_result = MatchResult(
+                device_indices=empty_value,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                host_hit_length=0,
+                mamba_branching_seqlen=match_result.mamba_branching_seqlen,
+            )
         if self.authoritative_tree.enabled:
             # In PP authoritative mode, generic live_match must not derive host hits
             # from per-rank local host/device state. Request-scoped ready/sticky
@@ -3637,6 +3663,7 @@ class HiRadixCache(RadixCache):
             or self.cache_controller.prefetch_rate_limited()
         ):
             self.prefetch_skipped_rids.add(req_id)
+            self.prefetch_revoked_rids.discard(req_id)
             return
 
         last_host_node.protect_host()
@@ -3647,8 +3674,10 @@ class HiRadixCache(RadixCache):
         if host_indices is None:
             last_host_node.release_host()
             self.prefetch_skipped_rids.add(req_id)
+            self.prefetch_revoked_rids.discard(req_id)
             return
         self.prefetch_skipped_rids.discard(req_id)
+        self.prefetch_revoked_rids.discard(req_id)
         prefetch_transfers = self.nsa_prefetch_transfers()
         if prefetch_transfers:
             operation = self.cache_controller.prefetch(
@@ -3949,6 +3978,7 @@ class HiRadixCache(RadixCache):
         self.authoritative_prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self._clear_host_insert_rebuild_blueprint(rid)
         self.prefetch_skipped_rids.discard(rid)
+        self.prefetch_revoked_rids.discard(rid)
 
         if rid not in self.ongoing_prefetch:
             return
