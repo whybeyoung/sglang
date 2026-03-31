@@ -445,10 +445,10 @@ class HiRadixCache(RadixCache):
                 if node is not None:
                     stable_visible_nodes.append(node)
             if ready_visible_nodes:
-                for node in ready_visible_nodes:
-                    self.authoritative_prefetch_visible_node_ids.add(node.id)
-                for node in stable_visible_nodes:
-                    self.authoritative_host_visible_node_ids.add(node.id)
+                self._stage_ready_visible_nodes(
+                    ready_visible_nodes,
+                    stable_visible_nodes=stable_visible_nodes,
+                )
                 self._record_authoritative_resolution("host_insert.ready_visible")
                 if stable_visible_nodes:
                     self._record_authoritative_resolution("host_insert.ready_promote")
@@ -1541,6 +1541,17 @@ class HiRadixCache(RadixCache):
                 self.authoritative_host_visible_node_ids.add(loaded_node.id)
             self.authoritative_prefetch_visible_node_ids.discard(loaded_node.id)
         self._clear_prefetch_ready_for_host_node(last_hit_node)
+
+    def _stage_ready_visible_nodes(
+        self,
+        ready_visible_nodes: list[TreeNode],
+        *,
+        stable_visible_nodes: Optional[list[TreeNode]] = None,
+    ) -> None:
+        for node in ready_visible_nodes:
+            self.authoritative_prefetch_visible_node_ids.add(node.id)
+        for node in stable_visible_nodes or []:
+            self.authoritative_host_visible_node_ids.add(node.id)
 
     def get_authoritative_resolution_stats(self) -> dict[str, int]:
         return dict(self.authoritative_resolution_stats)
@@ -3475,6 +3486,11 @@ class HiRadixCache(RadixCache):
             ready_result,
             matched_length=matched_length,
         )
+        if self.authoritative_tree.enabled and ready_visible_nodes:
+            self._stage_ready_visible_nodes(
+                ready_visible_nodes,
+                stable_visible_nodes=stable_visible_nodes,
+            )
         self.queue_authoritative_tree_op(
             "HOST_INSERT_FROM_STORAGE",
             **self._build_host_insert_from_storage_payload(
