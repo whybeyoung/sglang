@@ -3517,7 +3517,11 @@ class HiRadixCache(RadixCache):
     def _should_suppress_revoked_live_match(
         self, req: Optional[Req], match_result: MatchResult
     ) -> bool:
-        if req is None or not self.authoritative_tree.enabled:
+        if req is None:
+            return False
+        if not (
+            self.authoritative_tree.enabled or self.pp_device_only_match_fallback
+        ):
             return False
         if req.rid not in self.prefetch_revoked_rids:
             return False
