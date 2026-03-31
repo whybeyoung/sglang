@@ -1457,6 +1457,48 @@ class HiRadixCache(RadixCache):
             self.authoritative_resolution_stats.get(name, 0) + 1
         )
 
+    def _clear_prefetch_ready_for_host_node(self, host_node: Optional[TreeNode]) -> None:
+        if host_node is None:
+            return
+        host_node_id = getattr(host_node, "id", None)
+        host_node_hash = (
+            host_node.get_last_hash_value()
+            if hasattr(host_node, "get_last_hash_value")
+            else None
+        )
+        if host_node_id is None and host_node_hash is None:
+            return
+
+        req_ids_to_clear: set[str] = set()
+        for req_id, ready_result in self.prefetch_ready_results_by_reqid.items():
+            last_host_node = getattr(ready_result.match_result, "last_host_node", None)
+            if last_host_node is None:
+                continue
+            if getattr(last_host_node, "id", None) == host_node_id:
+                req_ids_to_clear.add(req_id)
+                continue
+            if (
+                host_node_hash is not None
+                and hasattr(last_host_node, "get_last_hash_value")
+                and last_host_node.get_last_hash_value() == host_node_hash
+            ):
+                req_ids_to_clear.add(req_id)
+
+        for req_id, summary in self.authoritative_prefetch_ready_by_reqid.items():
+            node_ref = getattr(summary, "last_host_node_ref", None)
+            if node_ref is None:
+                continue
+            if node_ref.get("node_id") == host_node_id or (
+                host_node_hash is not None and node_ref.get("last_hash") == host_node_hash
+            ):
+                req_ids_to_clear.add(req_id)
+
+        for req_id in req_ids_to_clear:
+            self.prefetch_ready_results_by_reqid.pop(req_id, None)
+            self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
+            self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+            self.authoritative_prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+
     def get_authoritative_resolution_stats(self) -> dict[str, int]:
         return dict(self.authoritative_resolution_stats)
 
@@ -2721,6 +2763,7 @@ class HiRadixCache(RadixCache):
         if self.authoritative_tree.enabled:
             for loaded_node in nodes_to_load:
                 self.authoritative_host_visible_node_ids.discard(loaded_node.id)
+            self._clear_prefetch_ready_for_host_node(last_hit_node)
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(

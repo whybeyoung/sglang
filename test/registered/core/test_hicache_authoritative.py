@@ -142,6 +142,43 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertIs(second, ready_result)
         self.assertIn("rid-latched", cache.prefetch_ready_results_by_reqid)
 
+    def test_clear_prefetch_ready_for_host_node_clears_matching_state(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        host_node = types.SimpleNamespace(
+            id=184, get_last_hash_value=lambda: "hash-184"
+        )
+        cache.prefetch_ready_results_by_reqid = {
+            "rid-a": LatchedPrefetchReadyResult(
+                match_result=MatchResult(
+                    device_indices=torch.empty((0,), dtype=torch.int64),
+                    last_device_node=None,
+                    last_host_node=host_node,
+                    host_hit_length=3712,
+                ),
+                storage_hit_length=3712,
+                input_len=3741,
+            )
+        }
+        cache.authoritative_prefetch_ready_by_reqid = {
+            "rid-a": AuthoritativePrefetchReadySummary(
+                req_id="rid-a",
+                prefix_len=3712,
+                host_hit_length=3712,
+                storage_hit_length=3712,
+                input_len=3741,
+                last_host_node_ref={"node_id": 184, "last_hash": "hash-184"},
+            )
+        }
+        cache.prefetch_loaded_tokens_by_reqid = {"rid-a": 3712}
+        cache.authoritative_prefetch_loaded_tokens_by_reqid = {"rid-a": 3712}
+
+        cache._clear_prefetch_ready_for_host_node(host_node)
+
+        self.assertEqual(cache.prefetch_ready_results_by_reqid, {})
+        self.assertEqual(cache.authoritative_prefetch_ready_by_reqid, {})
+        self.assertEqual(cache.prefetch_loaded_tokens_by_reqid, {})
+        self.assertEqual(cache.authoritative_prefetch_loaded_tokens_by_reqid, {})
+
     def test_hicache_clamps_match_result_with_authoritative_summary(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.authoritative_prefetch_ready_by_reqid = {
