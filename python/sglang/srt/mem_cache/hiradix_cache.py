@@ -439,10 +439,19 @@ class HiRadixCache(RadixCache):
                 node = self._resolve_authoritative_node_ref(node_ref=node_ref)
                 if node is not None:
                     ready_visible_nodes.append(node)
+            stable_visible_nodes: list[TreeNode] = []
+            for node_ref in op.payload.get("stable_visible_node_refs") or []:
+                node = self._resolve_authoritative_node_ref(node_ref=node_ref)
+                if node is not None:
+                    stable_visible_nodes.append(node)
             if ready_visible_nodes:
                 for node in ready_visible_nodes:
                     self.authoritative_prefetch_visible_node_ids.add(node.id)
+                for node in stable_visible_nodes:
+                    self.authoritative_host_visible_node_ids.add(node.id)
                 self._record_authoritative_resolution("host_insert.ready_visible")
+                if stable_visible_nodes:
+                    self._record_authoritative_resolution("host_insert.ready_promote")
                 return
             resolved_nodes: list[TreeNode] = []
             node_refs = op.payload.get("node_refs")
@@ -1849,6 +1858,7 @@ class HiRadixCache(RadixCache):
         matched_length: int,
         committed_tokens: int,
         ready_visible_nodes: Optional[list[TreeNode]] = None,
+        stable_visible_nodes: Optional[list[TreeNode]] = None,
     ) -> dict[str, object]:
         return {
             "req_id": req_id,
@@ -1865,6 +1875,10 @@ class HiRadixCache(RadixCache):
             "ready_visible_node_refs": [
                 self._make_authoritative_node_ref(node)
                 for node in (ready_visible_nodes or [])
+            ],
+            "stable_visible_node_refs": [
+                self._make_authoritative_node_ref(node)
+                for node in (stable_visible_nodes or [])
             ],
         }
 
@@ -3435,6 +3449,14 @@ class HiRadixCache(RadixCache):
                 )
             ready_result = self.canonicalize_prefetch_ready_result(req_id, ready_result)
         ready_visible_nodes = self._collect_request_ready_visible_nodes(ready_result)
+        stable_visible_nodes: list[TreeNode] = []
+        if (
+            self.authoritative_tree.enabled
+            and ready_result is not None
+            and ready_result.storage_hit_length == 0
+            and self.is_prefetch_ready_result_usable(ready_result)
+        ):
+            stable_visible_nodes = list(ready_visible_nodes)
         self.queue_authoritative_tree_op(
             "HOST_INSERT_FROM_STORAGE",
             **self._build_host_insert_from_storage_payload(
@@ -3447,6 +3469,7 @@ class HiRadixCache(RadixCache):
                 matched_length=matched_length,
                 committed_tokens=min_completed_tokens,
                 ready_visible_nodes=ready_visible_nodes,
+                stable_visible_nodes=stable_visible_nodes,
             ),
         )
         self.prefetch_loaded_tokens_by_reqid[req_id] = ready_storage_hit_length

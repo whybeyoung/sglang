@@ -594,6 +594,51 @@ class TestHiCacheAuthoritative(CustomTestCase):
             cache.authoritative_resolution_stats["host_insert.ready_visible"], 1
         )
 
+    def test_host_insert_from_storage_promotes_stable_visible_chain(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.authoritative_resolution_stats = {}
+        cache.authoritative_prefetch_loaded_tokens_by_reqid = {}
+        cache.authoritative_pending_backup_node_ids = set()
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = set()
+        cache.authoritative_prefetch_visible_node_ids = set()
+        cache._clear_host_insert_rebuild_blueprint = lambda req_id: None
+        node_a = types.SimpleNamespace(id=11)
+        node_b = types.SimpleNamespace(id=12)
+
+        def resolve(node_ref=None, node_id=None, last_hash=None):
+            ref = node_ref or {"node_id": node_id, "last_hash": last_hash}
+            if ref.get("node_id") == 11:
+                return node_a
+            if ref.get("node_id") == 12:
+                return node_b
+            return None
+
+        cache._resolve_authoritative_node_ref = resolve
+
+        class Op:
+            op_type = "HOST_INSERT_FROM_STORAGE"
+            payload = {
+                "req_id": "rid-4b",
+                "loaded_from_storage": 0,
+                "ready_visible_node_refs": [
+                    {"node_id": 11, "last_hash": None},
+                    {"node_id": 12, "last_hash": None},
+                ],
+                "stable_visible_node_refs": [
+                    {"node_id": 12, "last_hash": None},
+                ],
+            }
+            op_seq = 1
+
+        cache.apply_authoritative_tree_op(Op())
+
+        self.assertEqual(cache.authoritative_prefetch_visible_node_ids, {11, 12})
+        self.assertEqual(cache.authoritative_host_visible_node_ids, {12})
+        self.assertEqual(
+            cache.authoritative_resolution_stats["host_insert.ready_promote"], 1
+        )
+
     def test_build_host_insert_payload_carries_ready_visible_node_refs(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache._make_authoritative_node_ref = (
@@ -626,6 +671,36 @@ class TestHiCacheAuthoritative(CustomTestCase):
                 {"node_id": 21, "last_hash": "h21"},
                 {"node_id": 22, "last_hash": "h22"},
             ],
+        )
+
+    def test_build_host_insert_payload_carries_stable_visible_node_refs(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache._make_authoritative_node_ref = (
+            lambda node: None
+            if node is None
+            else {"node_id": node.id, "last_hash": getattr(node, "last_hash", None)}
+        )
+        anchor = types.SimpleNamespace(id=10, last_hash="h10")
+        inserted = [types.SimpleNamespace(id=11, last_hash="h11")]
+        ready_visible = [types.SimpleNamespace(id=21, last_hash="h21")]
+        stable_visible = [types.SimpleNamespace(id=31, last_hash="h31")]
+
+        payload = cache._build_host_insert_from_storage_payload(
+            req_id="rid-4c",
+            anchor_node=anchor,
+            fetched_token_ids=[1, 2, 3],
+            fetched_hash_value=["p0", "p1", "p2"],
+            inserted_nodes=inserted,
+            loaded_from_storage=0,
+            matched_length=3,
+            committed_tokens=3,
+            ready_visible_nodes=ready_visible,
+            stable_visible_nodes=stable_visible,
+        )
+
+        self.assertEqual(
+            payload["stable_visible_node_refs"],
+            [{"node_id": 31, "last_hash": "h31"}],
         )
 
     def test_host_backup_commit_stages_pending_visibility_first(self):
