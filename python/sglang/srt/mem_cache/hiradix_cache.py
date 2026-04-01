@@ -3842,6 +3842,21 @@ class HiRadixCache(RadixCache):
             in getattr(self, "authoritative_host_visible_boundary_keys", set())
         )
 
+    def _node_matches_authoritative_backup_boundary(
+        self, node: Optional[TreeNode]
+    ) -> bool:
+        if node is None or node == self.root_node:
+            return False
+        boundary_key = self._make_authoritative_boundary_key(node)
+        if getattr(node, "id", None) in getattr(
+            self, "authoritative_backuped_node_ids", set()
+        ):
+            return True
+        return (
+            boundary_key is not None
+            and boundary_key in getattr(self, "authoritative_backuped_boundary_keys", set())
+        )
+
     def _should_suppress_revoked_live_match(
         self, req: Optional[Req], match_result: MatchResult
     ) -> bool:
@@ -3858,9 +3873,9 @@ class HiRadixCache(RadixCache):
         device_hit = len(match_result.device_indices)
         if device_hit <= 0:
             return False
-        if self._node_matches_stable_authoritative_boundary(
+        if self._node_matches_authoritative_backup_boundary(
             getattr(match_result, "last_device_node", None)
-        ) or self._node_matches_stable_authoritative_boundary(
+        ) or self._node_matches_authoritative_backup_boundary(
             getattr(match_result, "last_host_node", None)
         ):
             return False
