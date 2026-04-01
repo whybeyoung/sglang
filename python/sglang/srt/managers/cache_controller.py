@@ -810,10 +810,16 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_pools: Optional[List[object]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
+        # HiRadixCache already threads extra pool-transfer metadata through the
+        # prefetch call path. The base controller does not use it yet, but it
+        # should accept the argument so standard HiCache prefetch stays
+        # compatible with mooncake-backed L3 flows.
+        _ = extra_pools
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
