@@ -2873,6 +2873,154 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(result.host_hit_length, 0)
         self.assertIs(result.last_host_node, result.last_device_node)
 
+    def test_authoritative_live_match_suppresses_unstable_storage_only_ready_host_hit(
+        self,
+    ):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        class Node:
+            def __init__(self, node_id, *, evicted=False, host_value=None, parent=None):
+                self.id = node_id
+                self.evicted = evicted
+                self.host_value = host_value if host_value is not None else torch.tensor([])
+                self.parent = parent
+
+        root = Node(0, evicted=False)
+        cache.root_node = root
+        cache.page_size = 1
+        cache.device = torch.device("cpu")
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.pp_device_only_match_fallback = False
+        cache.prefetch_revoked_rids = set()
+        cache.prefetch_revoked_token_counts = {}
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = {100}
+        cache.authoritative_backuped_boundary_keys = set()
+        cache.authoritative_host_visible_boundary_keys = set()
+        cache.authoritative_prefetch_ready_by_reqid = {
+            "rid": types.SimpleNamespace(
+                input_len=6,
+                prefix_len=2,
+                host_hit_length=0,
+                storage_hit_length=4,
+                last_host_node_ref=None,
+            )
+        }
+        cache._is_authoritative_ready_stable = lambda req_id: False
+        cache._clamp_match_result_to_authoritative_summary = (
+            lambda req_id, match_result, input_len=None: match_result
+        )
+        cache._format_authoritative_resolution_stats = lambda: "none"
+        cache._format_host_insert_missing_segments = lambda req_id: "none"
+        cache._format_pending_backup_nodes = lambda: "none"
+        cache._format_match_authoritative_gates = (
+            lambda req_id, pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._format_match_clamp_delta = (
+            lambda pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._find_last_visible_host_ancestor = lambda node: node
+        cache._node_backup_visible = lambda node: True
+
+        host_node = Node(
+            100,
+            evicted=True,
+            host_value=torch.tensor([10, 11]),
+            parent=root,
+        )
+        cache._match_prefix_helper = (
+            lambda node, key: ([torch.tensor([1, 2])], host_node)
+        )
+
+        req = types.SimpleNamespace(rid="rid", fill_ids=list(range(6)), is_chunked=0)
+        result = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=[1, 2, 3, 4], extra_key=None),
+                req=req,
+                cow_mamba=False,
+            )
+        )
+
+        self.assertEqual(len(result.device_indices), 2)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertIs(result.last_host_node, result.last_device_node)
+
+    def test_authoritative_live_match_keeps_stable_storage_only_ready_host_hit(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        class Node:
+            def __init__(self, node_id, *, evicted=False, host_value=None, parent=None):
+                self.id = node_id
+                self.evicted = evicted
+                self.host_value = host_value if host_value is not None else torch.tensor([])
+                self.parent = parent
+
+        root = Node(0, evicted=False)
+        cache.root_node = root
+        cache.page_size = 1
+        cache.device = torch.device("cpu")
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.pp_device_only_match_fallback = False
+        cache.prefetch_revoked_rids = set()
+        cache.prefetch_revoked_token_counts = {}
+        cache.authoritative_backuped_node_ids = set()
+        cache.authoritative_host_visible_node_ids = {101}
+        cache.authoritative_backuped_boundary_keys = set()
+        cache.authoritative_host_visible_boundary_keys = set()
+        cache.authoritative_prefetch_ready_by_reqid = {
+            "rid": types.SimpleNamespace(
+                input_len=6,
+                prefix_len=2,
+                host_hit_length=0,
+                storage_hit_length=4,
+                last_host_node_ref=None,
+            )
+        }
+        cache._is_authoritative_ready_stable = lambda req_id: True
+        cache._clamp_match_result_to_authoritative_summary = (
+            lambda req_id, match_result, input_len=None: match_result
+        )
+        cache._format_authoritative_resolution_stats = lambda: "none"
+        cache._format_host_insert_missing_segments = lambda req_id: "none"
+        cache._format_pending_backup_nodes = lambda: "none"
+        cache._format_match_authoritative_gates = (
+            lambda req_id, pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._format_match_clamp_delta = (
+            lambda pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._find_last_visible_host_ancestor = lambda node: node
+        cache._node_backup_visible = lambda node: True
+
+        host_node = Node(
+            101,
+            evicted=True,
+            host_value=torch.tensor([10, 11]),
+            parent=root,
+        )
+        cache._match_prefix_helper = (
+            lambda node, key: ([torch.tensor([1, 2])], host_node)
+        )
+
+        req = types.SimpleNamespace(rid="rid", fill_ids=list(range(6)), is_chunked=0)
+        result = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=[1, 2, 3, 4], extra_key=None),
+                req=req,
+                cow_mamba=False,
+            )
+        )
+
+        self.assertEqual(len(result.device_indices), 2)
+        self.assertEqual(result.host_hit_length, 2)
+        self.assertIs(result.last_host_node, host_node)
+
     def test_canonicalize_prefetch_ready_result_suppresses_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 

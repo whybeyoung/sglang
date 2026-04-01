@@ -2078,6 +2078,36 @@ class HiRadixCache(RadixCache):
             input_len=ready_result.input_len,
         )
 
+    def _should_suppress_unstable_authoritative_live_host(
+        self,
+        req: Optional[Req],
+        match_result: MatchResult,
+    ) -> bool:
+        if req is None or not self.authoritative_tree.enabled:
+            return False
+        if match_result.host_hit_length <= 0:
+            return False
+        req_id = req.rid
+        if self._is_authoritative_ready_stable(req_id):
+            return False
+        summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
+        if summary is None:
+            return False
+        req_input_len = len(req.fill_ids)
+        if (
+            req_input_len is not None
+            and summary.input_len is not None
+            and summary.input_len != req_input_len
+        ):
+            return False
+        # A request whose authoritative ready summary is still storage-only must
+        # not start consuming newly materialized host subtrees through generic
+        # live_match before HOST_INSERT replay settles.
+        return (
+            getattr(summary, "storage_hit_length", 0) > 0
+            and getattr(summary, "host_hit_length", 0) == 0
+        )
+
     def _clamp_ready_result_to_authoritative_summary(
         self,
         req_id: str,
@@ -3958,6 +3988,16 @@ class HiRadixCache(RadixCache):
                 device_indices=empty_value,
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                host_hit_length=0,
+                mamba_branching_seqlen=match_result.mamba_branching_seqlen,
+            )
+        if self._should_suppress_unstable_authoritative_live_host(
+            params.req, match_result
+        ):
+            match_result = MatchResult(
+                device_indices=match_result.device_indices,
+                last_device_node=match_result.last_device_node,
+                last_host_node=match_result.last_device_node,
                 host_hit_length=0,
                 mamba_branching_seqlen=match_result.mamba_branching_seqlen,
             )
