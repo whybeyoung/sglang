@@ -653,6 +653,7 @@ class Req(ReqDllmMixin):
         self._latched_hicache_ready_input_len: Optional[int] = None
         self._latched_hicache_ready_result = None
         self._hicache_revoke_barrier_input_len: Optional[int] = None
+        self._hicache_revoke_barrier_generation: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1028,8 +1029,12 @@ class Req(ReqDllmMixin):
     def set_hicache_revoke_barrier(self, input_len: int):
         self._hicache_revoke_barrier_input_len = input_len
 
+    def set_hicache_revoke_barrier_generation(self, generation: int):
+        self._hicache_revoke_barrier_generation = generation
+
     def clear_hicache_revoke_barrier(self):
         self._hicache_revoke_barrier_input_len = None
+        self._hicache_revoke_barrier_generation = None
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):

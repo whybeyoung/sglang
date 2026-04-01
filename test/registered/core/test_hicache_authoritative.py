@@ -3860,6 +3860,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
         cache.prefetch_revoked_rids = {"rid-revoked"}
         cache.prefetch_revoked_token_counts = {"rid-revoked": 44544}
         cache.prefetch_revoke_barrier_input_lens = {"rid-revoked": 53282}
+        cache.prefetch_revoked_generation_by_reqid = {"rid-revoked": 7}
         cache._clamp_match_result_to_authoritative_summary = (
             lambda req_id, match_result, input_len=None: match_result
         )
@@ -3886,6 +3887,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
             fill_ids=list(range(53282)),
             is_chunked=0,
             _hicache_revoke_barrier_input_len=53282,
+            _hicache_revoke_barrier_generation=7,
         )
         result = cache.match_prefix(
             MatchPrefixParams(
@@ -4161,6 +4163,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
         cache.prefetch_revoke_barrier_input_lens = {"rid-revoked": 100}
         cache.prefetch_revoked_rids = {"rid-revoked"}
         cache.prefetch_revoked_token_counts = {"rid-revoked": 64}
+        cache.prefetch_revoked_generation_by_reqid = {"rid-revoked": 3}
 
         req = Req(
             rid="rid-revoked",
@@ -4176,6 +4179,27 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertNotIn("rid-revoked", cache.prefetch_revoke_barrier_input_lens)
         self.assertNotIn("rid-revoked", cache.prefetch_revoked_rids)
         self.assertNotIn("rid-revoked", cache.prefetch_revoked_token_counts)
+        self.assertNotIn("rid-revoked", cache.prefetch_revoked_generation_by_reqid)
+
+    def test_refresh_prefetch_revoke_barrier_sets_generation(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.prefetch_revoke_barrier_input_lens = {"rid-revoked": 120}
+        cache.prefetch_revoked_generation_by_reqid = {"rid-revoked": 9}
+        cache.prefetch_revoked_rids = {"rid-revoked"}
+        cache.prefetch_revoked_token_counts = {"rid-revoked": 64}
+
+        req = Req(
+            rid="rid-revoked",
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3],
+            sampling_params=None,
+        )
+        req.fill_ids = list(range(120))
+
+        cache.refresh_prefetch_revoke_barrier(req)
+
+        self.assertEqual(req._hicache_revoke_barrier_input_len, 120)
+        self.assertEqual(req._hicache_revoke_barrier_generation, 9)
 
 
 if __name__ == "__main__":

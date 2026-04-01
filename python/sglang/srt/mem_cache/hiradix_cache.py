@@ -318,6 +318,8 @@ class HiRadixCache(RadixCache):
         self.prefetch_revoked_rids: set[str] = set()
         self.prefetch_revoked_token_counts: dict[str, int] = {}
         self.prefetch_revoke_barrier_input_lens: dict[str, int] = {}
+        self.prefetch_generation_by_reqid: dict[str, int] = {}
+        self.prefetch_revoked_generation_by_reqid: dict[str, int] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -2664,6 +2666,7 @@ class HiRadixCache(RadixCache):
                 self._clear_host_insert_rebuild_blueprint(req_id)
                 self.prefetch_skipped_rids.discard(req_id)
                 self.prefetch_revoked_rids.add(req_id)
+                generation = self.prefetch_generation_by_reqid.get(req_id)
                 if info is not None:
                     if len(info) == 5:
                         last_host_node, token_ids, _, _, input_len = info
@@ -2671,6 +2674,8 @@ class HiRadixCache(RadixCache):
                         last_host_node, token_ids, _, _ = info
                         input_len = None
                     self.prefetch_revoked_token_counts[req_id] = len(token_ids)
+                    if generation is not None:
+                        self.prefetch_revoked_generation_by_reqid[req_id] = generation
                     if input_len is not None:
                         self.prefetch_revoke_barrier_input_lens[req_id] = input_len
                     if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
@@ -2690,6 +2695,8 @@ class HiRadixCache(RadixCache):
                         cc.prefetch_tokens_occupied = 0
                 else:
                     self.prefetch_revoked_token_counts.setdefault(req_id, 0)
+                    if generation is not None:
+                        self.prefetch_revoked_generation_by_reqid[req_id] = generation
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -3673,6 +3680,7 @@ class HiRadixCache(RadixCache):
         self.prefetch_revoked_rids.discard(req_id)
         self.prefetch_revoked_token_counts.pop(req_id, None)
         self.prefetch_revoke_barrier_input_lens.pop(req_id, None)
+        self.prefetch_revoked_generation_by_reqid.pop(req_id, None)
         ready_result: Optional[LatchedPrefetchReadyResult] = None
         if req is not None:
             if self.authoritative_tree.enabled:
@@ -3815,8 +3823,12 @@ class HiRadixCache(RadixCache):
     def refresh_prefetch_revoke_barrier(self, req: Req) -> None:
         input_len = len(getattr(req, "fill_ids", []) or [])
         barrier_input_len = self.prefetch_revoke_barrier_input_lens.get(req.rid)
+        barrier_generation = self.prefetch_revoked_generation_by_reqid.get(req.rid)
         clear_barrier = getattr(req, "clear_hicache_revoke_barrier", None)
         set_barrier = getattr(req, "set_hicache_revoke_barrier", None)
+        set_barrier_generation = getattr(
+            req, "set_hicache_revoke_barrier_generation", None
+        )
         if barrier_input_len is None:
             if clear_barrier is not None:
                 clear_barrier()
@@ -3825,11 +3837,14 @@ class HiRadixCache(RadixCache):
             self.prefetch_revoke_barrier_input_lens.pop(req.rid, None)
             self.prefetch_revoked_rids.discard(req.rid)
             self.prefetch_revoked_token_counts.pop(req.rid, None)
+            self.prefetch_revoked_generation_by_reqid.pop(req.rid, None)
             if clear_barrier is not None:
                 clear_barrier()
             return
         if set_barrier is not None:
             set_barrier(barrier_input_len)
+        if barrier_generation is not None and set_barrier_generation is not None:
+            set_barrier_generation(barrier_generation)
 
     def _lookup_prefetch_ready_result(
         self, req_id: str, *, req: Optional[Req] = None
@@ -3997,8 +4012,15 @@ class HiRadixCache(RadixCache):
         if device_hit <= 0 and host_hit <= 0:
             return False
         barrier_input_len = getattr(req, "_hicache_revoke_barrier_input_len", None)
+        barrier_generation = getattr(req, "_hicache_revoke_barrier_generation", None)
         req_input_len = len(getattr(req, "fill_ids", []) or [])
-        if barrier_input_len is not None and barrier_input_len == req_input_len:
+        revoked_generation = self.prefetch_revoked_generation_by_reqid.get(req.rid)
+        if (
+            barrier_input_len is not None
+            and barrier_generation is not None
+            and barrier_input_len == req_input_len
+            and barrier_generation == revoked_generation
+        ):
             return True
         revoked_tokens = self.prefetch_revoked_token_counts.get(req.rid, 0)
         suppress_bound = max(self.prefetch_threshold, revoked_tokens)
@@ -4172,6 +4194,8 @@ class HiRadixCache(RadixCache):
             self.prefetch_skipped_rids.add(req_id)
             return
         self.prefetch_skipped_rids.discard(req_id)
+        generation = self.prefetch_generation_by_reqid.get(req_id, 0) + 1
+        self.prefetch_generation_by_reqid[req_id] = generation
         prefetch_transfers = self.nsa_prefetch_transfers()
         if prefetch_transfers:
             operation = self.cache_controller.prefetch(
@@ -4476,6 +4500,7 @@ class HiRadixCache(RadixCache):
         self.prefetch_revoked_rids.discard(rid)
         self.prefetch_revoked_token_counts.pop(rid, None)
         self.prefetch_revoke_barrier_input_lens.pop(rid, None)
+        self.prefetch_revoked_generation_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:
             return
