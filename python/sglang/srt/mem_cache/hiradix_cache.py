@@ -3783,6 +3783,22 @@ class HiRadixCache(RadixCache):
         (host alloc failure, below threshold, or rate-limited)."""
         return req_id in self.prefetch_skipped_rids
 
+    def _node_matches_stable_authoritative_boundary(
+        self, node: Optional[TreeNode]
+    ) -> bool:
+        if node is None or node == self.root_node:
+            return False
+        if self._node_stable_host_visible(node):
+            return True
+        last_hash_getter = getattr(node, "get_last_hash_value", None)
+        last_hash = last_hash_getter() if callable(last_hash_getter) else None
+        if last_hash is None:
+            return False
+        return (
+            last_hash in getattr(self, "authoritative_backuped_last_hashes", set())
+            or last_hash in getattr(self, "authoritative_host_visible_last_hashes", set())
+        )
+
     def _should_suppress_revoked_live_match(
         self, req: Optional[Req], match_result: MatchResult
     ) -> bool:
@@ -3798,6 +3814,12 @@ class HiRadixCache(RadixCache):
             return False
         device_hit = len(match_result.device_indices)
         if device_hit <= 0:
+            return False
+        if self._node_matches_stable_authoritative_boundary(
+            getattr(match_result, "last_device_node", None)
+        ) or self._node_matches_stable_authoritative_boundary(
+            getattr(match_result, "last_host_node", None)
+        ):
             return False
         revoked_tokens = self.prefetch_revoked_token_counts.get(req.rid, 0)
         suppress_bound = max(self.prefetch_threshold, revoked_tokens)
