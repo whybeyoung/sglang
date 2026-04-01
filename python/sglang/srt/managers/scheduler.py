@@ -1229,6 +1229,14 @@ class Scheduler(
     def _decode_pp_budget(self, budget: Optional[int]) -> Optional[int]:
         return None if budget is None or budget < 0 else int(budget)
 
+    def _encode_pp_budget_payload(self, budget: Optional[int]) -> list[int]:
+        return [self._encode_pp_budget(budget)]
+
+    def _decode_pp_budget_payload(self, payload: Optional[list[int]]) -> Optional[int]:
+        if not payload:
+            return None
+        return self._decode_pp_budget(payload[0])
+
     def _set_pp_prefetch_sync_budgets(
         self,
         revoke_budget: Optional[int],
@@ -1309,10 +1317,10 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        hicache_prefetch_revoke_budget = self._encode_pp_budget(
+        hicache_prefetch_revoke_budget = self._encode_pp_budget_payload(
             hicache_prefetch_revoke_budget
         )
-        hicache_prefetch_ready_budget = self._encode_pp_budget(
+        hicache_prefetch_ready_budget = self._encode_pp_budget_payload(
             hicache_prefetch_ready_budget
         )
 
@@ -1404,8 +1412,8 @@ class Scheduler(
             )
 
         self._set_pp_prefetch_sync_budgets(
-            self._decode_pp_budget(hicache_prefetch_revoke_budget),
-            self._decode_pp_budget(hicache_prefetch_ready_budget),
+            self._decode_pp_budget_payload(hicache_prefetch_revoke_budget),
+            self._decode_pp_budget_payload(hicache_prefetch_ready_budget),
         )
 
         # Process MM requests under EPD-disaggregation mode
