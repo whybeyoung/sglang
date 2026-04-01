@@ -247,6 +247,8 @@ class HiRadixCache(RadixCache):
         ] = {}
         self.pp_prefetch_revoke_budget: Optional[int] = None
         self.pp_prefetch_ready_budget: Optional[int] = None
+        self.pp_prefetch_revoke_sync_count: int = 0
+        self.pp_prefetch_ready_sync_count: int = 0
         # track requests whose prefetch was skipped (alloc failure, threshold, rate limit)
         self.prefetch_skipped_rids: set[str] = set()
         # todo: dynamically adjust the threshold
@@ -619,6 +621,7 @@ class HiRadixCache(RadixCache):
                 self.pp_prefetch_revoke_budget = max(
                     self.pp_prefetch_revoke_budget - drained_revoke, 0
                 )
+            self.pp_prefetch_revoke_sync_count += drained_revoke
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -1393,6 +1396,7 @@ class HiRadixCache(RadixCache):
 
         if self.pp_prefetch_ready_budget is not None:
             self.pp_prefetch_ready_budget = max(self.pp_prefetch_ready_budget - 1, 0)
+        self.pp_prefetch_ready_sync_count += 1
 
         return True
 
@@ -1426,6 +1430,13 @@ class HiRadixCache(RadixCache):
 
     def get_pp_prefetch_sync_budgets(self) -> tuple[Optional[int], Optional[int]]:
         return self.pp_prefetch_revoke_budget, self.pp_prefetch_ready_budget
+
+    def pop_pp_prefetch_sync_event_counts(self) -> tuple[int, int]:
+        revoke_count = self.pp_prefetch_revoke_sync_count
+        ready_count = self.pp_prefetch_ready_sync_count
+        self.pp_prefetch_revoke_sync_count = 0
+        self.pp_prefetch_ready_sync_count = 0
+        return revoke_count, ready_count
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:

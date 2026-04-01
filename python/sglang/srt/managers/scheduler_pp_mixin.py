@@ -101,6 +101,39 @@ class SchedulerPPMixin:
             self._pp_build_req_payload(recv_reqs), async_send=async_send
         )
 
+    def _pp_build_prefetch_sync_payload(self: Scheduler):
+        revoke_count = 0
+        ready_count = 0
+        pop_counts = getattr(self.tree_cache, "pop_pp_prefetch_sync_event_counts", None)
+        if pop_counts is not None:
+            revoke_count, ready_count = pop_counts()
+        return {
+            "__pp_prefetch_sync_payload__": True,
+            "hicache_prefetch_revoke_budget": int(revoke_count),
+            "hicache_prefetch_ready_budget": int(ready_count),
+        }
+
+    def _pp_send_prefetch_sync_to_next_stage(
+        self: Scheduler, async_send: bool = False
+    ):
+        return self._pp_send_pyobj_to_next_stage(
+            self._pp_build_prefetch_sync_payload(), async_send=async_send
+        )
+
+    def _pp_apply_prefetch_sync_from_prev_stage(self: Scheduler):
+        payload = self._pp_recv_pyobj_from_prev_stage()
+        if not (
+            isinstance(payload, dict)
+            and payload.get("__pp_prefetch_sync_payload__") is True
+        ):
+            self._set_pp_prefetch_sync_budgets(None, None)
+            return
+        self._set_pp_prefetch_sync_budgets(
+            payload.get("hicache_prefetch_revoke_budget"),
+            payload.get("hicache_prefetch_ready_budget"),
+        )
+        self._maybe_wait_for_pp_prefetch_sync_budgets()
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -127,6 +160,7 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        send_prefetch_sync_work = []
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -144,8 +178,21 @@ class SchedulerPPMixin:
                             recv_reqs,
                             async_send=True,
                         )
+                if not self.pp_group.is_first_rank:
+                    with torch.profiler.record_function(
+                        "recv_prefetch_sync_from_prev_stage"
+                    ):
+                        self._pp_apply_prefetch_sync_from_prev_stage()
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(send_prefetch_sync_work)
+                    with torch.profiler.record_function(
+                        "send_prefetch_sync_to_next_stage"
+                    ):
+                        send_prefetch_sync_work = (
+                            self._pp_send_prefetch_sync_to_next_stage(async_send=True)
+                        )
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
