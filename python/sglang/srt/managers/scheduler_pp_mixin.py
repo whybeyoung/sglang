@@ -62,6 +62,37 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_build_req_payload(self: Scheduler, recv_reqs):
+        load_ack_budget = None
+        get_ready_load_ack_count = getattr(
+            self.tree_cache, "get_ready_load_ack_count", None
+        )
+        if get_ready_load_ack_count is not None:
+            load_ack_budget = int(get_ready_load_ack_count())
+        return {
+            "__pp_req_payload__": True,
+            "reqs": recv_reqs,
+            "hicache_load_ack_budget": load_ack_budget,
+        }
+
+    def _pp_unpack_req_payload(self: Scheduler, recv_payload):
+        if (
+            isinstance(recv_payload, dict)
+            and recv_payload.get("__pp_req_payload__") is True
+        ):
+            return (
+                recv_payload.get("reqs", []),
+                recv_payload.get("hicache_load_ack_budget"),
+            )
+        return recv_payload, None
+
+    def _pp_send_reqs_to_next_stage(
+        self: Scheduler, recv_reqs, async_send: bool = False
+    ):
+        return self._pp_send_pyobj_to_next_stage(
+            self._pp_build_req_payload(recv_reqs), async_send=async_send
+        )
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -101,7 +132,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        self.send_req_work = self._pp_send_reqs_to_next_stage(
                             recv_reqs,
                             async_send=True,
                         )
@@ -316,7 +347,7 @@ class SchedulerPPMixin:
                         authoritative_abort=self.pp_group.is_first_rank,
                     )
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(
                         recv_reqs, async_send=True
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
@@ -494,7 +525,7 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(
                         recv_reqs, async_send=True
                     )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(

@@ -245,6 +245,10 @@ class HiRadixCache(RadixCache):
         self.prefetch_ready_results_by_reqid: dict[
             str, LatchedPrefetchReadyResult
         ] = {}
+        # Optional PP-synchronized budget for how many load ACKs may advance L1/L2
+        # tree-visible state in the current scheduling round. This is intentionally
+        # scoped to L1+L2 and does not make L3/prefetch outcomes authoritative.
+        self.pp_load_ack_budget: Optional[int] = None
         # track requests whose prefetch was skipped (alloc failure, threshold, rate limit)
         self.prefetch_skipped_rids: set[str] = set()
         # todo: dynamically adjust the threshold
@@ -862,19 +866,57 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def loading_check(self):
-        finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
-                # the KV cache loading is still ongoing
-                break
-            finish_count += 1
-            # no need to sync across TP workers as batch forwarding is synced
+        if len(self.ongoing_load_back) == 0:
+            return
+
+        finish_count = self.get_ready_load_ack_count()
+        budget = self.pp_load_ack_budget
+        if budget is not None:
+            finish_count = min(finish_count, budget)
+        if (
+            finish_count > 0
+            and (
+                os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
+                or os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1"
+            )
+        ):
+            ack_node_ids = [
+                list(self.cache_controller.ack_load_queue[i].node_ids)
+                for i in range(min(finish_count, len(self.cache_controller.ack_load_queue)))
+            ]
+            logger.warning(
+                "[HiCacheLoadSync] apply ready load ACKs: count=%s local_ready=%s "
+                "budget=%s queue_len=%s ack_node_ids=%s pp=%s cp=%s tp=%s",
+                finish_count,
+                self.get_ready_load_ack_count(),
+                budget,
+                len(self.cache_controller.ack_load_queue),
+                ack_node_ids,
+                self.pp_rank,
+                self.attn_cp_rank,
+                getattr(self.cache_controller, "tp_rank", None),
+            )
+
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+            finish_event.synchronize()
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+            finish_count -= 1
+            if self.pp_load_ack_budget is not None:
+                self.pp_load_ack_budget -= 1
 
-        # ACK until all events are processed
-        del self.cache_controller.ack_load_queue[:finish_count]
+    def get_ready_load_ack_count(self) -> int:
+        ready_count = 0
+        for _, finish_event, _ in self.cache_controller.ack_load_queue:
+            if not finish_event.query():
+                break
+            ready_count += 1
+        return ready_count
+
+    def set_pp_load_ack_budget(self, budget: Optional[int]):
+        self.pp_load_ack_budget = None if budget is None else max(int(budget), 0)
 
     def evictable_size(self):
         return self.evictable_size_

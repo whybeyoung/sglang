@@ -1223,6 +1223,51 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    def _set_pp_hicache_load_ack_budget(self, budget: Optional[int]):
+        setter = getattr(self.tree_cache, "set_pp_load_ack_budget", None)
+        if setter is not None:
+            setter(budget)
+
+    def _maybe_apply_pp_hicache_load_ack_budget(self):
+        if (
+            self.pp_rank == 0
+            or not self.enable_hierarchical_cache
+            or not self.enable_hicache_storage
+        ):
+            return
+
+        budget = getattr(self.tree_cache, "pp_load_ack_budget", None)
+        if budget is None or budget <= 0:
+            return
+
+        timeout_s = max(envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1)
+        wait_start = time.perf_counter()
+
+        while True:
+            remaining = getattr(self.tree_cache, "pp_load_ack_budget", None)
+            if remaining is None or remaining <= 0:
+                return
+
+            self.tree_cache.check_hicache_events()
+            next_remaining = getattr(self.tree_cache, "pp_load_ack_budget", None)
+            if next_remaining is None or next_remaining <= 0:
+                return
+
+            if time.perf_counter() - wait_start >= timeout_s:
+                logger.warning(
+                    "[HiCacheLoadSync] timed out applying PP load ACK budget: "
+                    "budget=%s remaining=%s pp=%s cp=%s tp=%s",
+                    budget,
+                    next_remaining,
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                )
+                return
+
+            if next_remaining == remaining:
+                time.sleep(0.001)
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1233,6 +1278,7 @@ class Scheduler(
                 self.last_batch.forward_mode if self.last_batch is not None else None
             )
             if not self.recv_skipper.handle(last_forward_mode):
+                self._set_pp_hicache_load_ack_budget(None)
                 return []
 
         if self.pp_rank == 0:
@@ -1259,10 +1305,11 @@ class Scheduler(
                     recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
+            recv_reqs_payload = recv_reqs
         else:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
+                recv_reqs_payload = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
                     self.world_group.cpu_group,
@@ -1270,7 +1317,19 @@ class Scheduler(
                     self.pp_rank * self.tp_size + dp_offset,
                 )
             else:
-                recv_reqs = None
+                recv_reqs_payload = None
+
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            unpack_req_payload = getattr(self, "_pp_unpack_req_payload", None)
+            if unpack_req_payload is not None:
+                recv_reqs, hicache_load_ack_budget = unpack_req_payload(
+                    recv_reqs_payload
+                )
+            else:
+                recv_reqs, hicache_load_ack_budget = recv_reqs_payload, None
+        else:
+            recv_reqs = None
+            hicache_load_ack_budget = None
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
@@ -1289,10 +1348,22 @@ class Scheduler(
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
+                hicache_load_ack_budget = broadcast_pyobj(
+                    hicache_load_ack_budget,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
 
             if self.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
                     work_reqs,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+                hicache_load_ack_budget = broadcast_pyobj(
+                    hicache_load_ack_budget,
                     self.attn_cp_group.rank,
                     self.attn_cp_cpu_group,
                     src=self.attn_cp_group.ranks[0],
@@ -1305,6 +1376,12 @@ class Scheduler(
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
                 )
+                hicache_load_ack_budget = broadcast_pyobj(
+                    hicache_load_ack_budget,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(
@@ -1313,6 +1390,15 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+            hicache_load_ack_budget = broadcast_pyobj(
+                hicache_load_ack_budget,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+
+        self._set_pp_hicache_load_ack_budget(hicache_load_ack_budget)
+        self._maybe_apply_pp_hicache_load_ack_budget()
 
         # Process MM requests under EPD-disaggregation mode
         if (
