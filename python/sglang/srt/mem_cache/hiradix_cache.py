@@ -3896,8 +3896,6 @@ class HiRadixCache(RadixCache):
             return False
         if req.rid not in self.prefetch_revoked_rids:
             return False
-        if getattr(req, "is_chunked", 0) > 0:
-            return False
         device_hit = len(match_result.device_indices)
         if device_hit <= 0:
             return False
