@@ -2038,6 +2038,46 @@ class HiRadixCache(RadixCache):
             stable_host_hit_length,
         )
 
+    def _suppress_unstable_authoritative_host_ready(
+        self,
+        req_id: Optional[str],
+        ready_result: Optional[LatchedPrefetchReadyResult],
+    ) -> Optional[LatchedPrefetchReadyResult]:
+        if ready_result is None or not self.authoritative_tree.enabled:
+            return ready_result
+        host_hit_length = ready_result.match_result.host_hit_length
+        if host_hit_length <= 0 or self._is_authoritative_ready_stable(req_id):
+            return ready_result
+        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+            logger.warning(
+                "[HiCacheMatchChain] suppress unstable authoritative host ready: "
+                "rid=%s device_prefix=%s host_hit=%s storage_hit=%s auth_stats=%s "
+                "missing_segments=%s pending_backups=%s pp=%s cp=%s tp=%s",
+                req_id,
+                len(ready_result.match_result.device_indices),
+                host_hit_length,
+                ready_result.storage_hit_length,
+                self._format_authoritative_resolution_stats(),
+                self._format_host_insert_missing_segments(req_id),
+                self._format_pending_backup_nodes(),
+                self.pp_rank,
+                self.attn_cp_rank,
+                getattr(self.cache_controller, "tp_rank", None),
+            )
+        return LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=ready_result.match_result.device_indices,
+                last_device_node=ready_result.match_result.last_device_node,
+                last_host_node=ready_result.match_result.last_device_node,
+                host_hit_length=0,
+                mamba_branching_seqlen=ready_result.match_result.mamba_branching_seqlen,
+            ),
+            # Keep the committed ready-prefix upper bound intact while making the
+            # result conservative until HOST_INSERT authoritative replay settles.
+            storage_hit_length=ready_result.storage_hit_length + host_hit_length,
+            input_len=ready_result.input_len,
+        )
+
     def _clamp_ready_result_to_authoritative_summary(
         self,
         req_id: str,
@@ -3577,6 +3617,9 @@ class HiRadixCache(RadixCache):
                     req, loaded_from_storage
                 )
             ready_result = self.canonicalize_prefetch_ready_result(req_id, ready_result)
+            ready_result = self._suppress_unstable_authoritative_host_ready(
+                req_id, ready_result
+            )
         ready_visible_nodes = self._collect_request_ready_visible_nodes(ready_result)
         stable_visible_nodes = self._collect_stable_ready_visible_nodes(
             ready_result,

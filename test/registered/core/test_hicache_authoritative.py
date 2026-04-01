@@ -1836,6 +1836,59 @@ class TestHiCacheAuthoritative(CustomTestCase):
             cache.authoritative_resolution_stats["prefetch_ready.skip_unstable"], 1
         )
 
+    def test_suppress_unstable_authoritative_host_ready_converts_host_hit_to_storage(
+        self,
+    ):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class Tree:
+            enabled = True
+
+        cache.authoritative_tree = Tree()
+        cache._is_authoritative_ready_stable = lambda req_id: False
+
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.arange(2, dtype=torch.int64),
+                last_device_node="device-node",
+                last_host_node="host-node",
+                host_hit_length=64,
+            ),
+            storage_hit_length=32,
+            input_len=99,
+        )
+
+        suppressed = cache._suppress_unstable_authoritative_host_ready("rid-u", ready)
+
+        self.assertEqual(len(suppressed.match_result.device_indices), 2)
+        self.assertEqual(suppressed.match_result.host_hit_length, 0)
+        self.assertEqual(suppressed.storage_hit_length, 96)
+        self.assertEqual(suppressed.match_result.last_host_node, "device-node")
+
+    def test_suppress_unstable_authoritative_host_ready_keeps_stable_host_hit(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class Tree:
+            enabled = True
+
+        cache.authoritative_tree = Tree()
+        cache._is_authoritative_ready_stable = lambda req_id: True
+
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.arange(2, dtype=torch.int64),
+                last_device_node="device-node",
+                last_host_node="host-node",
+                host_hit_length=64,
+            ),
+            storage_hit_length=32,
+            input_len=99,
+        )
+
+        preserved = cache._suppress_unstable_authoritative_host_ready("rid-s", ready)
+
+        self.assertIs(preserved, ready)
+
     def test_maybe_commit_stable_prefetch_ready_summaries_requeues_summary(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.authoritative_prefetch_ready_by_reqid = {}
