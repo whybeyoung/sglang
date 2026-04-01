@@ -1055,10 +1055,14 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_pools: Optional[List[object]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
+        # Keep the base controller compatible with callers that thread
+        # auxiliary pool-transfer metadata through archive/write-back paths.
+        _ = extra_pools
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
