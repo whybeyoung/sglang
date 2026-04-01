@@ -1424,6 +1424,9 @@ class HiRadixCache(RadixCache):
             None if ready_budget is None else max(int(ready_budget), 0)
         )
 
+    def get_pp_prefetch_sync_budgets(self) -> tuple[Optional[int], Optional[int]]:
+        return self.pp_prefetch_revoke_budget, self.pp_prefetch_ready_budget
+
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
             return
