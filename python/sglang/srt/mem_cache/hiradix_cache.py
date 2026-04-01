@@ -301,9 +301,9 @@ class HiRadixCache(RadixCache):
         self.authoritative_pending_backup_node_ids: set[int] = set()
         self.authoritative_pending_backup_reasons: dict[str, str] = {}
         self.authoritative_backuped_node_ids: set[int] = set()
-        self.authoritative_backuped_last_hashes: set[str] = set()
+        self.authoritative_backuped_boundary_keys: set[tuple[int, str]] = set()
         self.authoritative_host_visible_node_ids: set[int] = set()
-        self.authoritative_host_visible_last_hashes: set[str] = set()
+        self.authoritative_host_visible_boundary_keys: set[tuple[int, str]] = set()
         self.authoritative_prefetch_visible_node_ids: set[int] = set()
         self.authoritative_resolution_stats: dict[str, int] = {}
         self._last_authoritative_resolution_log_ts = 0.0
@@ -1447,26 +1447,48 @@ class HiRadixCache(RadixCache):
             return
         if not hasattr(self, "authoritative_backuped_node_ids"):
             self.authoritative_backuped_node_ids = set()
-        if not hasattr(self, "authoritative_backuped_last_hashes"):
-            self.authoritative_backuped_last_hashes = set()
+        if not hasattr(self, "authoritative_backuped_boundary_keys"):
+            self.authoritative_backuped_boundary_keys = set()
         self.authoritative_backuped_node_ids.add(node.id)
-        last_hash_getter = getattr(node, "get_last_hash_value", None)
-        last_hash = last_hash_getter() if callable(last_hash_getter) else None
-        if last_hash is not None:
-            self.authoritative_backuped_last_hashes.add(last_hash)
+        boundary_key = self._make_authoritative_boundary_key(node)
+        if boundary_key is not None:
+            self.authoritative_backuped_boundary_keys.add(boundary_key)
 
     def _mark_authoritative_host_visible(self, node: Optional[TreeNode]) -> None:
         if node is None:
             return
         if not hasattr(self, "authoritative_host_visible_node_ids"):
             self.authoritative_host_visible_node_ids = set()
-        if not hasattr(self, "authoritative_host_visible_last_hashes"):
-            self.authoritative_host_visible_last_hashes = set()
+        if not hasattr(self, "authoritative_host_visible_boundary_keys"):
+            self.authoritative_host_visible_boundary_keys = set()
         self.authoritative_host_visible_node_ids.add(node.id)
+        boundary_key = self._make_authoritative_boundary_key(node)
+        if boundary_key is not None:
+            self.authoritative_host_visible_boundary_keys.add(boundary_key)
+
+    def _make_authoritative_boundary_key(
+        self, node: Optional[TreeNode]
+    ) -> Optional[tuple[int, str]]:
+        if node is None or node == self.root_node:
+            return None
         last_hash_getter = getattr(node, "get_last_hash_value", None)
         last_hash = last_hash_getter() if callable(last_hash_getter) else None
-        if last_hash is not None:
-            self.authoritative_host_visible_last_hashes.add(last_hash)
+        if last_hash is None:
+            return None
+        prefix_len = 0
+        cursor = node
+        while cursor is not None and cursor != self.root_node:
+            key = getattr(cursor, "key", None)
+            if key is not None:
+                prefix_len += len(key)
+            else:
+                host_value = getattr(cursor, "host_value", None)
+                if host_value is not None:
+                    prefix_len += len(host_value)
+            cursor = getattr(cursor, "parent", None)
+        if self.page_size > 1:
+            prefix_len = prefix_len // self.page_size * self.page_size
+        return (prefix_len, last_hash)
 
     def _node_backup_visible(self, node: TreeNode) -> bool:
         if not getattr(self.authoritative_tree, "enabled", False):
@@ -1474,15 +1496,15 @@ class HiRadixCache(RadixCache):
         authoritative_backuped_node_ids = getattr(
             self, "authoritative_backuped_node_ids", set()
         )
-        authoritative_backuped_last_hashes = getattr(
-            self, "authoritative_backuped_last_hashes", set()
+        authoritative_backuped_boundary_keys = getattr(
+            self, "authoritative_backuped_boundary_keys", set()
         )
-        last_hash = node.get_last_hash_value()
+        boundary_key = self._make_authoritative_boundary_key(node)
         return (
             node.id in authoritative_backuped_node_ids
             or (
-                last_hash is not None
-                and last_hash in authoritative_backuped_last_hashes
+                boundary_key is not None
+                and boundary_key in authoritative_backuped_boundary_keys
             )
             or self._node_stable_host_visible(node)
         )
@@ -1496,21 +1518,21 @@ class HiRadixCache(RadixCache):
         authoritative_host_visible_node_ids = getattr(
             self, "authoritative_host_visible_node_ids", set()
         )
-        authoritative_backuped_last_hashes = getattr(
-            self, "authoritative_backuped_last_hashes", set()
+        authoritative_backuped_boundary_keys = getattr(
+            self, "authoritative_backuped_boundary_keys", set()
         )
-        authoritative_host_visible_last_hashes = getattr(
-            self, "authoritative_host_visible_last_hashes", set()
+        authoritative_host_visible_boundary_keys = getattr(
+            self, "authoritative_host_visible_boundary_keys", set()
         )
-        last_hash = node.get_last_hash_value()
+        boundary_key = self._make_authoritative_boundary_key(node)
         return (
             node.id in authoritative_backuped_node_ids
             or node.id in authoritative_host_visible_node_ids
             or (
-                last_hash is not None
+                boundary_key is not None
                 and (
-                    last_hash in authoritative_backuped_last_hashes
-                    or last_hash in authoritative_host_visible_last_hashes
+                    boundary_key in authoritative_backuped_boundary_keys
+                    or boundary_key in authoritative_host_visible_boundary_keys
                 )
             )
         )
@@ -1542,10 +1564,10 @@ class HiRadixCache(RadixCache):
         self.authoritative_backuped_node_ids.discard(node_id)
         self.authoritative_host_visible_node_ids.discard(node_id)
         self.authoritative_prefetch_visible_node_ids.discard(node_id)
-        last_hash = node.get_last_hash_value()
-        if last_hash is not None:
-            self.authoritative_backuped_last_hashes.discard(last_hash)
-            self.authoritative_host_visible_last_hashes.discard(last_hash)
+        boundary_key = self._make_authoritative_boundary_key(node)
+        if boundary_key is not None:
+            self.authoritative_backuped_boundary_keys.discard(boundary_key)
+            self.authoritative_host_visible_boundary_keys.discard(boundary_key)
 
     def _record_authoritative_resolution(self, name: str) -> None:
         self.authoritative_resolution_stats[name] = (
@@ -2656,9 +2678,9 @@ class HiRadixCache(RadixCache):
         self.authoritative_pending_backup_node_ids.clear()
         self.authoritative_pending_backup_reasons.clear()
         self.authoritative_backuped_node_ids.clear()
-        self.authoritative_backuped_last_hashes.clear()
+        self.authoritative_backuped_boundary_keys.clear()
         self.authoritative_host_visible_node_ids.clear()
-        self.authoritative_host_visible_last_hashes.clear()
+        self.authoritative_host_visible_boundary_keys.clear()
         self.authoritative_prefetch_visible_node_ids.clear()
         self.authoritative_resolution_stats.clear()
         self._last_authoritative_resolution_log_ts = 0.0
@@ -3790,13 +3812,14 @@ class HiRadixCache(RadixCache):
             return False
         if self._node_stable_host_visible(node):
             return True
-        last_hash_getter = getattr(node, "get_last_hash_value", None)
-        last_hash = last_hash_getter() if callable(last_hash_getter) else None
-        if last_hash is None:
+        boundary_key = self._make_authoritative_boundary_key(node)
+        if boundary_key is None:
             return False
         return (
-            last_hash in getattr(self, "authoritative_backuped_last_hashes", set())
-            or last_hash in getattr(self, "authoritative_host_visible_last_hashes", set())
+            boundary_key
+            in getattr(self, "authoritative_backuped_boundary_keys", set())
+            or boundary_key
+            in getattr(self, "authoritative_host_visible_boundary_keys", set())
         )
 
     def _should_suppress_revoked_live_match(

@@ -725,8 +725,8 @@ class TestHiCacheAuthoritative(CustomTestCase):
         cache.authoritative_tree = Tree()
         cache.authoritative_backuped_node_ids = set()
         cache.authoritative_host_visible_node_ids = set()
-        cache.authoritative_backuped_last_hashes = set()
-        cache.authoritative_host_visible_last_hashes = {"stable-hash"}
+        cache.authoritative_backuped_boundary_keys = set()
+        cache.authoritative_host_visible_boundary_keys = {(0, "stable-hash")}
 
         self.assertTrue(cache._node_stable_host_visible(Node(41, "stable-hash")))
         self.assertTrue(cache._node_backup_visible(Node(41, "stable-hash")))
@@ -3126,7 +3126,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.authoritative_prefetch_visible_node_ids = set()
         cache.authoritative_host_visible_node_ids = set()
-        cache.authoritative_host_visible_last_hashes = set()
+        cache.authoritative_host_visible_boundary_keys = set()
 
         ready_node = types.SimpleNamespace(id=7, get_last_hash_value=lambda: "h7")
         ready_node_2 = types.SimpleNamespace(id=8)
@@ -3139,7 +3139,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
 
         self.assertEqual(cache.authoritative_prefetch_visible_node_ids, {7, 8})
         self.assertEqual(cache.authoritative_host_visible_node_ids, {9})
-        self.assertEqual(cache.authoritative_host_visible_last_hashes, {"h9"})
+        self.assertEqual(cache.authoritative_host_visible_boundary_keys, {(0, "h9")})
 
     def test_collect_stable_ready_visible_nodes_requires_matched_prefix_bound(self):
         cache = HiRadixCache.__new__(HiRadixCache)
@@ -3506,8 +3506,8 @@ class TestHiCacheAuthoritative(CustomTestCase):
         cache.pp_device_only_match_fallback = False
         cache.prefetch_revoked_rids = {"rid-revoked"}
         cache.prefetch_revoked_token_counts = {"rid-revoked": 16000}
-        cache.authoritative_backuped_last_hashes = set()
-        cache.authoritative_host_visible_last_hashes = {"stable-49"}
+        cache.authoritative_backuped_boundary_keys = set()
+        cache.authoritative_host_visible_boundary_keys = {(0, "stable-49")}
         cache._clamp_match_result_to_authoritative_summary = (
             lambda req_id, match_result, input_len=None: match_result
         )
