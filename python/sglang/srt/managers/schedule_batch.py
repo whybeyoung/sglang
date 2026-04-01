@@ -652,6 +652,7 @@ class Req(ReqDllmMixin):
         # load-backs that host prefix.
         self._latched_hicache_ready_input_len: Optional[int] = None
         self._latched_hicache_ready_result = None
+        self._hicache_revoke_barrier_input_len: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -877,6 +878,8 @@ class Req(ReqDllmMixin):
         input_len = len(self.fill_ids)
         if self._latched_hicache_ready_input_len != input_len:
             self.clear_latched_hicache_ready()
+        if self._hicache_revoke_barrier_input_len != input_len:
+            self.clear_hicache_revoke_barrier()
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
@@ -885,6 +888,11 @@ class Req(ReqDllmMixin):
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
+            refresh_revoke_barrier = getattr(
+                tree_cache, "refresh_prefetch_revoke_barrier", None
+            )
+            if refresh_revoke_barrier is not None:
+                refresh_revoke_barrier(self)
             match_result = None
             match_source = "live_match"
             if use_latched_hicache_result:
@@ -938,6 +946,7 @@ class Req(ReqDllmMixin):
                 if ready_result is not None:
                     match_result = ready_result.match_result
                     self.storage_hit_length = ready_result.storage_hit_length
+                    self.clear_hicache_revoke_barrier()
                 else:
                     self.storage_hit_length = 0
             if match_result is None:
@@ -1015,6 +1024,12 @@ class Req(ReqDllmMixin):
     def clear_latched_hicache_ready(self):
         self._latched_hicache_ready_input_len = None
         self._latched_hicache_ready_result = None
+
+    def set_hicache_revoke_barrier(self, input_len: int):
+        self._hicache_revoke_barrier_input_len = input_len
+
+    def clear_hicache_revoke_barrier(self):
+        self._hicache_revoke_barrier_input_len = None
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):

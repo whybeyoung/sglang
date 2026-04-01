@@ -317,6 +317,7 @@ class HiRadixCache(RadixCache):
         # rank-local live_match residue steer chunking differently across stages.
         self.prefetch_revoked_rids: set[str] = set()
         self.prefetch_revoked_token_counts: dict[str, int] = {}
+        self.prefetch_revoke_barrier_input_lens: dict[str, int] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -2567,7 +2568,10 @@ class HiRadixCache(RadixCache):
         try:
             for req_id, info in list(self.ongoing_prefetch.items()):
                 try:
-                    last_host_node, token_ids, host_indices, _operation = info
+                    if len(info) == 5:
+                        last_host_node, token_ids, host_indices, _operation, _input_len = info
+                    else:
+                        last_host_node, token_ids, host_indices, _operation = info
                 except Exception:
                     # Unexpected shape; just drop it.
                     self.ongoing_prefetch.pop(req_id, None)
@@ -2661,8 +2665,14 @@ class HiRadixCache(RadixCache):
                 self.prefetch_skipped_rids.discard(req_id)
                 self.prefetch_revoked_rids.add(req_id)
                 if info is not None:
-                    last_host_node, token_ids, _, _ = info
+                    if len(info) == 5:
+                        last_host_node, token_ids, _, _, input_len = info
+                    else:
+                        last_host_node, token_ids, _, _ = info
+                        input_len = None
                     self.prefetch_revoked_token_counts[req_id] = len(token_ids)
+                    if input_len is not None:
+                        self.prefetch_revoke_barrier_input_lens[req_id] = input_len
                     if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
                         logger.warning(
                             "[HiCacheMatchChain] revoke cleanup: rid=%s host_node=%s "
@@ -3603,9 +3613,13 @@ class HiRadixCache(RadixCache):
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
+        prefetch_info = self.ongoing_prefetch[req_id]
+        if len(prefetch_info) == 5:
+            last_host_node, token_ids, host_indices, operation, _input_len = (
+                prefetch_info
+            )
+        else:
+            last_host_node, token_ids, host_indices, operation = prefetch_info
 
         if operation.host_indices is None:
             # prefetch has not been issued due to insufficient host memory
@@ -3658,6 +3672,7 @@ class HiRadixCache(RadixCache):
         )
         self.prefetch_revoked_rids.discard(req_id)
         self.prefetch_revoked_token_counts.pop(req_id, None)
+        self.prefetch_revoke_barrier_input_lens.pop(req_id, None)
         ready_result: Optional[LatchedPrefetchReadyResult] = None
         if req is not None:
             if self.authoritative_tree.enabled:
@@ -3765,7 +3780,11 @@ class HiRadixCache(RadixCache):
         if req_id not in self.ongoing_prefetch:
             return
 
-        _, _, _, operation = self.ongoing_prefetch[req_id]
+        prefetch_info = self.ongoing_prefetch[req_id]
+        if len(prefetch_info) == 5:
+            _, _, _, operation, _ = prefetch_info
+        else:
+            _, _, _, operation = prefetch_info
         if operation.host_indices is None:
             return
         operation.mark_terminate()
@@ -3792,6 +3811,25 @@ class HiRadixCache(RadixCache):
         summary = self.authoritative_prefetch_ready_by_reqid.get(req_id)
         if summary is not None and summary.input_len not in (None, input_len):
             self.authoritative_prefetch_ready_by_reqid.pop(req_id, None)
+
+    def refresh_prefetch_revoke_barrier(self, req: Req) -> None:
+        input_len = len(getattr(req, "fill_ids", []) or [])
+        barrier_input_len = self.prefetch_revoke_barrier_input_lens.get(req.rid)
+        clear_barrier = getattr(req, "clear_hicache_revoke_barrier", None)
+        set_barrier = getattr(req, "set_hicache_revoke_barrier", None)
+        if barrier_input_len is None:
+            if clear_barrier is not None:
+                clear_barrier()
+            return
+        if barrier_input_len != input_len:
+            self.prefetch_revoke_barrier_input_lens.pop(req.rid, None)
+            self.prefetch_revoked_rids.discard(req.rid)
+            self.prefetch_revoked_token_counts.pop(req.rid, None)
+            if clear_barrier is not None:
+                clear_barrier()
+            return
+        if set_barrier is not None:
+            set_barrier(barrier_input_len)
 
     def _lookup_prefetch_ready_result(
         self, req_id: str, *, req: Optional[Req] = None
@@ -3955,8 +3993,13 @@ class HiRadixCache(RadixCache):
         if req.rid not in self.prefetch_revoked_rids:
             return False
         device_hit = len(match_result.device_indices)
-        if device_hit <= 0:
+        host_hit = match_result.host_hit_length
+        if device_hit <= 0 and host_hit <= 0:
             return False
+        barrier_input_len = getattr(req, "_hicache_revoke_barrier_input_len", None)
+        req_input_len = len(getattr(req, "fill_ids", []) or [])
+        if barrier_input_len is not None and barrier_input_len == req_input_len:
+            return True
         revoked_tokens = self.prefetch_revoked_token_counts.get(req.rid, 0)
         suppress_bound = max(self.prefetch_threshold, revoked_tokens)
         if suppress_bound <= 0:
@@ -4104,6 +4147,7 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        input_len: Optional[int] = None,
     ):
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
@@ -4151,6 +4195,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             host_indices,
             operation,
+            input_len,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
@@ -4430,11 +4475,16 @@ class HiRadixCache(RadixCache):
         self.prefetch_skipped_rids.discard(rid)
         self.prefetch_revoked_rids.discard(rid)
         self.prefetch_revoked_token_counts.pop(rid, None)
+        self.prefetch_revoke_barrier_input_lens.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:
             return
 
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
+        prefetch_info = self.ongoing_prefetch[rid]
+        if len(prefetch_info) == 5:
+            last_host_node, token_ids, host_indices, operation, _ = prefetch_info
+        else:
+            last_host_node, token_ids, host_indices, operation = prefetch_info
         if operation.host_indices is None:
             last_host_node.release_host()
             del self.ongoing_prefetch[rid]

@@ -1771,6 +1771,7 @@ class HiMambaRadixCache(MambaRadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        input_len: Optional[int] = None,
     ):
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size

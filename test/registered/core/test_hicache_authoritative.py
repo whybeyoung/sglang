@@ -3838,6 +3838,68 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertIs(result.last_device_node, root)
         self.assertIs(result.last_host_node, root)
 
+    def test_match_prefix_suppresses_revoked_live_match_for_same_input_generation(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class DummyAuthoritative:
+            enabled = True
+
+        class Node:
+            def __init__(self, node_id):
+                self.id = node_id
+                self.evicted = False
+                self.parent = None
+
+        root = Node(0)
+        cache.root_node = root
+        cache.page_size = 1
+        cache.device = torch.device("cpu")
+        cache.prefetch_threshold = 128
+        cache.authoritative_tree = DummyAuthoritative()
+        cache.pp_device_only_match_fallback = False
+        cache.prefetch_revoked_rids = {"rid-revoked"}
+        cache.prefetch_revoked_token_counts = {"rid-revoked": 44544}
+        cache.prefetch_revoke_barrier_input_lens = {"rid-revoked": 53282}
+        cache._clamp_match_result_to_authoritative_summary = (
+            lambda req_id, match_result, input_len=None: match_result
+        )
+        cache._format_authoritative_resolution_stats = lambda: "none"
+        cache._format_host_insert_missing_segments = lambda req_id: "none"
+        cache._format_pending_backup_nodes = lambda: "none"
+        cache._format_match_authoritative_gates = (
+            lambda req_id, pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._format_match_clamp_delta = (
+            lambda pre_clamp_device_hit, pre_clamp_host_hit, match_result: "none"
+        )
+        cache._find_last_visible_host_ancestor = lambda node: node
+        cache._node_backup_visible = lambda node: False
+
+        match_node = Node(131)
+        match_node.parent = root
+        cache._match_prefix_helper = (
+            lambda node, key: ([torch.arange(1280, dtype=torch.int64)], match_node)
+        )
+
+        req = types.SimpleNamespace(
+            rid="rid-revoked",
+            fill_ids=list(range(53282)),
+            is_chunked=0,
+            _hicache_revoke_barrier_input_len=53282,
+        )
+        result = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=list(range(1280)), extra_key=None),
+                req=req,
+                cow_mamba=False,
+            )
+        )
+
+        self.assertEqual(len(result.device_indices), 0)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertIs(result.last_device_node, root)
+        self.assertIs(result.last_host_node, root)
+
     def test_match_prefix_suppresses_chunked_revoked_live_match_residue(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
@@ -4093,6 +4155,27 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual(result.host_hit_length, 0)
         self.assertIs(result.last_device_node, root)
         self.assertIs(result.last_host_node, root)
+
+    def test_refresh_prefetch_revoke_barrier_clears_stale_generation(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.prefetch_revoke_barrier_input_lens = {"rid-revoked": 100}
+        cache.prefetch_revoked_rids = {"rid-revoked"}
+        cache.prefetch_revoked_token_counts = {"rid-revoked": 64}
+
+        req = Req(
+            rid="rid-revoked",
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3],
+            sampling_params=None,
+        )
+        req.fill_ids = list(range(120))
+
+        cache.refresh_prefetch_revoke_barrier(req)
+
+        self.assertIsNone(req._hicache_revoke_barrier_input_len)
+        self.assertNotIn("rid-revoked", cache.prefetch_revoke_barrier_input_lens)
+        self.assertNotIn("rid-revoked", cache.prefetch_revoked_rids)
+        self.assertNotIn("rid-revoked", cache.prefetch_revoked_token_counts)
 
 
 if __name__ == "__main__":
