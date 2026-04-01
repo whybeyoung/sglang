@@ -1223,50 +1223,20 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
-    def _set_pp_hicache_load_ack_budget(self, budget: Optional[int]):
-        setter = getattr(self.tree_cache, "set_pp_load_ack_budget", None)
+    def _encode_pp_budget(self, budget: Optional[int]) -> int:
+        return -1 if budget is None else int(budget)
+
+    def _decode_pp_budget(self, budget: Optional[int]) -> Optional[int]:
+        return None if budget is None or budget < 0 else int(budget)
+
+    def _set_pp_prefetch_sync_budgets(
+        self,
+        revoke_budget: Optional[int],
+        ready_budget: Optional[int],
+    ):
+        setter = getattr(self.tree_cache, "set_pp_prefetch_sync_budgets", None)
         if setter is not None:
-            setter(budget)
-
-    def _maybe_apply_pp_hicache_load_ack_budget(self):
-        if (
-            self.pp_rank == 0
-            or not self.enable_hierarchical_cache
-            or not self.enable_hicache_storage
-        ):
-            return
-
-        budget = getattr(self.tree_cache, "pp_load_ack_budget", None)
-        if budget is None or budget <= 0:
-            return
-
-        timeout_s = max(envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1)
-        wait_start = time.perf_counter()
-
-        while True:
-            remaining = getattr(self.tree_cache, "pp_load_ack_budget", None)
-            if remaining is None or remaining <= 0:
-                return
-
-            self.tree_cache.check_hicache_events()
-            next_remaining = getattr(self.tree_cache, "pp_load_ack_budget", None)
-            if next_remaining is None or next_remaining <= 0:
-                return
-
-            if time.perf_counter() - wait_start >= timeout_s:
-                logger.warning(
-                    "[HiCacheLoadSync] timed out applying PP load ACK budget: "
-                    "budget=%s remaining=%s pp=%s cp=%s tp=%s",
-                    budget,
-                    next_remaining,
-                    self.pp_rank,
-                    self.attn_cp_rank,
-                    self.attn_tp_rank,
-                )
-                return
-
-            if next_remaining == remaining:
-                time.sleep(0.001)
+            setter(revoke_budget, ready_budget)
 
     def recv_requests(
         self,
@@ -1278,7 +1248,7 @@ class Scheduler(
                 self.last_batch.forward_mode if self.last_batch is not None else None
             )
             if not self.recv_skipper.handle(last_forward_mode):
-                self._set_pp_hicache_load_ack_budget(None)
+                self._set_pp_prefetch_sync_budgets(None, None)
                 return []
 
         if self.pp_rank == 0:
@@ -1322,17 +1292,29 @@ class Scheduler(
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             unpack_req_payload = getattr(self, "_pp_unpack_req_payload", None)
             if unpack_req_payload is not None:
-                recv_reqs, hicache_load_ack_budget = unpack_req_payload(
-                    recv_reqs_payload
-                )
+                (
+                    recv_reqs,
+                    hicache_prefetch_revoke_budget,
+                    hicache_prefetch_ready_budget,
+                ) = unpack_req_payload(recv_reqs_payload)
             else:
-                recv_reqs, hicache_load_ack_budget = recv_reqs_payload, None
+                recv_reqs = recv_reqs_payload
+                hicache_prefetch_revoke_budget = None
+                hicache_prefetch_ready_budget = None
         else:
             recv_reqs = None
-            hicache_load_ack_budget = None
+            hicache_prefetch_revoke_budget = None
+            hicache_prefetch_ready_budget = None
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
+
+        hicache_prefetch_revoke_budget = self._encode_pp_budget(
+            hicache_prefetch_revoke_budget
+        )
+        hicache_prefetch_ready_budget = self._encode_pp_budget(
+            hicache_prefetch_ready_budget
+        )
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
@@ -1348,8 +1330,14 @@ class Scheduler(
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
-                hicache_load_ack_budget = broadcast_pyobj(
-                    hicache_load_ack_budget,
+                hicache_prefetch_revoke_budget = broadcast_pyobj(
+                    hicache_prefetch_revoke_budget,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+                hicache_prefetch_ready_budget = broadcast_pyobj(
+                    hicache_prefetch_ready_budget,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
@@ -1362,8 +1350,14 @@ class Scheduler(
                     self.attn_cp_cpu_group,
                     src=self.attn_cp_group.ranks[0],
                 )
-                hicache_load_ack_budget = broadcast_pyobj(
-                    hicache_load_ack_budget,
+                hicache_prefetch_revoke_budget = broadcast_pyobj(
+                    hicache_prefetch_revoke_budget,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+                hicache_prefetch_ready_budget = broadcast_pyobj(
+                    hicache_prefetch_ready_budget,
                     self.attn_cp_group.rank,
                     self.attn_cp_cpu_group,
                     src=self.attn_cp_group.ranks[0],
@@ -1376,8 +1370,14 @@ class Scheduler(
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
                 )
-                hicache_load_ack_budget = broadcast_pyobj(
-                    hicache_load_ack_budget,
+                hicache_prefetch_revoke_budget = broadcast_pyobj(
+                    hicache_prefetch_revoke_budget,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
+                hicache_prefetch_ready_budget = broadcast_pyobj(
+                    hicache_prefetch_ready_budget,
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
@@ -1390,15 +1390,23 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
-            hicache_load_ack_budget = broadcast_pyobj(
-                hicache_load_ack_budget,
+            hicache_prefetch_revoke_budget = broadcast_pyobj(
+                hicache_prefetch_revoke_budget,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+            hicache_prefetch_ready_budget = broadcast_pyobj(
+                hicache_prefetch_ready_budget,
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
 
-        self._set_pp_hicache_load_ack_budget(hicache_load_ack_budget)
-        self._maybe_apply_pp_hicache_load_ack_budget()
+        self._set_pp_prefetch_sync_budgets(
+            self._decode_pp_budget(hicache_prefetch_revoke_budget),
+            self._decode_pp_budget(hicache_prefetch_ready_budget),
+        )
 
         # Process MM requests under EPD-disaggregation mode
         if (

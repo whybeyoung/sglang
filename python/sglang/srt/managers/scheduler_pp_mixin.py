@@ -63,16 +63,23 @@ class PPBatchMetadata:
 
 class SchedulerPPMixin:
     def _pp_build_req_payload(self: Scheduler, recv_reqs):
-        load_ack_budget = None
-        get_ready_load_ack_count = getattr(
-            self.tree_cache, "get_ready_load_ack_count", None
+        revoke_budget = None
+        ready_budget = None
+        get_prefetch_revoke_count = getattr(
+            self.tree_cache, "get_prefetch_revoke_count", None
         )
-        if get_ready_load_ack_count is not None:
-            load_ack_budget = int(get_ready_load_ack_count())
+        get_ready_prefetch_req_count = getattr(
+            self.tree_cache, "get_ready_prefetch_req_count", None
+        )
+        if get_prefetch_revoke_count is not None:
+            revoke_budget = int(get_prefetch_revoke_count())
+        if get_ready_prefetch_req_count is not None:
+            ready_budget = int(get_ready_prefetch_req_count(self.waiting_queue))
         return {
             "__pp_req_payload__": True,
             "reqs": recv_reqs,
-            "hicache_load_ack_budget": load_ack_budget,
+            "hicache_prefetch_revoke_budget": revoke_budget,
+            "hicache_prefetch_ready_budget": ready_budget,
         }
 
     def _pp_unpack_req_payload(self: Scheduler, recv_payload):
@@ -82,9 +89,10 @@ class SchedulerPPMixin:
         ):
             return (
                 recv_payload.get("reqs", []),
-                recv_payload.get("hicache_load_ack_budget"),
+                recv_payload.get("hicache_prefetch_revoke_budget"),
+                recv_payload.get("hicache_prefetch_ready_budget"),
             )
-        return recv_payload, None
+        return recv_payload, None, None
 
     def _pp_send_reqs_to_next_stage(
         self: Scheduler, recv_reqs, async_send: bool = False

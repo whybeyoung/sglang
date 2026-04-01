@@ -245,10 +245,8 @@ class HiRadixCache(RadixCache):
         self.prefetch_ready_results_by_reqid: dict[
             str, LatchedPrefetchReadyResult
         ] = {}
-        # Optional PP-synchronized budget for how many load ACKs may advance L1/L2
-        # tree-visible state in the current scheduling round. This is intentionally
-        # scoped to L1+L2 and does not make L3/prefetch outcomes authoritative.
-        self.pp_load_ack_budget: Optional[int] = None
+        self.pp_prefetch_revoke_budget: Optional[int] = None
+        self.pp_prefetch_ready_budget: Optional[int] = None
         # track requests whose prefetch was skipped (alloc failure, threshold, rate limit)
         self.prefetch_skipped_rids: set[str] = set()
         # todo: dynamically adjust the threshold
@@ -593,7 +591,9 @@ class HiRadixCache(RadixCache):
                 yield item
 
         def _drain_revoke():
+            drained_revoke = 0
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                drained_revoke += 1
                 info = self.ongoing_prefetch.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
                 self.prefetch_ready_results_by_reqid.pop(req_id, None)
@@ -615,6 +615,10 @@ class HiRadixCache(RadixCache):
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
+            if self.pp_prefetch_revoke_budget is not None:
+                self.pp_prefetch_revoke_budget = max(
+                    self.pp_prefetch_revoke_budget - drained_revoke, 0
+                )
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -1233,6 +1237,8 @@ class HiRadixCache(RadixCache):
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
         n_revoke, n_backup, n_release = map(int, qsizes.tolist())
+        if self.pp_prefetch_revoke_budget is not None:
+            n_revoke = min(n_revoke, self.pp_prefetch_revoke_budget)
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
             n_backup=n_backup,
@@ -1301,6 +1307,9 @@ class HiRadixCache(RadixCache):
             return True
 
         if not self.can_terminate_prefetch(operation):
+            return False
+
+        if self.pp_prefetch_ready_budget is not None and self.pp_prefetch_ready_budget <= 0:
             return False
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
@@ -1382,7 +1391,38 @@ class HiRadixCache(RadixCache):
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
+        if self.pp_prefetch_ready_budget is not None:
+            self.pp_prefetch_ready_budget = max(self.pp_prefetch_ready_budget - 1, 0)
+
         return True
+
+    def get_prefetch_revoke_count(self) -> int:
+        return self.cache_controller.prefetch_revoke_queue.qsize()
+
+    def get_ready_prefetch_req_count(self, reqs: list[Req]) -> int:
+        ready_count = 0
+        for req in reqs:
+            info = self.ongoing_prefetch.get(req.rid)
+            if info is None:
+                continue
+            _, _, _, operation = info
+            if operation.host_indices is None:
+                continue
+            if self.can_terminate_prefetch(operation):
+                ready_count += 1
+        return ready_count
+
+    def set_pp_prefetch_sync_budgets(
+        self,
+        revoke_budget: Optional[int],
+        ready_budget: Optional[int],
+    ):
+        self.pp_prefetch_revoke_budget = (
+            None if revoke_budget is None else max(int(revoke_budget), 0)
+        )
+        self.pp_prefetch_ready_budget = (
+            None if ready_budget is None else max(int(ready_budget), 0)
+        )
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
