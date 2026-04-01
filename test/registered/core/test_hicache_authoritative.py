@@ -3121,6 +3121,37 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertEqual([node.id for node in stable], [11, 12])
         self.assertEqual(unstable, [])
 
+    def test_collect_stable_ready_visible_nodes_ignores_existing_device_prefix(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+
+        class Node:
+            def __init__(self, node_id, parent=None):
+                self.id = node_id
+                self.parent = parent
+                self.evicted = True
+                self.host_value = torch.tensor([node_id])
+
+        root = object()
+        host_1 = Node(21, root)
+        host_2 = Node(22, host_1)
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.tensor([1, 2, 3, 4]),
+                last_device_node=root,
+                last_host_node=host_2,
+                host_hit_length=2,
+            ),
+            storage_hit_length=5,
+            input_len=10,
+        )
+
+        stable = cache._collect_stable_ready_visible_nodes(
+            ready,
+            matched_length=2,
+        )
+
+        self.assertEqual([node.id for node in stable], [21, 22])
+
     def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 

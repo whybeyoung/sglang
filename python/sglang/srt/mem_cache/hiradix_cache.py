@@ -1991,14 +1991,8 @@ class HiRadixCache(RadixCache):
     ) -> list[TreeNode]:
         if ready_result is None or matched_length <= 0:
             return []
-        prefix_len = (
-            len(ready_result.match_result.device_indices)
-            + ready_result.match_result.host_hit_length
-        )
-        if (
-            ready_result.match_result.host_hit_length <= 0
-            or prefix_len > matched_length
-        ):
+        host_hit_length = ready_result.match_result.host_hit_length
+        if host_hit_length <= 0 or host_hit_length > matched_length:
             return []
         return self._collect_request_ready_visible_nodes(ready_result)
 
