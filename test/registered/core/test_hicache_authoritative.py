@@ -3515,7 +3515,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
         self.assertIs(result.last_device_node, root)
         self.assertIs(result.last_host_node, root)
 
-    def test_match_prefix_keeps_revoked_residue_with_backup_boundary(self):
+    def test_match_prefix_suppresses_revoked_residue_with_backup_boundary(self):
         cache = HiRadixCache.__new__(HiRadixCache)
 
         class DummyAuthoritative:
@@ -3578,10 +3578,10 @@ class TestHiCacheAuthoritative(CustomTestCase):
             )
         )
 
-        self.assertEqual(len(result.device_indices), 64)
+        self.assertEqual(len(result.device_indices), 0)
         self.assertEqual(result.host_hit_length, 0)
-        self.assertIs(result.last_device_node, match_node)
-        self.assertIs(result.last_host_node, match_node)
+        self.assertIs(result.last_device_node, root)
+        self.assertIs(result.last_host_node, root)
 
     def test_match_prefix_suppresses_revoked_residue_with_host_visible_boundary(self):
         cache = HiRadixCache.__new__(HiRadixCache)
