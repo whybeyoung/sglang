@@ -3707,6 +3707,7 @@ class HiRadixCache(RadixCache):
     ) -> bool:
         if ready_result is None:
             return False
+        host_hit_length = getattr(ready_result.match_result, "host_hit_length", 0)
         last_host_node = getattr(ready_result.match_result, "last_host_node", None)
         if last_host_node is not None and self.authoritative_tree.enabled:
             node_ref = self._make_authoritative_node_ref(last_host_node)
@@ -3718,6 +3719,21 @@ class HiRadixCache(RadixCache):
         if not getattr(last_host_node, "evicted", False):
             return False
         if not self._node_request_ready_visible(last_host_node):
+            return False
+        selected_host_node = self._select_last_host_node_within_hit_length(
+            last_host_node,
+            host_hit_length,
+            include_prefetch_visible=True,
+        )
+        if selected_host_node == self.root_node:
+            return False
+        if (
+            self._visible_host_hit_length_to_node(
+                selected_host_node,
+                include_prefetch_visible=True,
+            )
+            < host_hit_length
+        ):
             return False
         return True
 
