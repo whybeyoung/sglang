@@ -1715,6 +1715,21 @@ class HiRadixCache(RadixCache):
         has_pending_backup = self._has_relevant_pending_backup(req_id)
         return not (has_blueprint or has_skeleton or has_missing or has_pending_backup)
 
+    def _node_matches_authoritative_backup_boundary(
+        self, node: Optional[TreeNode]
+    ) -> bool:
+        if node is None or node == self.root_node:
+            return False
+        authoritative_backuped_node_ids = getattr(
+            self, "authoritative_backuped_node_ids", set()
+        )
+        if node.id in authoritative_backuped_node_ids:
+            return True
+        boundary_key = self._make_authoritative_boundary_key(node)
+        if boundary_key is None:
+            return False
+        return boundary_key in getattr(self, "authoritative_backuped_boundary_keys", set())
+
     def _format_authoritative_resolution_stats(self, limit: int = 6) -> str:
         stats = self.get_authoritative_resolution_stats()
         if not stats:
@@ -2103,10 +2118,23 @@ class HiRadixCache(RadixCache):
         # A request whose authoritative ready summary is still storage-only must
         # not start consuming newly materialized host subtrees through generic
         # live_match before HOST_INSERT replay settles.
-        return (
+        suppress = (
             getattr(summary, "storage_hit_length", 0) > 0
             and getattr(summary, "host_hit_length", 0) == 0
         )
+        if not suppress:
+            return False
+        last_host_node = getattr(match_result, "last_host_node", None)
+        if not self._node_matches_authoritative_backup_boundary(last_host_node):
+            return True
+        if self._has_relevant_pending_backup(req_id, host_node=last_host_node):
+            return True
+        if self.authoritative_host_insert_missing_by_reqid.get(req_id):
+            return True
+        # Allow already backup-committed host paths back into live_match once the
+        # matched path itself no longer has missing segments or pending backups,
+        # even if req-level rebuild bookkeeping has not fully drained yet.
+        return False
 
     def _clamp_ready_result_to_authoritative_summary(
         self,
