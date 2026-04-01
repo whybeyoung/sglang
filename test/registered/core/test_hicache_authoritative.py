@@ -3143,6 +3143,7 @@ class TestHiCacheAuthoritative(CustomTestCase):
 
     def test_collect_stable_ready_visible_nodes_requires_matched_prefix_bound(self):
         cache = HiRadixCache.__new__(HiRadixCache)
+        cache.page_size = 1
 
         class Node:
             def __init__(self, node_id, parent=None):
@@ -3169,16 +3170,17 @@ class TestHiCacheAuthoritative(CustomTestCase):
             ready,
             matched_length=2,
         )
-        unstable = cache._collect_stable_ready_visible_nodes(
+        partial = cache._collect_stable_ready_visible_nodes(
             ready,
             matched_length=1,
         )
 
         self.assertEqual([node.id for node in stable], [11, 12])
-        self.assertEqual(unstable, [])
+        self.assertEqual([node.id for node in partial], [12])
 
     def test_collect_stable_ready_visible_nodes_ignores_existing_device_prefix(self):
         cache = HiRadixCache.__new__(HiRadixCache)
+        cache.page_size = 1
 
         class Node:
             def __init__(self, node_id, parent=None):
@@ -3207,6 +3209,38 @@ class TestHiCacheAuthoritative(CustomTestCase):
         )
 
         self.assertEqual([node.id for node in stable], [21, 22])
+
+    def test_collect_stable_ready_visible_nodes_rounds_down_to_page_boundary(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.page_size = 4
+
+        class Node:
+            def __init__(self, node_id, parent=None):
+                self.id = node_id
+                self.parent = parent
+                self.evicted = True
+                self.host_value = torch.arange(4, dtype=torch.int64)
+
+        root = object()
+        host_1 = Node(31, root)
+        host_2 = Node(32, host_1)
+        ready = LatchedPrefetchReadyResult(
+            match_result=MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64),
+                last_device_node=root,
+                last_host_node=host_2,
+                host_hit_length=8,
+            ),
+            storage_hit_length=8,
+            input_len=16,
+        )
+
+        stable = cache._collect_stable_ready_visible_nodes(
+            ready,
+            matched_length=6,
+        )
+
+        self.assertEqual([node.id for node in stable], [32])
 
     def test_lookup_prefetch_ready_result_canonicalizes_host_only_ready(self):
         cache = HiRadixCache.__new__(HiRadixCache)

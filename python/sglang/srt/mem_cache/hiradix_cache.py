@@ -1982,9 +1982,19 @@ class HiRadixCache(RadixCache):
         if ready_result is None:
             return []
         host_hit_length = getattr(ready_result.match_result, "host_hit_length", 0)
+        return self._collect_ready_visible_nodes_within_hit_length(
+            getattr(ready_result.match_result, "last_host_node", None),
+            host_hit_length,
+        )
+
+    def _collect_ready_visible_nodes_within_hit_length(
+        self,
+        last_host_node: Optional[TreeNode],
+        host_hit_length: int,
+    ) -> list[TreeNode]:
         if host_hit_length <= 0:
             return []
-        node = getattr(ready_result.match_result, "last_host_node", None)
+        node = last_host_node
         if node is None or node == self.root_node:
             return []
         selected: list[TreeNode] = []
@@ -2014,9 +2024,19 @@ class HiRadixCache(RadixCache):
         if ready_result is None or matched_length <= 0:
             return []
         host_hit_length = ready_result.match_result.host_hit_length
-        if host_hit_length <= 0 or host_hit_length > matched_length:
+        if host_hit_length <= 0:
             return []
-        return self._collect_request_ready_visible_nodes(ready_result)
+        page_size = max(getattr(self, "page_size", 1), 1)
+        stable_host_hit_length = min(
+            host_hit_length,
+            matched_length // page_size * page_size,
+        )
+        if stable_host_hit_length <= 0:
+            return []
+        return self._collect_ready_visible_nodes_within_hit_length(
+            getattr(ready_result.match_result, "last_host_node", None),
+            stable_host_hit_length,
+        )
 
     def _clamp_ready_result_to_authoritative_summary(
         self,
