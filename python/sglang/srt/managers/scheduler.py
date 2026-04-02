@@ -1258,45 +1258,21 @@ class Scheduler(
         if getter is None:
             return
 
-        timeout_s = max(envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1)
-        wait_start = time.perf_counter()
-        while True:
-            revoke_budget, ready_budget = getter()
-            revoke_pending = revoke_budget is not None and revoke_budget > 0
-            ready_pending = ready_budget is not None and ready_budget > 0
-            if not revoke_pending and not ready_pending:
-                return
+        revoke_budget, ready_budget = getter()
+        revoke_pending = revoke_budget is not None and revoke_budget > 0
+        ready_pending = ready_budget is not None and ready_budget > 0
+        if not revoke_pending and not ready_pending:
+            return
 
-            self.tree_cache.check_hicache_events()
+        # Best-effort one-shot pump to avoid stalling the PP main loop.
+        self.tree_cache.check_hicache_events()
 
-            if ready_pending:
-                for req in self.waiting_queue:
-                    self.tree_cache.check_prefetch_progress(req)
-                    _, new_ready_budget = getter()
-                    if new_ready_budget is None or new_ready_budget <= 0:
-                        break
-
-            new_revoke_budget, new_ready_budget = getter()
-            if (
-                (new_revoke_budget is None or new_revoke_budget <= 0)
-                and (new_ready_budget is None or new_ready_budget <= 0)
-            ):
-                return
-
-            if time.perf_counter() - wait_start >= timeout_s:
-                logger.warning(
-                    "[PPPrefetchSync] wait timeout: revoke_budget=%s ready_budget=%s "
-                    "pp=%s cp=%s tp=%s waiting_queue=%s",
-                    new_revoke_budget,
-                    new_ready_budget,
-                    self.pp_rank,
-                    self.attn_cp_rank,
-                    self.attn_tp_rank,
-                    len(self.waiting_queue),
-                )
-                return
-
-            time.sleep(0.001)
+        if ready_pending:
+            for req in self.waiting_queue:
+                self.tree_cache.check_prefetch_progress(req)
+                _, new_ready_budget = getter()
+                if new_ready_budget is None or new_ready_budget <= 0:
+                    break
 
     def recv_requests(
         self,
@@ -1467,7 +1443,6 @@ class Scheduler(
             self._decode_pp_budget_payload(hicache_prefetch_revoke_budget),
             self._decode_pp_budget_payload(hicache_prefetch_ready_budget),
         )
-        self._maybe_wait_for_pp_prefetch_sync_budgets()
 
         # Process MM requests under EPD-disaggregation mode
         if (
