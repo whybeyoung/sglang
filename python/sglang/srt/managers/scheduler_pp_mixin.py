@@ -301,7 +301,6 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
-        send_prefetch_sync_work = []
 
         while True:
             server_is_idle = True
@@ -325,9 +324,6 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                if not self.pp_group.is_first_rank:
-                    self._pp_apply_prefetch_sync_from_prev_stage()
-
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
@@ -340,11 +336,6 @@ class SchedulerPPMixin:
                 batch = self.get_new_batch_prefill()
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(send_prefetch_sync_work)
-                    send_prefetch_sync_work = (
-                        self._pp_send_prefetch_sync_to_next_stage(async_send=True)
-                    )
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
