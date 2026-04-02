@@ -1366,13 +1366,14 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
-            # If it is a health check generation request and there are running requests, ignore it.
-            if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None
-                or self.dllm_manager.any_staging_reqs()
-                or not self.running_batch.is_empty()
-                or len(self.offload_tags) > 0
-            ):
+            # Skip health check when the scheduler is busy. Ongoing work already
+            # carries health info back through process_output, but disagg
+            # bootstrap/prealloc/transfer queues do not always imply active GPU
+            # progress, so they are intentionally excluded from the health-check
+            # idle path.
+            if is_health_check_generate_req(
+                recv_req
+            ) and not self.is_fully_idle(for_health_check=True):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
@@ -2699,6 +2700,37 @@ class Scheduler(
         if len(self.grammar_manager.grammar_queue) != 0:
             return False
         return True
+
+    def is_fully_idle(self, for_health_check: bool = False) -> bool:
+        # Health check piggybacks on results emitted by active scheduling work.
+        # Only running state and waiting_queue guarantee the scheduler can make
+        # forward progress soon; disagg bootstrap/prealloc/transfer queues may
+        # hold requests that are stalled on remote connectivity or KV pressure,
+        # so they must not be treated as proof of liveness for health checks.
+        idle = (
+            self.running_batch.is_empty()
+            and self.chunked_req is None
+            and not self.dllm_manager.any_staging_reqs()
+            and (self.last_batch is None or self.last_batch.is_empty())
+            and (self.cur_batch is None or self.cur_batch.is_empty())
+            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+            and len(self.offload_tags) == 0
+        )
+
+        idle &= len(self.waiting_queue) == 0
+
+        if not for_health_check:
+            idle &= len(self.grammar_manager.grammar_queue) == 0
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                idle &= len(self.disagg_prefill_inflight_queue) == 0
+                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
+                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+
+        return idle
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
