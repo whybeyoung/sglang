@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -942,6 +944,25 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                logger.warning(
+                    "[HiCacheMatchChain] init_next_round_input: rid=%s fill_len=%s "
+                    "token_ids_len=%s matched_device=%s matched_host=%s prefix_len=%s "
+                    "pp_last_device=%s pp_last_host=%s",
+                    self.rid,
+                    len(self.fill_ids),
+                    len(token_ids),
+                    len(match_result.device_indices),
+                    match_result.host_hit_length,
+                    len(self.prefix_indices),
+                    match_result.last_device_node.id
+                    if match_result.last_device_node is not None
+                    else None,
+                    match_result.last_host_node.id
+                    if match_result.last_host_node is not None
+                    else None,
+                )
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()

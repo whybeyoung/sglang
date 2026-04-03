@@ -7,8 +7,10 @@ import logging
 import os
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
 
 import torch
 
@@ -60,6 +62,18 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PPHostTreeEvent:
+    seq: int
+    kind: str
+    rid: Optional[str] = None
+    loaded_from_storage: int = 0
+    node_ids: List[int] = field(default_factory=list)
+    node_key_lens: List[int] = field(default_factory=list)
+    node_last_hashes: List[Optional[str]] = field(default_factory=list)
+    node_extra_keys: List[Optional[str]] = field(default_factory=list)
 
 
 class HiRadixCache(RadixCache):
@@ -175,6 +189,11 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+        self.pp_host_tree_event_seq = 0
+        self.pp_outgoing_host_tree_events: List[dict[str, Any]] = []
+        self.pp_pending_host_tree_events: Deque[PPHostTreeEvent] = deque()
+        self.pp_deferred_revoke_req_ids: Deque[str] = deque()
+        self._in_pp_host_tree_replay = False
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -492,14 +511,25 @@ class HiRadixCache(RadixCache):
                 yield item
 
         def _drain_revoke():
+            if self._pp_downstream_sync_enabled():
+                for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                    self.pp_deferred_revoke_req_ids.append(req_id)
+                while self.pp_pending_host_tree_events:
+                    event = self.pp_pending_host_tree_events[0]
+                    if event.kind != "REVOKE" or not self._try_replay_revoke_event(event):
+                        break
+                    self.pp_pending_host_tree_events.popleft()
+                return
+
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                info = self.ongoing_prefetch.pop(req_id, None)
-                if info is not None:
-                    last_host_node, token_ids, _, _ = info
-                    last_host_node.release_host()
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
+                self._drain_single_revoke_req(req_id)
+                self._append_pp_host_tree_event(
+                    PPHostTreeEvent(
+                        seq=self._next_pp_host_tree_seq(),
+                        kind="REVOKE",
+                        rid=req_id,
+                    )
+                )
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -608,7 +638,276 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        self.pp_outgoing_host_tree_events.clear()
+        self.pp_pending_host_tree_events.clear()
+        self.pp_deferred_revoke_req_ids.clear()
         super().reset()
+
+    def _pp_downstream_sync_enabled(self) -> bool:
+        return self.enable_storage and self.pp_size > 1 and self.pp_rank > 0
+
+    def _append_pp_host_tree_event(self, event: PPHostTreeEvent) -> None:
+        if not (self.enable_storage and self.pp_size > 1):
+            return
+        self.pp_outgoing_host_tree_events.append(
+            {
+                "seq": event.seq,
+                "kind": event.kind,
+                "rid": event.rid,
+                "loaded_from_storage": event.loaded_from_storage,
+                "node_ids": list(event.node_ids),
+                "node_key_lens": list(event.node_key_lens),
+                "node_last_hashes": list(event.node_last_hashes),
+                "node_extra_keys": list(event.node_extra_keys),
+            }
+        )
+
+    def _next_pp_host_tree_seq(self) -> int:
+        self.pp_host_tree_event_seq += 1
+        return self.pp_host_tree_event_seq
+
+    def consume_pp_host_tree_events(self) -> List[dict[str, Any]]:
+        events = list(self.pp_outgoing_host_tree_events)
+        self.pp_outgoing_host_tree_events.clear()
+        return events
+
+    def enqueue_pp_host_tree_events(self, events: List[dict[str, Any]]) -> None:
+        if not self._pp_downstream_sync_enabled() or not events:
+            return
+        for event in events:
+            self.pp_pending_host_tree_events.append(
+                PPHostTreeEvent(
+                    seq=int(event.get("seq", 0)),
+                    kind=str(event["kind"]),
+                    rid=event.get("rid"),
+                    loaded_from_storage=int(event.get("loaded_from_storage", 0)),
+                    node_ids=[int(v) for v in event.get("node_ids", [])],
+                    node_key_lens=[int(v) for v in event.get("node_key_lens", [])],
+                    node_last_hashes=list(event.get("node_last_hashes", [])),
+                    node_extra_keys=list(event.get("node_extra_keys", [])),
+                )
+            )
+
+    def _peek_pp_host_tree_event(self) -> Optional[PPHostTreeEvent]:
+        if not self.pp_pending_host_tree_events:
+            return None
+        return self.pp_pending_host_tree_events[0]
+
+    def _pop_pp_host_tree_event(self) -> Optional[PPHostTreeEvent]:
+        if not self.pp_pending_host_tree_events:
+            return None
+        return self.pp_pending_host_tree_events.popleft()
+
+    def _drain_single_revoke_req(self, req_id: str) -> None:
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is not None:
+            last_host_node, token_ids, _, _ = info
+            last_host_node.release_host()
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+            if self.cache_controller.prefetch_tokens_occupied < 0:
+                self.cache_controller.prefetch_tokens_occupied = 0
+        self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+
+    def _try_replay_revoke_event(self, event: PPHostTreeEvent) -> bool:
+        req_id = event.rid
+        if req_id is None:
+            return False
+
+        while True:
+            if self.pp_deferred_revoke_req_ids:
+                deferred_req_id = self.pp_deferred_revoke_req_ids[0]
+                if deferred_req_id != req_id:
+                    return False
+                self.pp_deferred_revoke_req_ids.popleft()
+                self._drain_single_revoke_req(deferred_req_id)
+                return True
+
+            try:
+                queued_req_id = self.cache_controller.prefetch_revoke_queue.get_nowait()
+            except Empty:
+                return False
+
+            if queued_req_id != req_id:
+                self.pp_deferred_revoke_req_ids.append(queued_req_id)
+                return False
+
+            self._drain_single_revoke_req(queued_req_id)
+            return True
+
+    def _write_commit_event_matches(
+        self,
+        event: PPHostTreeEvent,
+        ack_list: List[int],
+        nodes: List[TreeNode],
+    ) -> bool:
+        if ack_list != event.node_ids:
+            return False
+        if len(nodes) != len(event.node_key_lens):
+            return False
+        for idx, node in enumerate(nodes):
+            if len(node.key) != event.node_key_lens[idx]:
+                return False
+            if node.key.extra_key != event.node_extra_keys[idx]:
+                return False
+            if node.get_last_hash_value() != event.node_last_hashes[idx]:
+                return False
+        return True
+
+    def _consume_write_ack_group(
+        self, finish_event, ack_list: List[int], emit_event: bool
+    ) -> None:
+        finish_event.synchronize()
+        committed_nodes: List[TreeNode] = []
+        for ack_id in ack_list:
+            backuped_node = self.ongoing_write_through.pop(ack_id)
+            committed_nodes.append(backuped_node)
+            self.dec_lock_ref(backuped_node)
+            if self.enable_storage:
+                self.write_backup_storage(backuped_node)
+        if emit_event:
+            self._append_pp_host_tree_event(
+                PPHostTreeEvent(
+                    seq=self._next_pp_host_tree_seq(),
+                    kind="WRITE_BACKUP_COMMITTED",
+                    node_ids=[node.id for node in committed_nodes],
+                    node_key_lens=[len(node.key) for node in committed_nodes],
+                    node_last_hashes=[
+                        node.get_last_hash_value() for node in committed_nodes
+                    ],
+                    node_extra_keys=[node.key.extra_key for node in committed_nodes],
+                )
+            )
+
+    def _try_replay_write_backup_event(self, event: PPHostTreeEvent) -> bool:
+        if not self.cache_controller.ack_write_queue:
+            return False
+        _, finish_event, ack_list = self.cache_controller.ack_write_queue[0]
+        if not finish_event.query():
+            return False
+        nodes = [self.ongoing_write_through.get(ack_id) for ack_id in ack_list]
+        if any(node is None for node in nodes):
+            return False
+        if not self._write_commit_event_matches(event, ack_list, nodes):
+            return False
+        self.cache_controller.ack_write_queue.pop(0)
+        self._consume_write_ack_group(finish_event, ack_list, emit_event=True)
+        return True
+
+    def _finalize_prefetch_progress(
+        self, req_id: str, operation: PrefetchOperation, emit_event: bool
+    ) -> int:
+        last_host_node, token_ids, host_indices, _ = self.ongoing_prefetch[req_id]
+        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+            operation
+        )
+        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+
+        min_completed_tokens = completed_tokens
+        if self.tp_world_size > 1:
+            completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
+            torch.distributed.all_reduce(
+                completed_tokens_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            min_completed_tokens = completed_tokens_tensor.item()
+
+        fetched_token_ids = token_ids[:min_completed_tokens]
+        written_indices = host_indices[:min_completed_tokens]
+        matched_length = self._insert_helper_host(
+            last_host_node,
+            RadixKey(
+                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+            ),
+            written_indices,
+            hash_value[: min_completed_tokens // self.page_size],
+        )
+
+        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.append_host_mem_release(
+            host_indices[min_completed_tokens:completed_tokens]
+        )
+        last_host_node.release_host()
+        del self.ongoing_prefetch[req_id]
+        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+        loaded_from_storage = min_completed_tokens - matched_length
+        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+
+        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+            logger.warning(
+                "[HiCacheMatchChain] prefetch finalize: rid=%s completed_tokens=%s "
+                "min_completed_tokens=%s matched_length=%s loaded_from_storage=%s "
+                "pp=%s cp=%s",
+                req_id,
+                completed_tokens,
+                min_completed_tokens,
+                matched_length,
+                loaded_from_storage,
+                self.pp_rank,
+                self.attn_cp_rank,
+            )
+
+        if emit_event:
+            self._append_pp_host_tree_event(
+                PPHostTreeEvent(
+                    seq=self._next_pp_host_tree_seq(),
+                    kind="PREFETCH_FINALIZE",
+                    rid=req_id,
+                    loaded_from_storage=loaded_from_storage,
+                )
+            )
+        if self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+        return loaded_from_storage
+
+    def _try_replay_prefetch_finalize_event(self, event: PPHostTreeEvent) -> bool:
+        req_id = event.rid
+        if req_id is None or req_id not in self.ongoing_prefetch:
+            return False
+        _, _, _, operation = self.ongoing_prefetch[req_id]
+        if operation.host_indices is None or not self.can_terminate_prefetch(operation):
+            return False
+        loaded_from_storage = self._finalize_prefetch_progress(
+            req_id, operation, emit_event=True
+        )
+        if loaded_from_storage != event.loaded_from_storage:
+            logger.warning(
+                "[PPHiCacheSync] prefetch finalize mismatch: rid=%s upstream=%s local=%s "
+                "pp=%s cp=%s",
+                req_id,
+                event.loaded_from_storage,
+                loaded_from_storage,
+                self.pp_rank,
+                self.attn_cp_rank,
+            )
+        return True
+
+    def replay_pp_host_tree_events(self) -> int:
+        if not self._pp_downstream_sync_enabled():
+            return 0
+        if self._in_pp_host_tree_replay:
+            return 0
+
+        replayed = 0
+        self._in_pp_host_tree_replay = True
+        try:
+            while self.pp_pending_host_tree_events:
+                event = self.pp_pending_host_tree_events[0]
+                progressed = False
+                if event.kind == "WRITE_BACKUP_COMMITTED":
+                    progressed = self._try_replay_write_backup_event(event)
+                elif event.kind == "REVOKE":
+                    progressed = self._try_replay_revoke_event(event)
+                elif event.kind == "PREFETCH_FINALIZE":
+                    progressed = self._try_replay_prefetch_finalize_event(event)
+                if not progressed:
+                    break
+                self.pp_pending_host_tree_events.popleft()
+                replayed += 1
+        finally:
+            self._in_pp_host_tree_replay = False
+        return replayed
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -719,8 +1018,18 @@ class HiRadixCache(RadixCache):
         if len(self.ongoing_write_through) == 0:
             return
 
+        if self._pp_downstream_sync_enabled():
+            while self.pp_pending_host_tree_events:
+                event = self.pp_pending_host_tree_events[0]
+                if event.kind != "WRITE_BACKUP_COMMITTED":
+                    break
+                if not self._try_replay_write_backup_event(event):
+                    break
+                self.pp_pending_host_tree_events.popleft()
+            return
+
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+        for _, finish_event, _ in self.cache_controller.ack_write_queue:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -736,12 +1045,7 @@ class HiRadixCache(RadixCache):
         finish_count = int(queue_size.item())
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
-                self.dec_lock_ref(backuped_node)
-                if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+            self._consume_write_ack_group(finish_event, ack_list, emit_event=True)
             finish_count -= 1
 
     def loading_check(self):
@@ -1116,6 +1420,13 @@ class HiRadixCache(RadixCache):
             # there is no ongoing prefetch for this request or it has been revoked
             return True
 
+        if self._pp_downstream_sync_enabled() and not self._in_pp_host_tree_replay:
+            self.replay_pp_host_tree_events()
+            event = self._peek_pp_host_tree_event()
+            if event is not None:
+                if event.kind != "PREFETCH_FINALIZE" or event.rid != req_id:
+                    return False
+
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
@@ -1128,49 +1439,12 @@ class HiRadixCache(RadixCache):
 
         if not self.can_terminate_prefetch(operation):
             return False
+        self._finalize_prefetch_progress(req_id, operation, emit_event=True)
 
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
-
-        min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            # synchrnoize TP workers to make the same update to hiradix cache
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = completed_tokens_tensor.item()
-        fetched_token_ids = token_ids[:min_completed_tokens]
-        written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
-            ),
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
-        )
-
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
-        last_host_node.release_host()
-        del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
-
-        # Track tokens actually loaded from storage for this request (L3 hits)
-        loaded_from_storage = min_completed_tokens - matched_length
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
-
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+        if self._pp_downstream_sync_enabled():
+            event = self._peek_pp_host_tree_event()
+            if event is not None and event.kind == "PREFETCH_FINALIZE" and event.rid == req_id:
+                self._pop_pp_host_tree_event()
 
         return True
 
@@ -1221,6 +1495,28 @@ class HiRadixCache(RadixCache):
             last_node = last_node.parent
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
+
+        if (
+            os.getenv("SGLANG_DEBUG_HICACHE_MATCH", "0") == "1"
+            and params.req is not None
+        ):
+            logger.warning(
+                "[HiCacheMatch] rid=%s key_len=%s aligned_len=%s device_hit=%s "
+                "host_hit=%s total_cached=%s page_size=%s pp=%s cp=%s tp=%s "
+                "last_device=%s last_host=%s",
+                params.req.rid,
+                len(params.key),
+                page_aligned_len,
+                len(value),
+                host_hit_length,
+                len(value) + host_hit_length,
+                self.page_size,
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.cache_controller.tp_rank,
+                last_node.id if last_node is not None else None,
+                last_host_node.id if last_host_node is not None else None,
+            )
 
         return MatchResult(
             device_indices=value,

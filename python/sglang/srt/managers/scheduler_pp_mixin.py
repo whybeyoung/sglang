@@ -58,6 +58,37 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_build_req_payload(self: Scheduler, recv_reqs):
+        if self.pp_group.is_last_rank:
+            return recv_reqs
+        events = []
+        if (
+            self.enable_hicache_storage
+            and self.tree_cache is not None
+            and hasattr(self.tree_cache, "consume_pp_host_tree_events")
+        ):
+            events = self.tree_cache.consume_pp_host_tree_events()
+        if not events:
+            return recv_reqs
+        return {
+            "recv_reqs": recv_reqs,
+            "hicache_host_tree_events": events,
+        }
+
+    def _pp_apply_hicache_sync_before_batch(self: Scheduler) -> None:
+        if (
+            self.pp_rank == 0
+            or not self.enable_hicache_storage
+            or self.tree_cache is None
+        ):
+            return
+        incoming_events = getattr(self, "pp_hicache_host_tree_events", None) or []
+        if incoming_events and hasattr(self.tree_cache, "enqueue_pp_host_tree_events"):
+            self.tree_cache.enqueue_pp_host_tree_events(incoming_events)
+        self.pp_hicache_host_tree_events = []
+        if hasattr(self.tree_cache, "replay_pp_host_tree_events"):
+            self.tree_cache.replay_pp_host_tree_events()
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -98,10 +129,11 @@ class SchedulerPPMixin:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
+                            self._pp_build_req_payload(recv_reqs),
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
+                    self._pp_apply_hicache_sync_before_batch()
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
@@ -226,6 +258,7 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
+                self._pp_apply_hicache_sync_before_batch()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -309,7 +342,7 @@ class SchedulerPPMixin:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        self._pp_build_req_payload(recv_reqs), async_send=True
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True

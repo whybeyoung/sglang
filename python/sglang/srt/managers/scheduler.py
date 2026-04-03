@@ -1423,6 +1423,7 @@ class Scheduler(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        pp_hicache_host_tree_events: List[dict] = []
 
         if self.recv_skipper is not None:
             last_forward_mode = (
@@ -1470,12 +1471,27 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
+        if self.pp_rank > 0:
+            if (
+                self.attn_tp_rank == 0
+                and self.attn_cp_rank == 0
+                and isinstance(recv_reqs, dict)
+                and "recv_reqs" in recv_reqs
+            ):
+                pp_hicache_host_tree_events = list(
+                    recv_reqs.get("hicache_host_tree_events", [])
+                )
+                recv_reqs = recv_reqs["recv_reqs"]
+            elif self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+                pp_hicache_host_tree_events = []
+
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
                 work_reqs = None
                 control_reqs = None
+                pp_hicache_host_tree_events = None
 
             if self.attn_tp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1484,6 +1500,13 @@ class Scheduler(
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
+                if self.pp_rank > 0:
+                    pp_hicache_host_tree_events = broadcast_pyobj(
+                        pp_hicache_host_tree_events,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
 
             if self.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1492,6 +1515,13 @@ class Scheduler(
                     self.attn_cp_cpu_group,
                     src=self.attn_cp_group.ranks[0],
                 )
+                if self.pp_rank > 0:
+                    pp_hicache_host_tree_events = broadcast_pyobj(
+                        pp_hicache_host_tree_events,
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
 
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
@@ -1508,6 +1538,18 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+            if self.pp_rank > 0:
+                pp_hicache_host_tree_events = broadcast_pyobj(
+                    pp_hicache_host_tree_events,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
+
+        if self.pp_rank > 0:
+            self.pp_hicache_host_tree_events = list(pp_hicache_host_tree_events or [])
+        else:
+            self.pp_hicache_host_tree_events = []
 
         # Process MM requests under EPD-disaggregation mode
         if (
@@ -2443,6 +2485,22 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                prefix_len_after_init = len(req.prefix_indices)
+                recomputed_extend_len = len(req.fill_ids) - prefix_len_after_init
+                logger.warning(
+                    "[PPShape] rid=%s fill_len=%s prefix_len=%s host_hit=%s "
+                    "storage_hit=%s extend_len=%s pp=%s cp=%s tp=%s",
+                    req.rid,
+                    len(req.fill_ids),
+                    prefix_len_after_init,
+                    req.host_hit_length,
+                    req.storage_hit_length,
+                    recomputed_extend_len,
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
