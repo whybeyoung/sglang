@@ -420,7 +420,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
                 )
                 if self.is_mla_cp_mode:
-                    self.mla_suffix = f"{self.pp_rank}_{self.mla_cp_writer_rank}"
+                    self.mla_suffix = f"{self.pp_rank}_cp_{self.mla_cp_writer_rank}"
                 else:
                     self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
             else:
