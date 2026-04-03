@@ -2011,13 +2011,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
+        Currently doing FlashInfer autotune and optional PP sampling warmup.
         """
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+        if self._should_run_flashinfer_sampling_warmup():
+            self._flashinfer_sampling_warmup()
 
         self._warmup_fused_sampling()
 
@@ -2083,6 +2086,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
+
+    def _should_run_flashinfer_sampling_warmup(self) -> bool:
+        if self.server_args.sampling_backend != "flashinfer":
+            return False
+        if self.pp_rank != self.pp_size - 1:
+            return False
+        if self.pp_size == 1 and self.tp_size == 1:
+            return False
+        return True
+
+    def _flashinfer_sampling_warmup(self):
+        from flashinfer.sampling import top_k_top_p_sampling_from_probs
+
+        logger.info("Running FlashInfer sampling warmup (last PP stage)...")
+        for step in range(self.tp_size):
+            self.tp_group.barrier()
+            if self.tp_rank == step:
+                with torch.inference_mode():
+                    batch_size = 2
+                    vocab_size = 128
+                    probs = torch.rand(
+                        batch_size, vocab_size, device=self.device, dtype=torch.float32
+                    )
+                    probs = probs / probs.sum(dim=-1, keepdim=True)
+                    top_k = torch.full(
+                        (batch_size,), 50, device=self.device, dtype=torch.int32
+                    )
+                    top_p = torch.full(
+                        (batch_size,), 1.0, device=self.device, dtype=torch.float32
+                    )
+                    top_k_top_p_sampling_from_probs(
+                        probs,
+                        top_k,
+                        top_p,
+                        filter_apply_order="joint",
+                        check_nan=False,
+                    )
+            self.tp_group.barrier()
+        logger.info("FlashInfer sampling warmup completed.")
 
     def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
