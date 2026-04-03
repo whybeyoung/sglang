@@ -118,10 +118,18 @@ class PoolTransferResult:
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
     def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
-        """Record actual load/write success counts per extra pool."""
-        self.extra_pool_hit_pages.update(
-            {name: sum(rs) for name, rs in results.items()}
-        )
+        """Refine extra-pool hit pages from concrete get/set results."""
+        for name, rs in results.items():
+            self.extra_pool_hit_pages[name] = max(
+                self.extra_pool_hit_pages.get(name, 0),
+                sum(rs),
+            )
+
+    def update_extra_pool_hit_page_counts(self, counts: dict[str, int]) -> None:
+        for name, count in counts.items():
+            self.extra_pool_hit_pages[name] = max(
+                self.extra_pool_hit_pages.get(name, 0), count
+            )
 
 
 class HiCacheStorage(ABC):
