@@ -86,8 +86,10 @@ class SchedulerPPMixin:
         if incoming_events and hasattr(self.tree_cache, "enqueue_pp_host_tree_events"):
             self.tree_cache.enqueue_pp_host_tree_events(incoming_events)
         self.pp_hicache_host_tree_events = []
-        if hasattr(self.tree_cache, "replay_pp_host_tree_events"):
-            self.tree_cache.replay_pp_host_tree_events()
+        # Keep PP transport minimal: only stage/broadcast the ordered host-tree events
+        # here. The actual local application should stay on the original hicache pump
+        # paths (writing_check/check_prefetch_progress), otherwise batch selection can
+        # interleave with drain_storage_control_queues() and disturb PD bootstrap timing.
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
