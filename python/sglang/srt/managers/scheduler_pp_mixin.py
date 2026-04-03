@@ -37,6 +37,21 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+def _ordered_intersection(left: List[str], right: List[str]) -> List[str]:
+    right_set = set(right)
+    return [item for item in left if item in right_set]
+
+
+def _ordered_union(left: List[str], right: List[str]) -> List[str]:
+    merged = list(left)
+    seen = set(left)
+    for item in right:
+        if item not in seen:
+            merged.append(item)
+            seen.add(item)
+    return merged
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -768,11 +783,11 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = _ordered_intersection(
+                prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+            bad_bootstrapped_rids = _ordered_union(
+                prev_bad_bootstrapped_rids, curr_bad_bootstrapped_rids
             )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
@@ -796,8 +811,8 @@ class SchedulerPPMixin:
                 [KVPoll.Success, KVPoll.Failed],
             )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            transferred_rids = _ordered_intersection(
+                prev_transferred_rids, curr_transferred_rids
             )
         return transferred_rids
 
@@ -1182,7 +1197,7 @@ class SchedulerPPMixin:
         else:
             # Other ranks, receive the retracted reqs info from the previous rank and ensure the consensus
             prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
-            return list(set(prev_retract_rids) & set(curr_retract_rids))
+            return _ordered_intersection(prev_retract_rids, curr_retract_rids)
 
     def _pp_pd_get_prealloc_ids(self: Scheduler):
         # communicate pre-consensus prealloc reqs
@@ -1204,11 +1219,11 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            good_prealloc_rids = list(
-                set(prev_good_prealloc_rids) & set(curr_good_prealloc_rids)
+            good_prealloc_rids = _ordered_intersection(
+                prev_good_prealloc_rids, curr_good_prealloc_rids
             )
-            bad_prealloc_rids = list(
-                set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
+            bad_prealloc_rids = _ordered_union(
+                prev_bad_prealloc_rids, curr_bad_prealloc_rids
             )
         return [good_prealloc_rids, bad_prealloc_rids]
 
@@ -1232,8 +1247,8 @@ class SchedulerPPMixin:
                 [KVPoll.Success, KVPoll.Failed],
             )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            transferred_rids = _ordered_intersection(
+                prev_transferred_rids, curr_transferred_rids
             )
         return transferred_rids
 

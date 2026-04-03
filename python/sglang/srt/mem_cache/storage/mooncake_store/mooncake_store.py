@@ -411,11 +411,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
             self.enable_pp = self.pp_size > 1
             self.enable_cp = self.attn_cp_size > 1
+            # In MLA+CP mode, KV content is identical across CP ranks.
+            # Use CP0 as the shared storage key owner.
+            self.mla_cp_writer_rank = 0
+            self.is_mla_cp_mode = self.is_mla_backend and self.enable_cp
             if self.enable_pp or self.enable_cp:
                 self.mha_suffix = (
                     f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
                 )
-                self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
+                if self.is_mla_cp_mode:
+                    self.mla_suffix = f"{self.pp_rank}_{self.mla_cp_writer_rank}"
+                else:
+                    self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
@@ -962,6 +969,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
+        if self._should_skip_local_write():
+            return [0] * len(key_strs)
         return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
@@ -971,6 +980,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
+
+    def _should_skip_local_write(self) -> bool:
+        # MLA+CP: only CP0 writes shared keys, other CP ranks read CP0 keys.
+        return self.is_mla_cp_mode and self.attn_cp_rank != self.mla_cp_writer_rank
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
