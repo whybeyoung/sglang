@@ -166,11 +166,19 @@ class SchedulerPPMixin:
         local_candidate_reqs,
         curr_good_bootstrapped_rids,
         curr_bad_bootstrapped_rids,
+        candidate_polls=None,
     ) -> Dict[str, object]:
+        poll_values = []
+        if candidate_polls:
+            poll_values = [
+                getattr(poll, "name", str(poll))
+                for poll in list(candidate_polls)[:8]
+            ]
         return {
             "mb": mb_id,
             "bootstrap": self._pp_prefill_bootstrap_req_debug(local_bootstrap_reqs),
             "candidates": self._pp_prefill_bootstrap_req_debug(local_candidate_reqs),
+            "polls": poll_values,
             "curr_good": curr_good_bootstrapped_rids[:8],
             "curr_bad": curr_bad_bootstrapped_rids[:8],
         }
@@ -1284,8 +1292,9 @@ class SchedulerPPMixin:
             (
                 good_bootstrapped_rids,
                 bad_bootstrapped_rids,
+                _local_candidate_polls,
             ) = self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
-                local_bootstrap_reqs
+                local_bootstrap_reqs, return_polls=True
             )
             shared_bootstrap_capacity = local_bootstrap_capacity
         else:
@@ -1324,9 +1333,13 @@ class SchedulerPPMixin:
                         for req in local_bootstrap_reqs
                         if req.rid in prev_good_rids_set
                     ]
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
+            (
+                curr_good_bootstrapped_rids,
+                curr_bad_bootstrapped_rids,
+                candidate_polls,
+            ) = (
                 self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
-                    local_candidate_reqs
+                    local_candidate_reqs, return_polls=True
                 )
             )
             local_bootstrap_rids = [req.rid for req in local_bootstrap_reqs]
@@ -1353,8 +1366,9 @@ class SchedulerPPMixin:
                         (
                             curr_good_bootstrapped_rids,
                             curr_bad_bootstrapped_rids,
+                            candidate_polls,
                         ) = self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
-                            local_candidate_reqs[1:]
+                            local_candidate_reqs[1:], return_polls=True
                         )
                 else:
                     self._pp_prefill_clear_intermediate_head(
@@ -1413,6 +1427,7 @@ class SchedulerPPMixin:
                         local_candidate_reqs,
                         curr_good_bootstrapped_rids,
                         curr_bad_bootstrapped_rids,
+                        candidate_polls,
                     ),
                     bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
                 )
@@ -1435,6 +1450,7 @@ class SchedulerPPMixin:
                         local_candidate_reqs,
                         curr_good_bootstrapped_rids,
                         curr_bad_bootstrapped_rids,
+                        candidate_polls,
                     ),
                     bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
                 )
@@ -1454,6 +1470,7 @@ class SchedulerPPMixin:
                         local_candidate_reqs,
                         curr_good_bootstrapped_rids,
                         curr_bad_bootstrapped_rids,
+                        candidate_polls,
                     ),
                     bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
                 )
@@ -1475,6 +1492,7 @@ class SchedulerPPMixin:
                         local_candidate_reqs,
                         curr_good_bootstrapped_rids,
                         curr_bad_bootstrapped_rids,
+                        candidate_polls,
                     ),
                     bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
                 )
@@ -1537,6 +1555,7 @@ class SchedulerPPMixin:
                         local_candidate_reqs,
                         curr_good_bootstrapped_rids,
                         curr_bad_bootstrapped_rids,
+                        candidate_polls,
                     ),
                 )
         if len(good_bootstrapped_rids) > shared_bootstrap_capacity:

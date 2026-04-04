@@ -276,11 +276,11 @@ class PrefillBootstrapQueue:
         return True
 
     def get_bootstrapped_rids(
-        self, reqs: Optional[List[Req]] = None
-    ) -> tuple[List[str], List[str]]:
+        self, reqs: Optional[List[Req]] = None, return_polls: bool = False
+    ) -> tuple[List[str], List[str]] | tuple[List[str], List[str], List[KVPoll]]:
         reqs_to_poll = self.queue if reqs is None else reqs
         if not reqs_to_poll:
-            return [], []
+            return ([], [], []) if return_polls else ([], [])
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in reqs_to_poll],
@@ -300,6 +300,8 @@ class PrefillBootstrapQueue:
                 break
             good_rids.append(req.rid)
 
+        if return_polls:
+            return good_rids, bad_rids, list(polls)
         return good_rids, bad_rids
 
     def _handle_bootstrap_failed_req(self, req: Req) -> None:
