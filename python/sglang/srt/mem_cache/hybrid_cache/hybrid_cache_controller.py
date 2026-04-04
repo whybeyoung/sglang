@@ -23,6 +23,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
+    PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
@@ -412,7 +413,7 @@ class HybridCacheController(BaseHiCacheController):
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
         all_pages_extra_pools = {
-            _pool_name_key(transfer.name)
+            transfer.name
             for transfer in operation.pool_transfers or []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
         }
@@ -420,7 +421,7 @@ class HybridCacheController(BaseHiCacheController):
             {
                 name: count
                 for name, count in hit_result.extra_pool_hit_pages.items()
-                if name != PoolName.KV.value and name not in all_pages_extra_pools
+                if name != PoolName.KV and name not in all_pages_extra_pools
             }
         )
 
