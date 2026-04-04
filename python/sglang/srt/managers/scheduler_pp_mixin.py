@@ -302,18 +302,23 @@ class SchedulerPPMixin:
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
                 self._pp_apply_hicache_sync_before_batch()
-                self._pp_prefill_diag_log(
-                    "recv",
-                    mb=mb_id,
-                    recv=self._pp_prefill_diag_rids(recv_reqs),
-                    waiting=self._pp_prefill_diag_rids(self.waiting_queue),
-                    bootstrap_q=self._pp_prefill_diag_rids(
-                        self.disagg_prefill_bootstrap_queue.queue
-                    ),
-                    inflight_q=self._pp_prefill_diag_rids(
-                        self.disagg_prefill_inflight_queue
-                    ),
+                recv_diag = self._pp_prefill_diag_rids(recv_reqs)
+                waiting_diag = self._pp_prefill_diag_rids(self.waiting_queue)
+                bootstrap_diag = self._pp_prefill_diag_rids(
+                    self.disagg_prefill_bootstrap_queue.queue
                 )
+                inflight_diag = self._pp_prefill_diag_rids(
+                    self.disagg_prefill_inflight_queue
+                )
+                if recv_diag or waiting_diag or bootstrap_diag or inflight_diag:
+                    self._pp_prefill_diag_log(
+                        "recv",
+                        mb=mb_id,
+                        recv=recv_diag,
+                        waiting=waiting_diag,
+                        bootstrap_q=bootstrap_diag,
+                        inflight_q=inflight_diag,
+                    )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -923,7 +928,14 @@ class SchedulerPPMixin:
                 )
             )
             self.waiting_queue.extend(good_reqs)
-            if self._pp_prefill_diag_enabled():
+            if self._pp_prefill_diag_enabled() and (
+                good_consensus_bootstrapped_rids
+                or bad_consensus_bootstrapped_rids
+                or good_reqs
+                or failed_reqs
+                or self.waiting_queue
+                or self.disagg_prefill_bootstrap_queue.queue
+            ):
                 logger.warning(
                     "[PPPrefillDiag][bootstrap_apply] pp=%s cp=%s tp=%s "
                     "consensus_good=%s consensus_bad=%s popped_good=%s popped_failed=%s "
@@ -995,7 +1007,12 @@ class SchedulerPPMixin:
             shared_bootstrap_capacity = min(
                 prev_shared_bootstrap_capacity, local_bootstrap_capacity
             )
-            if self._pp_prefill_diag_enabled():
+            if self._pp_prefill_diag_enabled() and (
+                prev_good_bootstrapped_rids
+                or curr_good_bootstrapped_rids
+                or prev_bad_bootstrapped_rids
+                or curr_bad_bootstrapped_rids
+            ):
                 logger.warning(
                     "[PPPrefillDiag][bootstrap_intersection] pp=%s cp=%s tp=%s "
                     "prev_good=%s curr_good=%s merged_good=%s prev_bad=%s curr_bad=%s "
@@ -1015,7 +1032,11 @@ class SchedulerPPMixin:
                 )
         if len(good_bootstrapped_rids) > shared_bootstrap_capacity:
             good_bootstrapped_rids = good_bootstrapped_rids[:shared_bootstrap_capacity]
-        if self._pp_prefill_diag_enabled() and self.pp_group.is_first_rank:
+        if (
+            self._pp_prefill_diag_enabled()
+            and self.pp_group.is_first_rank
+            and (good_bootstrapped_rids or bad_bootstrapped_rids)
+        ):
             logger.warning(
                 "[PPPrefillDiag][bootstrap_poll] pp=%s cp=%s tp=%s local_good=%s "
                 "local_bad=%s shared_capacity=%s bootstrap=%s",
