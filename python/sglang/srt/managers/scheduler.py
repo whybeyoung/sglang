@@ -2444,7 +2444,9 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         frontier_diag = os.getenv("SGLANG_DEBUG_PP_PREFILL_DIAG", "0") == "1"
-        if frontier_diag:
+        if frontier_diag and (
+            self.waiting_queue or self.chunked_req is not None or self.running_batch.reqs
+        ):
             logger.warning(
                 "[PPFrontierDiag][start] pp=%s cp=%s tp=%s waiting_head=%s chunked=%s running=%s",
                 self.pp_rank,
@@ -2489,7 +2491,7 @@ class Scheduler(
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if frontier_diag:
+                if frontier_diag and not prefetch_done:
                     logger.warning(
                         "[PPFrontierDiag][prefetch] pp=%s cp=%s tp=%s rid=%s prefetch_done=%s waiting=%s",
                         self.pp_rank,
@@ -2529,7 +2531,9 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
-            if frontier_diag:
+            if frontier_diag and (
+                res != AddReqResult.CONTINUE or len(adder.can_run_list) > 0
+            ):
                 logger.warning(
                     "[PPFrontierDiag][adder] pp=%s cp=%s tp=%s rid=%s result=%s can_run=%s",
                     self.pp_rank,
@@ -2566,7 +2570,7 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        if frontier_diag:
+        if frontier_diag and (can_run_list or adder.preempt_list):
             logger.warning(
                 "[PPFrontierDiag][final] pp=%s cp=%s tp=%s can_run=%s preempt=%s waiting_before_pop=%s",
                 self.pp_rank,
