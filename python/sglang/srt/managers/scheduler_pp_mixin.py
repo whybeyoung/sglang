@@ -433,6 +433,8 @@ class SchedulerPPMixin:
                             released_bad=released_bad,
                             waiting_after_apply=waiting_after_apply,
                         )
+                    # Consume this microbatch's bootstrap consensus exactly once.
+                    bmbs[next_mb_id] = None
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
@@ -467,6 +469,8 @@ class SchedulerPPMixin:
                             inflight_after_apply=inflight_after_apply,
                             waiting_after_release=waiting_after_release,
                         )
+                    # Consume this microbatch's release consensus exactly once.
+                    tmbs[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         self._pp_build_req_payload(recv_reqs), async_send=True
