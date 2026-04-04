@@ -2443,6 +2443,17 @@ class Scheduler(
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
+        frontier_diag = os.getenv("SGLANG_DEBUG_PP_PREFILL_DIAG", "0") == "1"
+        if frontier_diag:
+            logger.warning(
+                "[PPFrontierDiag][start] pp=%s cp=%s tp=%s waiting_head=%s chunked=%s running=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                [req.rid for req in self.waiting_queue[:8]],
+                getattr(self.chunked_req, "rid", None),
+                [req.rid for req in self.running_batch.reqs[:8]],
+            )
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
@@ -2478,6 +2489,16 @@ class Scheduler(
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if frontier_diag:
+                    logger.warning(
+                        "[PPFrontierDiag][prefetch] pp=%s cp=%s tp=%s rid=%s prefetch_done=%s waiting=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        self.attn_tp_rank,
+                        req.rid,
+                        prefetch_done,
+                        [x.rid for x in self.waiting_queue[:8]],
+                    )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -2508,6 +2529,16 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if frontier_diag:
+                logger.warning(
+                    "[PPFrontierDiag][adder] pp=%s cp=%s tp=%s rid=%s result=%s can_run=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    req.rid,
+                    getattr(res, "name", str(res)),
+                    [x.rid for x in adder.can_run_list[:8]],
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -2534,6 +2565,17 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+
+        if frontier_diag:
+            logger.warning(
+                "[PPFrontierDiag][final] pp=%s cp=%s tp=%s can_run=%s preempt=%s waiting_before_pop=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                [x.rid for x in can_run_list[:8]],
+                [x.rid for x in adder.preempt_list[:8]],
+                [x.rid for x in self.waiting_queue[:8]],
+            )
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]

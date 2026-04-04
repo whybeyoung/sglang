@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -58,6 +59,32 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_prefill_diag_enabled(self: Scheduler) -> bool:
+        return os.getenv("SGLANG_DEBUG_PP_PREFILL_DIAG", "0") == "1"
+
+    def _pp_prefill_diag_rids(
+        self: Scheduler, items, limit: int = 8
+    ) -> List[str]:
+        if not items:
+            return []
+        out = []
+        for item in list(items)[:limit]:
+            out.append(getattr(item, "rid", item))
+        return out
+
+    def _pp_prefill_diag_log(self: Scheduler, tag: str, **kwargs) -> None:
+        if not self._pp_prefill_diag_enabled():
+            return
+        parts = [f"{k}={v}" for k, v in kwargs.items()]
+        logger.warning(
+            "[PPPrefillDiag][%s] pp=%s cp=%s tp=%s %s",
+            tag,
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.attn_tp_rank,
+            " ".join(parts),
+        )
+
     def _pp_build_req_payload(self: Scheduler, recv_reqs):
         if self.pp_group.is_last_rank:
             return recv_reqs
@@ -261,23 +288,52 @@ class SchedulerPPMixin:
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
                 self._pp_apply_hicache_sync_before_batch()
+                self._pp_prefill_diag_log(
+                    "recv",
+                    mb=mb_id,
+                    recv=self._pp_prefill_diag_rids(recv_reqs),
+                    waiting=self._pp_prefill_diag_rids(self.waiting_queue),
+                    bootstrap_q=self._pp_prefill_diag_rids(
+                        self.disagg_prefill_bootstrap_queue.queue
+                    ),
+                    inflight_q=self._pp_prefill_diag_rids(
+                        self.disagg_prefill_inflight_queue
+                    ),
+                )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
+                self._pp_prefill_diag_log(
+                    "bootstrap_poll",
+                    mb=mb_id,
+                    boot_good=self._pp_prefill_diag_rids(bootstrapped_rids[0]),
+                    boot_bad=self._pp_prefill_diag_rids(bootstrapped_rids[1]),
+                )
                 self._pp_commit_comm_work(send_bootstrapped_work)
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                self._pp_prefill_diag_log(
+                    "transfer_poll",
+                    mb=mb_id,
+                    transferred=self._pp_prefill_diag_rids(transferred_rids),
+                )
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
+                self._pp_prefill_diag_log(
+                    "batch_pick",
+                    mb=mb_id,
+                    batch=self._pp_prefill_diag_rids(batch.reqs if batch else []),
+                    waiting_after_pick=self._pp_prefill_diag_rids(self.waiting_queue),
+                )
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
@@ -324,12 +380,44 @@ class SchedulerPPMixin:
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
+                    self._pp_prefill_diag_log(
+                        "bootstrap_consensus_recv",
+                        mb=next_mb_id,
+                        consensus_good=self._pp_prefill_diag_rids(
+                            next_consensus_bootstrapped_rids[0]
+                        ),
+                        consensus_bad=self._pp_prefill_diag_rids(
+                            next_consensus_bootstrapped_rids[1]
+                        ),
+                    )
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
+                    )
+                    self._pp_prefill_diag_log(
+                        "bootstrap_apply",
+                        mb=next_mb_id,
+                        released_good=self._pp_prefill_diag_rids(
+                            next_consensus_bootstrapped_rids[0]
+                            if next_consensus_bootstrapped_rids
+                            else []
+                        ),
+                        released_bad=self._pp_prefill_diag_rids(
+                            next_consensus_bootstrapped_rids[1]
+                            if next_consensus_bootstrapped_rids
+                            else []
+                        ),
+                        waiting_after_apply=self._pp_prefill_diag_rids(
+                            self.waiting_queue
+                        ),
                     )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    self._pp_prefill_diag_log(
+                        "release_recv",
+                        mb=next_mb_id,
+                        release=self._pp_prefill_diag_rids(next_release_rids),
+                    )
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -342,6 +430,16 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
+                    self._pp_prefill_diag_log(
+                        "release_apply",
+                        mb=next_mb_id,
+                        inflight_after_apply=self._pp_prefill_diag_rids(
+                            self.disagg_prefill_inflight_queue
+                        ),
+                        waiting_after_release=self._pp_prefill_diag_rids(
+                            self.waiting_queue
+                        ),
+                    )
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         self._pp_build_req_payload(recv_reqs), async_send=True
