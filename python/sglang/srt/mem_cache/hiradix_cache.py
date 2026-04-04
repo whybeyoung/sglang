@@ -1430,6 +1430,10 @@ class HiRadixCache(RadixCache):
 
         if self._pp_downstream_sync_enabled() and not self._in_pp_host_tree_replay:
             self.replay_pp_host_tree_events()
+            if req_id not in self.ongoing_prefetch:
+                # The ordered PP replay may have already revoked/finalized this request
+                # on the local rank. Treat it as completed for the scheduler path.
+                return True
             event = self._peek_pp_host_tree_event()
             if event is not None:
                 if event.kind != "PREFETCH_FINALIZE" or event.rid != req_id:
