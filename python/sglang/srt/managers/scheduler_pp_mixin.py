@@ -318,7 +318,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids(mb_id)
                 bmbs[mb_id] = bootstrapped_rids
                 if bootstrapped_rids[0] or bootstrapped_rids[1]:
                     self._pp_prefill_diag_log(
@@ -947,17 +947,27 @@ class SchedulerPPMixin:
             ]
         return None
 
-    def _pp_pd_get_bootstrapped_ids(self: Scheduler):
+    def _pp_pd_get_bootstrapped_ids(self: Scheduler, mb_id: int):
         # communicate pre-consensus bootstrapp reqs
         local_bootstrap_capacity = (
             self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.available_size()
         )
+        for req in self.disagg_prefill_bootstrap_queue.queue:
+            if req.bootstrap_mb_id is None:
+                req.bootstrap_mb_id = mb_id
+        local_bootstrap_reqs = [
+            req
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if req.bootstrap_mb_id == mb_id
+        ]
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
             (
                 good_bootstrapped_rids,
                 bad_bootstrapped_rids,
-            ) = self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids()
+            ) = self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
+                local_bootstrap_reqs
+            )
             shared_bootstrap_capacity = local_bootstrap_capacity
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -970,7 +980,7 @@ class SchedulerPPMixin:
             prev_good_rids_set = set(prev_good_bootstrapped_rids)
             local_candidate_reqs = [
                 req
-                for req in self.disagg_prefill_bootstrap_queue.queue
+                for req in local_bootstrap_reqs
                 if req.rid in prev_good_rids_set
             ]
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (

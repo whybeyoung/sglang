@@ -777,6 +777,7 @@ class Req(ReqDllmMixin):
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
+        self.bootstrap_mb_id = None
 
         # For observability
         self.metrics_collector = metrics_collector
