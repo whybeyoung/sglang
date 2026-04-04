@@ -52,6 +52,16 @@ def _ordered_common_prefix(left: List[str], right: List[str]) -> List[str]:
     return prefix
 
 
+def _ordered_prefix_from_queue(queue_rids: List[str], proposal_rids: List[str]) -> List[str]:
+    """Keep only the authoritative prefix that still matches the local queue head."""
+    prefix = []
+    for queue_item, proposal_item in zip(queue_rids, proposal_rids):
+        if queue_item != proposal_item:
+            break
+        prefix.append(proposal_item)
+    return prefix
+
+
 def _ordered_union(left: List[str], right: List[str]) -> List[str]:
     merged = list(left)
     seen = set(left)
@@ -1000,13 +1010,34 @@ class SchedulerPPMixin:
                     local_candidate_reqs
                 )
             )
+            local_bootstrap_rids = [req.rid for req in local_bootstrap_reqs]
             good_bootstrapped_rids = _ordered_common_prefix(
                 prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
-            bad_bootstrapped_rids = prev_bad_bootstrapped_rids
+            # Treat upstream abort/fail as authoritative, but only consume the
+            # contiguous local queue prefix to preserve FIFO semantics.
+            bad_bootstrapped_rids = _ordered_prefix_from_queue(
+                local_bootstrap_rids, prev_bad_bootstrapped_rids
+            )
             shared_bootstrap_capacity = min(
                 prev_shared_bootstrap_capacity, local_bootstrap_capacity
             )
+            if (
+                self._pp_prefill_diag_enabled()
+                and prev_bad_bootstrapped_rids
+                and not bad_bootstrapped_rids
+            ):
+                logger.warning(
+                    "[PPPrefillProblem][abort_cleanup_drift] pp=%s cp=%s tp=%s "
+                    "prev_bad=%s local_bootstrap=%s curr_bad=%s bootstrap=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    prev_bad_bootstrapped_rids[:8],
+                    local_bootstrap_rids[:8],
+                    curr_bad_bootstrapped_rids[:8],
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                )
             if self._pp_prefill_diag_enabled() and (
                 prev_good_bootstrapped_rids
                 or curr_good_bootstrapped_rids
