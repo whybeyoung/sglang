@@ -78,6 +78,14 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_prefill_safe_len(self: Scheduler, value) -> int:
+        if value is None:
+            return 0
+        try:
+            return len(value)
+        except TypeError:
+            return 0
+
     def _pp_prefill_diag_enabled(self: Scheduler) -> bool:
         return os.getenv("SGLANG_DEBUG_PP_PREFILL_DIAG", "0") == "1"
 
@@ -107,6 +115,214 @@ class SchedulerPPMixin:
             self.attn_cp_rank,
             self.attn_tp_rank,
             " ".join(parts),
+        )
+
+    def _pp_prefill_req_shape(
+        self: Scheduler, req: Req
+    ) -> Dict[str, object]:
+        return {
+            "rid": req.rid,
+            "fill": self._pp_prefill_safe_len(getattr(req, "fill_ids", None)),
+            "prefix": self._pp_prefill_safe_len(
+                getattr(req, "prefix_indices", None)
+            ),
+            "storage": getattr(req, "storage_hit_length", 0),
+        }
+
+    def _pp_prefill_batch_shape(
+        self: Scheduler, batch: Optional[ScheduleBatch], limit: int = 6
+    ) -> List[Dict[str, object]]:
+        if batch is None:
+            return []
+        return [self._pp_prefill_req_shape(req) for req in batch.reqs[:limit]]
+
+    def _pp_prefill_queue_shape(
+        self: Scheduler, queue, limit: int = 6
+    ) -> List[Dict[str, object]]:
+        if not queue:
+            return []
+        return [self._pp_prefill_req_shape(req) for req in list(queue)[:limit]]
+
+    def _pp_prefill_bootstrap_req_debug(
+        self: Scheduler, reqs, limit: int = 8
+    ) -> List[Dict[str, object]]:
+        if not reqs:
+            return []
+        debug_reqs = []
+        for req in list(reqs)[:limit]:
+            debug_reqs.append(
+                {
+                    "rid": req.rid,
+                    "mb": getattr(req, "bootstrap_mb_id", None),
+                    "room": getattr(req, "bootstrap_room", None),
+                }
+            )
+        return debug_reqs
+
+    def _pp_prefill_bootstrap_poll_summary(
+        self: Scheduler,
+        mb_id: int,
+        local_bootstrap_reqs,
+        local_candidate_reqs,
+        curr_good_bootstrapped_rids,
+        curr_bad_bootstrapped_rids,
+    ) -> Dict[str, object]:
+        return {
+            "mb": mb_id,
+            "bootstrap": self._pp_prefill_bootstrap_req_debug(local_bootstrap_reqs),
+            "candidates": self._pp_prefill_bootstrap_req_debug(local_candidate_reqs),
+            "curr_good": curr_good_bootstrapped_rids[:8],
+            "curr_bad": curr_bad_bootstrapped_rids[:8],
+        }
+
+    def _pp_prefill_problem_should_log(
+        self: Scheduler, tag: str, key: Tuple[object, ...]
+    ) -> bool:
+        if not self._pp_prefill_diag_enabled():
+            return False
+        state = getattr(self, "_pp_prefill_problem_state", None)
+        if state is None:
+            state = {}
+            setattr(self, "_pp_prefill_problem_state", state)
+        full_key = (tag,) + tuple(key)
+        count = state.get(full_key, 0) + 1
+        state[full_key] = count
+        return count in (1, 8, 64, 256)
+
+    def _pp_prefill_problem_log(
+        self: Scheduler, tag: str, key: Tuple[object, ...], **kwargs
+    ) -> None:
+        if not self._pp_prefill_problem_should_log(tag, key):
+            return
+        parts = [f"{k}={v}" for k, v in kwargs.items()]
+        logger.warning(
+            "[PPPrefillProblem][%s] pp=%s cp=%s tp=%s %s",
+            tag,
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.attn_tp_rank,
+            " ".join(parts),
+        )
+
+    def _pp_prefill_intermediate_head_count(
+        self: Scheduler, rid: str
+    ) -> int:
+        state = getattr(self, "_pp_prefill_intermediate_head_state", None)
+        if state is None:
+            state = {}
+            setattr(self, "_pp_prefill_intermediate_head_state", state)
+        count = state.get(rid, 0) + 1
+        state[rid] = count
+        return count
+
+    def _pp_prefill_clear_intermediate_head(
+        self: Scheduler, rid: Optional[str]
+    ) -> None:
+        if rid is None:
+            return
+        state = getattr(self, "_pp_prefill_intermediate_head_state", None)
+        if state is None:
+            return
+        state.pop(rid, None)
+
+    def _pp_prefill_defer_bootstrap_rids(
+        self: Scheduler, deferred_rids: List[str]
+    ) -> List[str]:
+        if not deferred_rids:
+            return []
+        queue = self.disagg_prefill_bootstrap_queue.queue
+        deferred_prefix = []
+        for req in queue:
+            if len(deferred_prefix) >= len(deferred_rids):
+                break
+            if req.rid != deferred_rids[len(deferred_prefix)]:
+                break
+            deferred_prefix.append(req)
+        if not deferred_prefix:
+            return []
+        self.disagg_prefill_bootstrap_queue.queue = (
+            queue[len(deferred_prefix) :] + deferred_prefix
+        )
+        for req in deferred_prefix:
+            req.bootstrap_mb_id = None
+            self._pp_prefill_clear_intermediate_head(req.rid)
+        return [req.rid for req in deferred_prefix]
+
+    def _pp_unpack_bootstrap_payload(
+        self: Scheduler, bootstrapped_rids: Optional[List[str]]
+    ) -> Tuple[List[str], List[str], List[str], int]:
+        if bootstrapped_rids is None:
+            return [], [], [], 0
+        if len(bootstrapped_rids) == 4:
+            good_rids, bad_rids, deferred_rids, shared_capacity = bootstrapped_rids
+            return good_rids, bad_rids, deferred_rids, shared_capacity
+        good_rids, bad_rids, shared_capacity = bootstrapped_rids
+        return good_rids, bad_rids, [], shared_capacity
+
+    def _pp_prefill_shape_snapshot_log(
+        self: Scheduler,
+        tag: str,
+        key: Tuple[object, ...],
+        batch: Optional[ScheduleBatch],
+        waiting_queue,
+        bootstrap_queue,
+        inflight_queue,
+    ) -> None:
+        self._pp_prefill_problem_log(
+            tag,
+            key=key,
+            batch=self._pp_prefill_batch_shape(batch),
+            waiting=self._pp_prefill_queue_shape(waiting_queue),
+            bootstrap=self._pp_prefill_queue_shape(bootstrap_queue),
+            inflight=self._pp_prefill_diag_rids(inflight_queue),
+            prealloc=len(getattr(self, "disagg_prefill_prealloc_queue", [])),
+        )
+
+    def _pp_prefill_req_age_sec(
+        self: Scheduler, req: Req, field: str
+    ) -> float:
+        ts = getattr(req.time_stats, field, 0.0)
+        if not ts:
+            return 0.0
+        return max(0.0, time.perf_counter() - ts)
+
+    def _pp_prefill_age_bucket(self: Scheduler, age_sec: float) -> int:
+        if age_sec >= 48:
+            return 48
+        if age_sec >= 32:
+            return 32
+        if age_sec >= 16:
+            return 16
+        if age_sec >= 8:
+            return 8
+        return 0
+
+    def _pp_prefill_maybe_log_age(
+        self: Scheduler,
+        tag: str,
+        req: Optional[Req],
+        field: str,
+        waiting_queue,
+        bootstrap_queue,
+        inflight_queue,
+    ) -> None:
+        if req is None:
+            return
+        age_sec = self._pp_prefill_req_age_sec(req, field)
+        bucket = self._pp_prefill_age_bucket(age_sec)
+        if bucket == 0:
+            return
+        self._pp_prefill_problem_log(
+            tag,
+            key=(req.rid, bucket),
+            rid=req.rid,
+            age_sec=round(age_sec, 1),
+            bootstrap_room=getattr(req, "bootstrap_room", None),
+            batch=[],
+            waiting=self._pp_prefill_queue_shape(waiting_queue),
+            bootstrap=self._pp_prefill_queue_shape(bootstrap_queue),
+            inflight=self._pp_prefill_diag_rids(inflight_queue),
+            prealloc=len(getattr(self, "disagg_prefill_prealloc_queue", [])),
         )
 
     def _pp_build_req_payload(self: Scheduler, recv_reqs):
@@ -329,6 +545,26 @@ class SchedulerPPMixin:
                         bootstrap_q=bootstrap_diag,
                         inflight_q=inflight_diag,
                     )
+                self._pp_prefill_maybe_log_age(
+                    "bootstrap_head_age",
+                    self.disagg_prefill_bootstrap_queue.queue[0]
+                    if self.disagg_prefill_bootstrap_queue.queue
+                    else None,
+                    "prefill_bootstrap_queue_entry_time",
+                    waiting_queue=self.waiting_queue,
+                    bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
+                    inflight_queue=self.disagg_prefill_inflight_queue,
+                )
+                self._pp_prefill_maybe_log_age(
+                    "inflight_head_age",
+                    self.disagg_prefill_inflight_queue[0]
+                    if self.disagg_prefill_inflight_queue
+                    else None,
+                    "prefill_transfer_queue_entry_time",
+                    waiting_queue=self.waiting_queue,
+                    bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
+                    inflight_queue=self.disagg_prefill_inflight_queue,
+                )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -365,6 +601,27 @@ class SchedulerPPMixin:
                         mb=mb_id,
                         batch=self._pp_prefill_diag_rids(batch.reqs if batch else []),
                         waiting_after_pick=self._pp_prefill_diag_rids(self.waiting_queue),
+                    )
+                batch_rids = tuple(self._pp_prefill_diag_rids(batch.reqs if batch else []))
+                waiting_rids = tuple(
+                    self._pp_prefill_diag_rids(self.waiting_queue)
+                )
+                bootstrap_rids = tuple(
+                    self._pp_prefill_diag_rids(
+                        self.disagg_prefill_bootstrap_queue.queue
+                    )
+                )
+                inflight_rids = tuple(
+                    self._pp_prefill_diag_rids(self.disagg_prefill_inflight_queue)
+                )
+                if batch or self.waiting_queue or self.disagg_prefill_bootstrap_queue.queue:
+                    self._pp_prefill_shape_snapshot_log(
+                        "batch_shape_snapshot",
+                        key=(mb_id, batch_rids, waiting_rids, bootstrap_rids, inflight_rids),
+                        batch=batch,
+                        waiting_queue=self.waiting_queue,
+                        bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
+                        inflight_queue=self.disagg_prefill_inflight_queue,
                     )
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
@@ -415,6 +672,10 @@ class SchedulerPPMixin:
                     if (
                         next_consensus_bootstrapped_rids[0]
                         or next_consensus_bootstrapped_rids[1]
+                        or (
+                            len(next_consensus_bootstrapped_rids) > 3
+                            and next_consensus_bootstrapped_rids[2]
+                        )
                     ):
                         self._pp_prefill_diag_log(
                             "bootstrap_consensus_recv",
@@ -424,6 +685,11 @@ class SchedulerPPMixin:
                             ),
                             consensus_bad=self._pp_prefill_diag_rids(
                                 next_consensus_bootstrapped_rids[1]
+                            ),
+                            consensus_deferred=self._pp_prefill_diag_rids(
+                                next_consensus_bootstrapped_rids[2]
+                                if len(next_consensus_bootstrapped_rids) > 3
+                                else []
                             ),
                         )
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
@@ -439,13 +705,25 @@ class SchedulerPPMixin:
                         if next_consensus_bootstrapped_rids
                         else []
                     )
+                    released_deferred = self._pp_prefill_diag_rids(
+                        next_consensus_bootstrapped_rids[2]
+                        if next_consensus_bootstrapped_rids
+                        and len(next_consensus_bootstrapped_rids) > 3
+                        else []
+                    )
                     waiting_after_apply = self._pp_prefill_diag_rids(self.waiting_queue)
-                    if released_good or released_bad or waiting_after_apply:
+                    if (
+                        released_good
+                        or released_bad
+                        or released_deferred
+                        or waiting_after_apply
+                    ):
                         self._pp_prefill_diag_log(
                             "bootstrap_apply",
                             mb=next_mb_id,
                             released_good=released_good,
                             released_bad=released_bad,
+                            released_deferred=released_deferred,
                             waiting_after_apply=waiting_after_apply,
                         )
                     # Consume this microbatch's bootstrap consensus exactly once.
@@ -484,6 +762,16 @@ class SchedulerPPMixin:
                             inflight_after_apply=inflight_after_apply,
                             waiting_after_release=waiting_after_release,
                         )
+                    self._pp_prefill_maybe_log_age(
+                        "inflight_head_age",
+                        self.disagg_prefill_inflight_queue[0]
+                        if self.disagg_prefill_inflight_queue
+                        else None,
+                        "prefill_transfer_queue_entry_time",
+                        waiting_queue=self.waiting_queue,
+                        bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
+                        inflight_queue=self.disagg_prefill_inflight_queue,
+                    )
                     # Consume this microbatch's release consensus exactly once.
                     tmbs[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
@@ -928,8 +1216,12 @@ class SchedulerPPMixin:
             (
                 good_consensus_bootstrapped_rids,
                 bad_consensus_bootstrapped_rids,
+                deferred_consensus_bootstrapped_rids,
                 shared_bootstrap_capacity,
-            ) = bootstrapped_rids
+            ) = self._pp_unpack_bootstrap_payload(bootstrapped_rids)
+            deferred_reqs = self._pp_prefill_defer_bootstrap_rids(
+                deferred_consensus_bootstrapped_rids
+            )
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.apply_bootstrap_consensus(
                     good_consensus_bootstrapped_rids,
@@ -948,15 +1240,18 @@ class SchedulerPPMixin:
             ):
                 logger.warning(
                     "[PPPrefillDiag][bootstrap_apply] pp=%s cp=%s tp=%s "
-                    "consensus_good=%s consensus_bad=%s popped_good=%s popped_failed=%s "
+                    "consensus_good=%s consensus_bad=%s consensus_deferred=%s "
+                    "popped_good=%s popped_failed=%s popped_deferred=%s "
                     "shared_capacity=%s waiting=%s bootstrap=%s waiting_head=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
                     good_consensus_bootstrapped_rids,
                     bad_consensus_bootstrapped_rids,
+                    deferred_consensus_bootstrapped_rids,
                     [req.rid for req in good_reqs],
                     [req.rid for req in failed_reqs],
+                    deferred_reqs,
                     shared_bootstrap_capacity,
                     len(self.waiting_queue),
                     len(self.disagg_prefill_bootstrap_queue.queue),
@@ -965,6 +1260,7 @@ class SchedulerPPMixin:
             return [
                 [req.rid for req in good_reqs],
                 [req.rid for req in failed_reqs],
+                deferred_reqs,
                 shared_bootstrap_capacity,
             ]
         return None
@@ -974,6 +1270,7 @@ class SchedulerPPMixin:
         local_bootstrap_capacity = (
             self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.available_size()
         )
+        deferred_bootstrapped_rids = []
         for req in self.disagg_prefill_bootstrap_queue.queue:
             if req.bootstrap_mb_id is None:
                 req.bootstrap_mb_id = mb_id
@@ -997,57 +1294,230 @@ class SchedulerPPMixin:
             (
                 prev_good_bootstrapped_rids,
                 prev_bad_bootstrapped_rids,
+                _prev_deferred_bootstrapped_rids,
                 prev_shared_bootstrap_capacity,
-            ) = prev_bootstrapped_rids
+            ) = self._pp_unpack_bootstrap_payload(prev_bootstrapped_rids)
             prev_good_rids_set = set(prev_good_bootstrapped_rids)
             local_candidate_reqs = [
                 req
                 for req in local_bootstrap_reqs
                 if req.rid in prev_good_rids_set
             ]
+            rebound_rids = []
+            if prev_good_bootstrapped_rids and not local_candidate_reqs:
+                # PP0 has already proposed a non-empty bootstrap frontier. If PP1
+                # filtered everything away only because requests were latched to the
+                # other microbatch, rebind those matching upstream candidates to the
+                # current mb and retry locally instead of stalling forever.
+                for req in self.disagg_prefill_bootstrap_queue.queue:
+                    if req.rid in prev_good_rids_set and req.bootstrap_mb_id != mb_id:
+                        req.bootstrap_mb_id = mb_id
+                        rebound_rids.append(req.rid)
+                if rebound_rids:
+                    local_bootstrap_reqs = [
+                        req
+                        for req in self.disagg_prefill_bootstrap_queue.queue
+                        if req.bootstrap_mb_id == mb_id
+                    ]
+                    local_candidate_reqs = [
+                        req
+                        for req in local_bootstrap_reqs
+                        if req.rid in prev_good_rids_set
+                    ]
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
                     local_candidate_reqs
                 )
             )
             local_bootstrap_rids = [req.rid for req in local_bootstrap_reqs]
+            head_intermediate_rid = None
+            head_intermediate_count = 0
+            if (
+                prev_good_bootstrapped_rids
+                and local_candidate_reqs
+                and not curr_good_bootstrapped_rids
+                and not curr_bad_bootstrapped_rids
+            ):
+                head_candidate = local_candidate_reqs[0]
+                if (
+                    local_bootstrap_reqs
+                    and local_bootstrap_reqs[0].rid == head_candidate.rid
+                    and prev_good_bootstrapped_rids[0] == head_candidate.rid
+                ):
+                    head_intermediate_rid = head_candidate.rid
+                    head_intermediate_count = self._pp_prefill_intermediate_head_count(
+                        head_intermediate_rid
+                    )
+                    if head_intermediate_count >= 32:
+                        deferred_bootstrapped_rids = [head_intermediate_rid]
+                        (
+                            curr_good_bootstrapped_rids,
+                            curr_bad_bootstrapped_rids,
+                        ) = self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
+                            local_candidate_reqs[1:]
+                        )
+                else:
+                    self._pp_prefill_clear_intermediate_head(
+                        local_bootstrap_reqs[0].rid if local_bootstrap_reqs else None
+                    )
+            elif local_bootstrap_reqs:
+                self._pp_prefill_clear_intermediate_head(local_bootstrap_reqs[0].rid)
+            effective_prev_good_bootstrapped_rids = list(prev_good_bootstrapped_rids)
+            if (
+                deferred_bootstrapped_rids
+                and effective_prev_good_bootstrapped_rids
+                and effective_prev_good_bootstrapped_rids[0]
+                == deferred_bootstrapped_rids[0]
+            ):
+                effective_prev_good_bootstrapped_rids = (
+                    effective_prev_good_bootstrapped_rids[len(deferred_bootstrapped_rids) :]
+                )
             good_bootstrapped_rids = _ordered_common_prefix(
-                prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
+                effective_prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
             # Treat upstream abort/fail as authoritative, but only consume the
             # contiguous local queue prefix to preserve FIFO semantics.
+            effective_prev_bad_bootstrapped_rids = list(prev_bad_bootstrapped_rids)
+            effective_local_bootstrap_rids = list(local_bootstrap_rids)
+            if deferred_bootstrapped_rids:
+                effective_local_bootstrap_rids = effective_local_bootstrap_rids[
+                    len(deferred_bootstrapped_rids) :
+                ]
             bad_bootstrapped_rids = _ordered_prefix_from_queue(
-                local_bootstrap_rids, prev_bad_bootstrapped_rids
+                effective_local_bootstrap_rids, effective_prev_bad_bootstrapped_rids
             )
             shared_bootstrap_capacity = min(
                 prev_shared_bootstrap_capacity, local_bootstrap_capacity
             )
+            if prev_good_bootstrapped_rids and not curr_good_bootstrapped_rids:
+                self._pp_prefill_problem_log(
+                    "bootstrap_no_local_candidate",
+                    key=(
+                        tuple(prev_good_bootstrapped_rids[:4]),
+                        tuple(local_bootstrap_rids[:4]),
+                    ),
+                    prev_good=prev_good_bootstrapped_rids[:8],
+                    local_bootstrap=local_bootstrap_rids[:8],
+                    curr_bad=curr_bad_bootstrapped_rids[:8],
+                    bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
+                )
+            if rebound_rids:
+                self._pp_prefill_problem_log(
+                    "bootstrap_mb_rebind",
+                    key=(mb_id, tuple(rebound_rids[:4])),
+                    prev_good=prev_good_bootstrapped_rids[:8],
+                    rebound=rebound_rids[:8],
+                    poll=self._pp_prefill_bootstrap_poll_summary(
+                        mb_id,
+                        local_bootstrap_reqs,
+                        local_candidate_reqs,
+                        curr_good_bootstrapped_rids,
+                        curr_bad_bootstrapped_rids,
+                    ),
+                    bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
+                )
             if (
-                self._pp_prefill_diag_enabled()
-                and prev_bad_bootstrapped_rids
-                and not bad_bootstrapped_rids
+                prev_good_bootstrapped_rids
+                and not curr_good_bootstrapped_rids
+                and not curr_bad_bootstrapped_rids
             ):
-                logger.warning(
-                    "[PPPrefillProblem][abort_cleanup_drift] pp=%s cp=%s tp=%s "
-                    "prev_bad=%s local_bootstrap=%s curr_bad=%s bootstrap=%s",
-                    self.pp_rank,
-                    self.attn_cp_rank,
-                    self.attn_tp_rank,
-                    prev_bad_bootstrapped_rids[:8],
-                    local_bootstrap_rids[:8],
-                    curr_bad_bootstrapped_rids[:8],
-                    len(self.disagg_prefill_bootstrap_queue.queue),
+                self._pp_prefill_problem_log(
+                    "bootstrap_poll_empty",
+                    key=(
+                        mb_id,
+                        tuple(prev_good_bootstrapped_rids[:4]),
+                        tuple(local_bootstrap_rids[:4]),
+                    ),
+                    prev_good=prev_good_bootstrapped_rids[:8],
+                    poll=self._pp_prefill_bootstrap_poll_summary(
+                        mb_id,
+                        local_bootstrap_reqs,
+                        local_candidate_reqs,
+                        curr_good_bootstrapped_rids,
+                        curr_bad_bootstrapped_rids,
+                    ),
+                    bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
+                )
+            if head_intermediate_rid is not None:
+                self._pp_prefill_problem_log(
+                    "bootstrap_head_intermediate",
+                    key=(mb_id, head_intermediate_rid, min(head_intermediate_count, 32)),
+                    rid=head_intermediate_rid,
+                    count=head_intermediate_count,
+                    deferred=bool(
+                        deferred_bootstrapped_rids
+                        and deferred_bootstrapped_rids[0] == head_intermediate_rid
+                    ),
+                    poll=self._pp_prefill_bootstrap_poll_summary(
+                        mb_id,
+                        local_bootstrap_reqs,
+                        local_candidate_reqs,
+                        curr_good_bootstrapped_rids,
+                        curr_bad_bootstrapped_rids,
+                    ),
+                    bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
+                )
+            elif (
+                prev_good_bootstrapped_rids
+                and not curr_good_bootstrapped_rids
+            ):
+                self._pp_prefill_problem_log(
+                    "bootstrap_poll_sparse",
+                    key=(
+                        mb_id,
+                        tuple(prev_good_bootstrapped_rids[:4]),
+                        tuple(curr_bad_bootstrapped_rids[:4]),
+                    ),
+                    prev_good=prev_good_bootstrapped_rids[:8],
+                    poll=self._pp_prefill_bootstrap_poll_summary(
+                        mb_id,
+                        local_bootstrap_reqs,
+                        local_candidate_reqs,
+                        curr_good_bootstrapped_rids,
+                        curr_bad_bootstrapped_rids,
+                    ),
+                    bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
+                )
+            if (
+                prev_good_bootstrapped_rids
+                and curr_good_bootstrapped_rids
+                and not good_bootstrapped_rids
+            ):
+                self._pp_prefill_problem_log(
+                    "bootstrap_prefix_collapsed",
+                    key=(
+                        tuple(prev_good_bootstrapped_rids[:4]),
+                        tuple(curr_good_bootstrapped_rids[:4]),
+                    ),
+                    prev_good=prev_good_bootstrapped_rids[:8],
+                    curr_good=curr_good_bootstrapped_rids[:8],
+                    local_bootstrap=local_bootstrap_rids[:8],
+                    bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
+                )
+            if prev_bad_bootstrapped_rids and not bad_bootstrapped_rids:
+                self._pp_prefill_problem_log(
+                    "abort_cleanup_drift",
+                    key=(
+                        tuple(prev_bad_bootstrapped_rids[:4]),
+                        tuple(local_bootstrap_rids[:4]),
+                    ),
+                    prev_bad=prev_bad_bootstrapped_rids[:8],
+                    local_bootstrap=local_bootstrap_rids[:8],
+                    curr_bad=curr_bad_bootstrapped_rids[:8],
+                    bootstrap=len(self.disagg_prefill_bootstrap_queue.queue),
                 )
             if self._pp_prefill_diag_enabled() and (
                 prev_good_bootstrapped_rids
                 or curr_good_bootstrapped_rids
                 or prev_bad_bootstrapped_rids
                 or curr_bad_bootstrapped_rids
+                or deferred_bootstrapped_rids
             ):
                 logger.warning(
                     "[PPPrefillDiag][bootstrap_intersection] pp=%s cp=%s tp=%s "
                     "prev_good=%s curr_good=%s merged_good=%s prev_bad=%s curr_bad=%s "
-                    "merged_bad=%s shared_capacity=%s local_capacity=%s bootstrap=%s",
+                    "merged_bad=%s deferred=%s shared_capacity=%s local_capacity=%s bootstrap=%s "
+                    "poll=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
@@ -1057,29 +1527,43 @@ class SchedulerPPMixin:
                     prev_bad_bootstrapped_rids,
                     curr_bad_bootstrapped_rids,
                     bad_bootstrapped_rids,
+                    deferred_bootstrapped_rids,
                     shared_bootstrap_capacity,
                     local_bootstrap_capacity,
                     len(self.disagg_prefill_bootstrap_queue.queue),
+                    self._pp_prefill_bootstrap_poll_summary(
+                        mb_id,
+                        local_bootstrap_reqs,
+                        local_candidate_reqs,
+                        curr_good_bootstrapped_rids,
+                        curr_bad_bootstrapped_rids,
+                    ),
                 )
         if len(good_bootstrapped_rids) > shared_bootstrap_capacity:
             good_bootstrapped_rids = good_bootstrapped_rids[:shared_bootstrap_capacity]
         if (
             self._pp_prefill_diag_enabled()
             and self.pp_group.is_first_rank
-            and (good_bootstrapped_rids or bad_bootstrapped_rids)
+            and (good_bootstrapped_rids or bad_bootstrapped_rids or deferred_bootstrapped_rids)
         ):
             logger.warning(
                 "[PPPrefillDiag][bootstrap_poll] pp=%s cp=%s tp=%s local_good=%s "
-                "local_bad=%s shared_capacity=%s bootstrap=%s",
+                "local_bad=%s local_deferred=%s shared_capacity=%s bootstrap=%s",
                 self.pp_rank,
                 self.attn_cp_rank,
                 self.attn_tp_rank,
                 good_bootstrapped_rids,
                 bad_bootstrapped_rids,
+                deferred_bootstrapped_rids,
                 shared_bootstrap_capacity,
                 len(self.disagg_prefill_bootstrap_queue.queue),
             )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids, shared_bootstrap_capacity]
+        return [
+            good_bootstrapped_rids,
+            bad_bootstrapped_rids,
+            deferred_bootstrapped_rids,
+            shared_bootstrap_capacity,
+        ]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
