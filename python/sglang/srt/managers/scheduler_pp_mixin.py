@@ -81,6 +81,11 @@ class SchedulerPPMixin:
             out.append(getattr(item, "rid", item))
         return out
 
+    def _pp_prefill_diag_queue(
+        self: Scheduler, items, limit: int = 8
+    ) -> List[str]:
+        return self._pp_prefill_diag_rids(items, limit=limit)
+
     def _pp_prefill_diag_log(self: Scheduler, tag: str, **kwargs) -> None:
         if not self._pp_prefill_diag_enabled():
             return
