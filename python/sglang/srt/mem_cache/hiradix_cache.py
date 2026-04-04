@@ -188,6 +188,7 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.zero_hit_prefetch_req_ids: set[str] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -196,7 +197,7 @@ class HiRadixCache(RadixCache):
         self.pp_host_tree_event_seq = 0
         self.pp_outgoing_host_tree_events: List[dict[str, Any]] = []
         self.pp_pending_host_tree_events: Deque[PPHostTreeEvent] = deque()
-        self.pp_deferred_revoke_req_ids: Deque[str] = deque()
+        self.pp_deferred_revoke_req_ids: Deque[tuple[str, bool]] = deque()
         self._in_pp_host_tree_replay = False
 
         # Detach storage backend automatically on process shutdown
@@ -532,10 +533,16 @@ class HiRadixCache(RadixCache):
                 drained += 1
                 yield item
 
+        def _normalize_revoke_item(item) -> tuple[str, bool]:
+            if isinstance(item, tuple):
+                req_id, zero_hit = item
+                return req_id, bool(zero_hit)
+            return item, False
+
         def _drain_revoke():
             if self._pp_downstream_sync_enabled():
-                for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                    self.pp_deferred_revoke_req_ids.append(req_id)
+                for item in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                    self.pp_deferred_revoke_req_ids.append(_normalize_revoke_item(item))
                 while self.pp_pending_host_tree_events:
                     event = self.pp_pending_host_tree_events[0]
                     if event.kind != "REVOKE" or not self._try_replay_revoke_event(event):
@@ -543,8 +550,9 @@ class HiRadixCache(RadixCache):
                     self.pp_pending_host_tree_events.popleft()
                 return
 
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._drain_single_revoke_req(req_id)
+            for item in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                req_id, zero_hit = _normalize_revoke_item(item)
+                self._drain_single_revoke_req(req_id, zero_hit=zero_hit)
                 self._append_pp_host_tree_event(
                     PPHostTreeEvent(
                         seq=self._next_pp_host_tree_seq(),
@@ -659,6 +667,7 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.zero_hit_prefetch_req_ids.clear()
         self.evictable_host_leaves.clear()
         self.pp_outgoing_host_tree_events.clear()
         self.pp_pending_host_tree_events.clear()
@@ -720,7 +729,7 @@ class HiRadixCache(RadixCache):
             return None
         return self.pp_pending_host_tree_events.popleft()
 
-    def _drain_single_revoke_req(self, req_id: str) -> None:
+    def _drain_single_revoke_req(self, req_id: str, zero_hit: bool = False) -> None:
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is not None:
             last_host_node, token_ids, _, _ = info
@@ -729,6 +738,8 @@ class HiRadixCache(RadixCache):
             if self.cache_controller.prefetch_tokens_occupied < 0:
                 self.cache_controller.prefetch_tokens_occupied = 0
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+        if zero_hit:
+            self.zero_hit_prefetch_req_ids.add(req_id)
 
     def _try_replay_revoke_event(self, event: PPHostTreeEvent) -> bool:
         req_id = event.rid
@@ -737,23 +748,30 @@ class HiRadixCache(RadixCache):
 
         while True:
             if self.pp_deferred_revoke_req_ids:
-                deferred_req_id = self.pp_deferred_revoke_req_ids[0]
+                deferred_req_id, deferred_zero_hit = self.pp_deferred_revoke_req_ids[0]
                 if deferred_req_id != req_id:
                     return False
                 self.pp_deferred_revoke_req_ids.popleft()
-                self._drain_single_revoke_req(deferred_req_id)
+                self._drain_single_revoke_req(
+                    deferred_req_id, zero_hit=deferred_zero_hit
+                )
                 return True
 
             try:
-                queued_req_id = self.cache_controller.prefetch_revoke_queue.get_nowait()
+                queued_item = self.cache_controller.prefetch_revoke_queue.get_nowait()
             except Empty:
                 return False
+            queued_req_id, queued_zero_hit = (
+                queued_item if isinstance(queued_item, tuple) else (queued_item, False)
+            )
 
             if queued_req_id != req_id:
-                self.pp_deferred_revoke_req_ids.append(queued_req_id)
+                self.pp_deferred_revoke_req_ids.append(
+                    (queued_req_id, queued_zero_hit)
+                )
                 return False
 
-            self._drain_single_revoke_req(queued_req_id)
+            self._drain_single_revoke_req(queued_req_id, zero_hit=queued_zero_hit)
             return True
 
     def _write_commit_event_matches(
@@ -852,6 +870,7 @@ class HiRadixCache(RadixCache):
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.zero_hit_prefetch_req_ids.discard(req_id)
 
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
@@ -1478,6 +1497,7 @@ class HiRadixCache(RadixCache):
         Returns 0 if no prefetch was done or was revoked.
         This should be called after check_prefetch_progress() returns True.
         """
+        self.zero_hit_prefetch_req_ids.discard(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
@@ -1548,6 +1568,12 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
+        if req_id in self.zero_hit_prefetch_req_ids:
+            # This request already proved to have no storage benefit on this pass.
+            # Skip re-entering the expensive prefetch -> revoke lifecycle and
+            # let it go straight through normal recompute.
+            return
+
         new_input_tokens = (
             convert_to_bigram_key(new_input_tokens)
             if self.is_eagle
@@ -1771,6 +1797,7 @@ class HiRadixCache(RadixCache):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.zero_hit_prefetch_req_ids.discard(rid)
 
         if rid not in self.ongoing_prefetch:
             return
