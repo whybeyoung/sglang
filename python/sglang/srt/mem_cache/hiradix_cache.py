@@ -753,6 +753,24 @@ class HiRadixCache(RadixCache):
             req_id in self.zero_hit_prefetch_req_ids,
         )
 
+    def _try_replay_prefetch_skip_event(self, event: PPHostTreeEvent) -> bool:
+        req_id = event.rid
+        if req_id is None:
+            return False
+        if req_id in self.ongoing_prefetch:
+            logger.warning(
+                "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=cleanup_ongoing",
+                req_id,
+            )
+            self._drain_single_revoke_req(req_id, zero_hit=True)
+            return True
+        self.zero_hit_prefetch_req_ids.add(req_id)
+        logger.warning(
+            "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=mark_zero_hit",
+            req_id,
+        )
+        return True
+
     def _try_replay_revoke_event(self, event: PPHostTreeEvent) -> bool:
         req_id = event.rid
         if req_id is None:
@@ -1015,6 +1033,8 @@ class HiRadixCache(RadixCache):
                 progressed = False
                 if event.kind == "WRITE_BACKUP_COMMITTED":
                     progressed = self._try_replay_write_backup_event(event)
+                elif event.kind == "PREFETCH_SKIP":
+                    progressed = self._try_replay_prefetch_skip_event(event)
                 elif event.kind == "REVOKE":
                     progressed = self._try_replay_revoke_event(event)
                 elif event.kind == "PREFETCH_FINALIZE":
@@ -1787,6 +1807,14 @@ class HiRadixCache(RadixCache):
                 prefetch_length,
                 self.prefetch_threshold,
             )
+            if self._pp_downstream_sync_enabled():
+                self._append_pp_host_tree_event(
+                    PPHostTreeEvent(
+                        seq=self._next_pp_host_tree_seq(),
+                        kind="PREFETCH_SKIP",
+                        rid=req_id,
+                    )
+                )
             return
         if self.cache_controller.prefetch_rate_limited():
             logger.warning(
