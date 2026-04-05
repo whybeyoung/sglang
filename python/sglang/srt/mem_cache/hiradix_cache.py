@@ -958,8 +958,33 @@ class HiRadixCache(RadixCache):
         req_id = event.rid
         if req_id is None or req_id not in self.ongoing_prefetch:
             return False
-        _, _, _, operation = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None or not self.can_terminate_prefetch(operation):
+        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[req_id]
+        if operation.host_indices is None:
+            return False
+        if not self.can_terminate_prefetch(operation):
+            # Upstream may already have finalized an empty prefetch (no hash pages /
+            # no completed tokens). In that case, waiting for local
+            # can_terminate_prefetch() will never make progress, so consume the
+            # authoritative finalize by cleaning up the local empty prefetch state.
+            if (
+                len(operation.hash_value) == 0
+                and operation.completed_tokens == 0
+                and event.loaded_from_storage == 0
+            ):
+                last_host_node.release_host()
+                del self.ongoing_prefetch[req_id]
+                self.cache_controller.append_host_mem_release(host_indices)
+                self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+                if self.cache_controller.prefetch_tokens_occupied < 0:
+                    self.cache_controller.prefetch_tokens_occupied = 0
+                self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+                self.zero_hit_prefetch_req_ids.discard(req_id)
+                logger.warning(
+                    "[HiCachePPReplay][finalize_empty_apply] rid=%s upstream_loaded=%s",
+                    req_id,
+                    event.loaded_from_storage,
+                )
+                return True
             return False
         loaded_from_storage = self._finalize_prefetch_progress(
             req_id, operation, emit_event=True
