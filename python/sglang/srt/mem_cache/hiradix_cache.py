@@ -695,6 +695,16 @@ class HiRadixCache(RadixCache):
     def _append_pp_host_tree_event(self, event: PPHostTreeEvent) -> None:
         if not (self.enable_storage and self.pp_size > 1):
             return
+        logger.warning(
+            "[HiCachePPEvent][emit] pp=%s cp=%s seq=%s kind=%s rid=%s loaded=%s outgoing_before=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            event.seq,
+            event.kind,
+            event.rid,
+            event.loaded_from_storage,
+            len(self.pp_outgoing_host_tree_events),
+        )
         self.pp_outgoing_host_tree_events.append(
             {
                 "seq": event.seq,
@@ -715,11 +725,43 @@ class HiRadixCache(RadixCache):
     def consume_pp_host_tree_events(self) -> List[dict[str, Any]]:
         events = list(self.pp_outgoing_host_tree_events)
         self.pp_outgoing_host_tree_events.clear()
+        if events:
+            logger.warning(
+                "[HiCachePPEvent][consume] pp=%s cp=%s count=%s events=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                len(events),
+                [
+                    (
+                        int(event.get("seq", 0)),
+                        str(event.get("kind")),
+                        event.get("rid"),
+                        int(event.get("loaded_from_storage", 0)),
+                    )
+                    for event in events[:8]
+                ],
+            )
         return events
 
     def enqueue_pp_host_tree_events(self, events: List[dict[str, Any]]) -> None:
         if not self._pp_downstream_sync_enabled() or not events:
             return
+        logger.warning(
+            "[HiCachePPEvent][enqueue] pp=%s cp=%s count=%s pending_before=%s events=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            len(events),
+            len(self.pp_pending_host_tree_events),
+            [
+                (
+                    int(event.get("seq", 0)),
+                    str(event.get("kind")),
+                    event.get("rid"),
+                    int(event.get("loaded_from_storage", 0)),
+                )
+                for event in events[:8]
+            ],
+        )
         for event in events:
             self.pp_pending_host_tree_events.append(
                 PPHostTreeEvent(
@@ -1057,8 +1099,33 @@ class HiRadixCache(RadixCache):
                 elif event.kind == "PREFETCH_FINALIZE":
                     progressed = self._try_replay_prefetch_finalize_event(event)
                 if not progressed:
+                    logger.warning(
+                        "[HiCachePPEvent][replay_blocked] pp=%s cp=%s seq=%s kind=%s rid=%s pending=%s ongoing=%s zero_hit=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        event.seq,
+                        event.kind,
+                        event.rid,
+                        len(self.pp_pending_host_tree_events),
+                        event.rid in self.ongoing_prefetch if event.rid is not None else False,
+                        event.rid in self.zero_hit_prefetch_req_ids if event.rid is not None else False,
+                    )
                     break
                 self.pp_pending_host_tree_events.popleft()
+                logger.warning(
+                    "[HiCachePPEvent][replay_applied] pp=%s cp=%s seq=%s kind=%s rid=%s pending_after=%s ongoing=%s zero_hit=%s loaded=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    event.seq,
+                    event.kind,
+                    event.rid,
+                    len(self.pp_pending_host_tree_events),
+                    event.rid in self.ongoing_prefetch if event.rid is not None else False,
+                    event.rid in self.zero_hit_prefetch_req_ids if event.rid is not None else False,
+                    self.prefetch_loaded_tokens_by_reqid.get(event.rid, 0)
+                    if event.rid is not None
+                    else 0,
+                )
                 replayed += 1
         finally:
             self._in_pp_host_tree_replay = False
