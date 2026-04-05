@@ -1716,7 +1716,13 @@ class HiRadixCache(RadixCache):
                     return True
             event = self._peek_pp_host_tree_event()
             if event is not None:
-                if event.kind != "PREFETCH_FINALIZE":
+                if event.kind == "WRITE_BACKUP_COMMITTED":
+                    logger.warning(
+                        "[HiCachePrefetchWaitPass] rid=%s reason=unrelated_write_backup_pending event_seq=%s",
+                        req_id,
+                        event.seq,
+                    )
+                elif event.kind != "PREFETCH_FINALIZE":
                     logger.warning(
                         "[HiCachePrefetchWaitBlocked] rid=%s reason=pending_pp_event event_kind=%s event_rid=%s",
                         req_id,
