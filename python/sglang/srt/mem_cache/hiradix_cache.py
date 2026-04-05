@@ -200,6 +200,7 @@ class HiRadixCache(RadixCache):
         self.pp_deferred_revoke_req_ids: Deque[tuple[str, bool]] = deque()
         self.pp_locally_revoked_req_ids: set[str] = set()
         self.pp_locally_revoked_req_queue: Deque[str] = deque()
+        self.pp_retry_prefetch_req_ids: set[str] = set()
         self._in_pp_host_tree_replay = False
 
         # Detach storage backend automatically on process shutdown
@@ -689,6 +690,7 @@ class HiRadixCache(RadixCache):
         self.pp_deferred_revoke_req_ids.clear()
         self.pp_locally_revoked_req_ids.clear()
         self.pp_locally_revoked_req_queue.clear()
+        self.pp_retry_prefetch_req_ids.clear()
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
@@ -786,6 +788,12 @@ class HiRadixCache(RadixCache):
     def has_pending_pp_write_backup_event(self) -> bool:
         event = self._peek_pp_host_tree_event()
         return event is not None and event.kind == "WRITE_BACKUP_COMMITTED"
+
+    def consume_pp_retry_prefetch_req(self, req_id: str) -> bool:
+        if req_id not in self.pp_retry_prefetch_req_ids:
+            return False
+        self.pp_retry_prefetch_req_ids.discard(req_id)
+        return True
 
     def _pop_pp_host_tree_event(self) -> Optional[PPHostTreeEvent]:
         if not self.pp_pending_host_tree_events:
@@ -1060,6 +1068,17 @@ class HiRadixCache(RadixCache):
         if req_id is None:
             return False
         if req_id not in self.ongoing_prefetch:
+            if event.loaded_from_storage > 0:
+                self.zero_hit_prefetch_req_ids.discard(req_id)
+                self.pp_retry_prefetch_req_ids.add(req_id)
+                logger.warning(
+                    "[HiCachePPEvent][replay_mark_retry_prefetch] pp=%s cp=%s seq=%s rid=%s loaded=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    event.seq,
+                    req_id,
+                    event.loaded_from_storage,
+                )
             logger.warning(
                 "[HiCachePPEvent][replay_drop_stale_finalize] pp=%s cp=%s seq=%s rid=%s loaded=%s zero_hit=%s",
                 self.pp_rank,

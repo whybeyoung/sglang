@@ -2523,6 +2523,15 @@ class Scheduler(
                 ):
                     break
 
+            if (
+                self.enable_hicache_storage
+                and self.pp_group is not None
+                and not self.pp_group.is_first_rank
+                and hasattr(self.tree_cache, "consume_pp_retry_prefetch_req")
+                and self.tree_cache.consume_pp_retry_prefetch_req(req.rid)
+            ):
+                self._prefetch_kvcache(req)
+
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if frontier_diag and not prefetch_done:
