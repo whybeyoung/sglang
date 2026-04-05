@@ -1752,6 +1752,12 @@ class HiRadixCache(RadixCache):
             # This request already proved to have no storage benefit on this pass.
             # Skip re-entering the expensive prefetch -> revoke lifecycle and
             # let it go straight through normal recompute.
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=skip reason=zero_hit_marked tokens=%s threshold=%s",
+                req_id,
+                len(new_input_tokens),
+                self.prefetch_threshold,
+            )
             return
 
         new_input_tokens = (
@@ -1764,11 +1770,33 @@ class HiRadixCache(RadixCache):
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage:
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=skip reason=storage_disabled tokens=%s aligned_tokens=%s threshold=%s",
+                req_id,
+                len(new_input_tokens),
+                prefetch_length,
+                self.prefetch_threshold,
+            )
+            return
+        if prefetch_length < self.prefetch_threshold:
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=skip reason=below_threshold tokens=%s aligned_tokens=%s threshold=%s",
+                req_id,
+                len(new_input_tokens),
+                prefetch_length,
+                self.prefetch_threshold,
+            )
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=skip reason=rate_limited tokens=%s aligned_tokens=%s threshold=%s occupied=%s",
+                req_id,
+                len(new_input_tokens),
+                prefetch_length,
+                self.prefetch_threshold,
+                self.cache_controller.prefetch_tokens_occupied,
+            )
             return
 
         last_host_node.protect_host()
@@ -1779,6 +1807,13 @@ class HiRadixCache(RadixCache):
         if host_indices is None:
             last_host_node.release_host()
             # no sufficient host memory for prefetch
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=skip reason=host_alloc_failed aligned_tokens=%s threshold=%s occupied=%s",
+                req_id,
+                prefetch_length,
+                self.prefetch_threshold,
+                self.cache_controller.prefetch_tokens_occupied,
+            )
             return
         operation = self.cache_controller.prefetch(
             req_id,
@@ -1795,6 +1830,13 @@ class HiRadixCache(RadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        logger.warning(
+            "[HiCachePrefetchDecision] rid=%s action=issue aligned_tokens=%s threshold=%s occupied=%s",
+            req_id,
+            len(new_input_tokens),
+            self.prefetch_threshold,
+            self.cache_controller.prefetch_tokens_occupied,
+        )
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
