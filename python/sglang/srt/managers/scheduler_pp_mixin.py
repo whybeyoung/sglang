@@ -674,31 +674,50 @@ class SchedulerPPMixin:
                 )
 
                 if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = (
+                    recv_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
-                    if (
-                        next_consensus_bootstrapped_rids[0]
-                        or next_consensus_bootstrapped_rids[1]
-                        or (
-                            len(next_consensus_bootstrapped_rids) > 3
-                            and next_consensus_bootstrapped_rids[2]
+                    recv_good, recv_bad, recv_deferred, _recv_shared_capacity = (
+                        self._pp_unpack_bootstrap_payload(
+                            recv_consensus_bootstrapped_rids
                         )
-                    ):
+                    )
+                    if recv_good or recv_bad or recv_deferred:
                         self._pp_prefill_diag_log(
                             "bootstrap_consensus_recv",
                             mb=next_mb_id,
-                            consensus_good=self._pp_prefill_diag_rids(
-                                next_consensus_bootstrapped_rids[0]
-                            ),
-                            consensus_bad=self._pp_prefill_diag_rids(
-                                next_consensus_bootstrapped_rids[1]
-                            ),
+                            consensus_good=self._pp_prefill_diag_rids(recv_good),
+                            consensus_bad=self._pp_prefill_diag_rids(recv_bad),
                             consensus_deferred=self._pp_prefill_diag_rids(
-                                next_consensus_bootstrapped_rids[2]
-                                if len(next_consensus_bootstrapped_rids) > 3
-                                else []
+                                recv_deferred
                             ),
+                        )
+                    if self.pp_group.is_last_rank:
+                        next_consensus_bootstrapped_rids = bmbs[next_mb_id]
+                        local_good, local_bad, local_deferred, _local_shared_capacity = (
+                            self._pp_unpack_bootstrap_payload(
+                                next_consensus_bootstrapped_rids
+                            )
+                        )
+                        if local_good or local_bad or local_deferred:
+                            self._pp_prefill_diag_log(
+                                "bootstrap_apply_source",
+                                mb=next_mb_id,
+                                source="local_consensus",
+                                local_good=self._pp_prefill_diag_rids(local_good),
+                                local_bad=self._pp_prefill_diag_rids(local_bad),
+                                local_deferred=self._pp_prefill_diag_rids(
+                                    local_deferred
+                                ),
+                                recv_good=self._pp_prefill_diag_rids(recv_good),
+                                recv_bad=self._pp_prefill_diag_rids(recv_bad),
+                                recv_deferred=self._pp_prefill_diag_rids(
+                                    recv_deferred
+                                ),
+                            )
+                    else:
+                        next_consensus_bootstrapped_rids = (
+                            recv_consensus_bootstrapped_rids
                         )
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
