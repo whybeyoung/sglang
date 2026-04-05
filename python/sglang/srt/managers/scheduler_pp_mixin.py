@@ -254,7 +254,9 @@ class SchedulerPPMixin:
         for req in deferred_reqs:
             req.bootstrap_mb_id = None
             self._pp_prefill_clear_intermediate_head(req.rid)
-            if hasattr(self.tree_cache, "pp_locally_revoked_req_ids"):
+            if hasattr(self.tree_cache, "discard_pp_locally_revoked_req"):
+                self.tree_cache.discard_pp_locally_revoked_req(req.rid)
+            elif hasattr(self.tree_cache, "pp_locally_revoked_req_ids"):
                 self.tree_cache.pp_locally_revoked_req_ids.discard(req.rid)
         return [req.rid for req in deferred_reqs]
 
@@ -1258,7 +1260,12 @@ class SchedulerPPMixin:
                     return_failed_reqs=True,
                 )
             )
-            if hasattr(self.tree_cache, "pp_locally_revoked_req_ids"):
+            if hasattr(self.tree_cache, "discard_pp_locally_revoked_req"):
+                for req in good_reqs:
+                    self.tree_cache.discard_pp_locally_revoked_req(req.rid)
+                for req in failed_reqs:
+                    self.tree_cache.discard_pp_locally_revoked_req(req.rid)
+            elif hasattr(self.tree_cache, "pp_locally_revoked_req_ids"):
                 for req in good_reqs:
                     self.tree_cache.pp_locally_revoked_req_ids.discard(req.rid)
                 for req in failed_reqs:
@@ -1378,10 +1385,12 @@ class SchedulerPPMixin:
                 and not curr_bad_bootstrapped_rids
             ):
                 head_candidate = local_candidate_reqs[0]
-                locally_revoked = (
-                    hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
-                    and head_candidate.rid in self.tree_cache.pp_locally_revoked_req_ids
+                revoked_head_rid = (
+                    self.tree_cache.peek_pp_locally_revoked_req()
+                    if hasattr(self.tree_cache, "peek_pp_locally_revoked_req")
+                    else None
                 )
+                locally_revoked = head_candidate.rid == revoked_head_rid
                 if (
                     local_bootstrap_reqs
                     and local_bootstrap_reqs[0].rid == head_candidate.rid

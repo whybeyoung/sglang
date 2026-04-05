@@ -199,6 +199,7 @@ class HiRadixCache(RadixCache):
         self.pp_pending_host_tree_events: Deque[PPHostTreeEvent] = deque()
         self.pp_deferred_revoke_req_ids: Deque[tuple[str, bool]] = deque()
         self.pp_locally_revoked_req_ids: set[str] = set()
+        self.pp_locally_revoked_req_queue: Deque[str] = deque()
         self._in_pp_host_tree_replay = False
 
         # Detach storage backend automatically on process shutdown
@@ -687,6 +688,7 @@ class HiRadixCache(RadixCache):
         self.pp_pending_host_tree_events.clear()
         self.pp_deferred_revoke_req_ids.clear()
         self.pp_locally_revoked_req_ids.clear()
+        self.pp_locally_revoked_req_queue.clear()
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
@@ -800,7 +802,9 @@ class HiRadixCache(RadixCache):
         if zero_hit:
             self.zero_hit_prefetch_req_ids.add(req_id)
             if self._pp_downstream_sync_enabled():
-                self.pp_locally_revoked_req_ids.add(req_id)
+                if req_id not in self.pp_locally_revoked_req_ids:
+                    self.pp_locally_revoked_req_ids.add(req_id)
+                    self.pp_locally_revoked_req_queue.append(req_id)
         logger.warning(
             "[HiCachePrefetchCleanup] rid=%s zero_hit=%s had_ongoing=%s ongoing_after=%s loaded_tokens_before=%s loaded_tokens_after=%s zero_hit_marked=%s",
             req_id,
@@ -811,6 +815,22 @@ class HiRadixCache(RadixCache):
             self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
             req_id in self.zero_hit_prefetch_req_ids,
         )
+
+    def peek_pp_locally_revoked_req(self) -> Optional[str]:
+        while self.pp_locally_revoked_req_queue:
+            rid = self.pp_locally_revoked_req_queue[0]
+            if rid in self.pp_locally_revoked_req_ids:
+                return rid
+            self.pp_locally_revoked_req_queue.popleft()
+        return None
+
+    def discard_pp_locally_revoked_req(self, req_id: str) -> None:
+        self.pp_locally_revoked_req_ids.discard(req_id)
+        while self.pp_locally_revoked_req_queue:
+            rid = self.pp_locally_revoked_req_queue[0]
+            if rid in self.pp_locally_revoked_req_ids:
+                break
+            self.pp_locally_revoked_req_queue.popleft()
 
     def _try_replay_prefetch_skip_event(self, event: PPHostTreeEvent) -> bool:
         req_id = event.rid

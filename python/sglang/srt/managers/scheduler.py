@@ -2457,6 +2457,7 @@ class Scheduler(
                 [req.rid for req in self.running_batch.reqs[:8]],
             )
 
+        follow_rank_revoked_head = None
         follow_rank_revoked_rids = set()
         if (
             self.enable_hicache_storage
@@ -2465,15 +2466,18 @@ class Scheduler(
             and hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
         ):
             follow_rank_revoked_rids = set(self.tree_cache.pp_locally_revoked_req_ids)
+            if hasattr(self.tree_cache, "peek_pp_locally_revoked_req"):
+                follow_rank_revoked_head = self.tree_cache.peek_pp_locally_revoked_req()
 
         for req in self.waiting_queue:
-            if follow_rank_revoked_rids and req.rid in follow_rank_revoked_rids:
+            if follow_rank_revoked_head is not None and req.rid == follow_rank_revoked_head:
                 if frontier_diag:
                     logger.warning(
-                        "[PPFrontierDiag][locally_revoked_barrier] pp=%s cp=%s tp=%s revoked=%s waiting=%s bootstrap=%s reason=waiting_head rid=%s",
+                        "[PPFrontierDiag][locally_revoked_barrier] pp=%s cp=%s tp=%s revoked_head=%s revoked=%s waiting=%s bootstrap=%s reason=waiting_head rid=%s",
                         self.pp_rank,
                         self.attn_cp_rank,
                         self.attn_tp_rank,
+                        follow_rank_revoked_head,
                         sorted(list(follow_rank_revoked_rids))[:8],
                         [x.rid for x in self.waiting_queue[:8]],
                         [
