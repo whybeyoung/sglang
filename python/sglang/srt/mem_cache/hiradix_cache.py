@@ -746,6 +746,14 @@ class HiRadixCache(RadixCache):
         if req_id is None:
             return False
 
+        # Treat upstream REVOKE as authoritative for downstream PP ranks.
+        # Waiting for the local revoke queue to independently produce the same
+        # req can leave the request stuck in wait_complete while the upstream
+        # rank has already bypassed/revoked the prefetch.
+        if req_id in self.ongoing_prefetch:
+            self._drain_single_revoke_req(req_id, zero_hit=True)
+            return True
+
         while True:
             if self.pp_deferred_revoke_req_ids:
                 deferred_req_id, deferred_zero_hit = self.pp_deferred_revoke_req_ids[0]
