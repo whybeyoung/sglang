@@ -2577,6 +2577,17 @@ class Scheduler(
                         break
 
             req.init_next_round_input(self.tree_cache)
+            if frontier_diag:
+                logger.warning(
+                    "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=waiting_head_ready prefix=%s host_hit=%s storage_hit=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    req.rid,
+                    len(req.prefix_indices),
+                    req.host_hit_length,
+                    req.storage_hit_length,
+                )
             if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
                 prefix_len_after_init = len(req.prefix_indices)
                 recomputed_extend_len = len(req.fill_ids) - prefix_len_after_init
@@ -2609,6 +2620,14 @@ class Scheduler(
                     req.rid,
                     getattr(res, "name", str(res)),
                     [x.rid for x in adder.can_run_list[:8]],
+                )
+            if frontier_diag and res == AddReqResult.CONTINUE:
+                logger.warning(
+                    "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=waiting_to_batch",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    req.rid,
                 )
 
             if self.enable_lora:

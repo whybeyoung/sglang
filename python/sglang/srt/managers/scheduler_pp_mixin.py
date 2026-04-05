@@ -757,6 +757,16 @@ class SchedulerPPMixin:
                             released_deferred=released_deferred,
                             waiting_after_apply=waiting_after_apply,
                         )
+                    if released_good:
+                        for rid in released_good[:8]:
+                            logger.warning(
+                                "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=bootstrap_to_waiting mb=%s",
+                                self.pp_rank,
+                                self.attn_cp_rank,
+                                self.attn_tp_rank,
+                                rid,
+                                next_mb_id,
+                            )
                     # Consume this microbatch's bootstrap consensus exactly once.
                     bmbs[next_mb_id] = None
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)

@@ -827,6 +827,14 @@ class HiRadixCache(RadixCache):
             self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
             req_id in self.zero_hit_prefetch_req_ids,
         )
+        logger.warning(
+            "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_cleanup zero_hit=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.attn_tp_rank,
+            req_id,
+            zero_hit,
+        )
 
     def peek_pp_locally_revoked_req(self) -> Optional[str]:
         while self.pp_locally_revoked_req_queue:
@@ -1179,6 +1187,17 @@ class HiRadixCache(RadixCache):
                 loaded_from_storage,
                 first_suffix_token,
                 first_suffix_hash,
+            )
+            logger.warning(
+                "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_finalize completed=%s matched=%s loaded=%s anchor_node=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                req_id,
+                min_completed_tokens,
+                matched_length,
+                loaded_from_storage,
+                last_host_node.id if last_host_node is not None else None,
             )
 
         if emit_event:
@@ -2199,6 +2218,16 @@ class HiRadixCache(RadixCache):
             last_hash,
             prefix_keys,
             **self._get_extra_pools(),
+        )
+        logger.warning(
+            "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_issue token_count=%s last_hash=%s prefix_keys=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.attn_tp_rank,
+            req_id,
+            len(new_input_tokens),
+            last_hash,
+            0 if prefix_keys is None else len(prefix_keys),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
