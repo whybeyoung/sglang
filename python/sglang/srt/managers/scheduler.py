@@ -2464,7 +2464,7 @@ class Scheduler(
                     res = self.lora_overlap_loader.try_overlap_load_lora(
                         req.lora_id, running_loras
                     )
-                    if not res:
+                if not res:
                         continue
                 else:
                     new_lora_set = {req.lora_id} | running_loras
@@ -2472,6 +2472,27 @@ class Scheduler(
                         new_lora_set
                     ):
                         continue
+
+            # On follow ranks, locally revoked zero-hit prefetches must settle in-order
+            # before later waiting requests can be launched, otherwise PP0/PP1 can pick
+            # different batch frontiers.
+            if (
+                self.enable_hicache_storage
+                and hasattr(self, "pp_group")
+                and not self.pp_group.is_first_rank
+                and hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
+                and req.rid in self.tree_cache.pp_locally_revoked_req_ids
+            ):
+                if frontier_diag:
+                    logger.warning(
+                        "[PPFrontierDiag][locally_revoked_waiting] pp=%s cp=%s tp=%s rid=%s waiting=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        self.attn_tp_rank,
+                        req.rid,
+                        [x.rid for x in self.waiting_queue[:8]],
+                    )
+                break
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
