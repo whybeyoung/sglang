@@ -1002,6 +1002,36 @@ class HiRadixCache(RadixCache):
             self._in_pp_host_tree_replay = False
         return replayed
 
+    def _try_fast_forward_revoke_for_req(self, req_id: str) -> bool:
+        """Apply an already-arrived REVOKE for req_id when it is only blocked by
+        unrelated PREFETCH_FINALIZE events ahead of it.
+
+        This keeps authoritative upstream revoke semantics while avoiding
+        cross-request HOL blocking from finalize events that do not affect the
+        current request.
+        """
+        if not self._pp_downstream_sync_enabled() or not self.pp_pending_host_tree_events:
+            return False
+
+        skipped_unrelated_finalize = 0
+        for event in self.pp_pending_host_tree_events:
+            if event.kind == "PREFETCH_FINALIZE" and event.rid != req_id:
+                skipped_unrelated_finalize += 1
+                continue
+            if event.kind == "REVOKE" and event.rid == req_id:
+                if self._try_replay_revoke_event(event):
+                    self.pp_pending_host_tree_events.remove(event)
+                    logger.warning(
+                        "[HiCachePPReplay][revoke_fast_apply] rid=%s skipped_unrelated_finalize=%s",
+                        req_id,
+                        skipped_unrelated_finalize,
+                    )
+                    return True
+                return False
+            return False
+
+        return False
+
     def get_height(self, node: TreeNode):
         height = 0
         while node != self.root_node:
@@ -1537,6 +1567,13 @@ class HiRadixCache(RadixCache):
                     req_id,
                 )
                 return True
+            if self._try_fast_forward_revoke_for_req(req_id):
+                if req_id not in self.ongoing_prefetch:
+                    logger.warning(
+                        "[HiCachePrefetchWaitResolved] rid=%s reason=fast_forward_revoke",
+                        req_id,
+                    )
+                    return True
             event = self._peek_pp_host_tree_event()
             if event is not None:
                 if event.kind != "PREFETCH_FINALIZE":
