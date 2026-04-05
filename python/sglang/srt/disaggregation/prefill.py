@@ -267,21 +267,15 @@ class PrefillBootstrapQueue:
             return True
 
         if not self.scheduler.tree_cache.check_prefetch_progress(req.rid):
-            count = getattr(req, "_hicache_gate_wait_count", 0) + 1
-            req._hicache_gate_wait_count = count
-            if count in (1, 8, 64, 256):
-                logger.warning(
-                    "[PPPrefillProblem][hicache_gate_wait] pp=%s tp=%s rid=%s count=%s storage_hit_length=%s state=%s",
-                    self.pp_rank,
-                    self.tp_rank,
-                    req.rid,
-                    count,
-                    req.storage_hit_length,
-                    self.scheduler.tree_cache.get_prefetch_progress_debug(req.rid),
-                )
+            logger.warning(
+                "[PPPrefillProblem][hicache_gate_wait] pp=%s tp=%s rid=%s storage_hit_length=%s state=%s",
+                self.pp_rank,
+                self.tp_rank,
+                req.rid,
+                req.storage_hit_length,
+                self.scheduler.tree_cache.get_prefetch_progress_debug(req.rid),
+            )
             return False
-        if hasattr(req, "_hicache_gate_wait_count"):
-            req._hicache_gate_wait_count = 0
 
         if req.storage_hit_length == 0:
             req.storage_hit_length = self.scheduler.tree_cache.pop_prefetch_loaded_tokens(

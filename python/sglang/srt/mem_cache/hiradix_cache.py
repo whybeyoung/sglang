@@ -189,7 +189,6 @@ class HiRadixCache(RadixCache):
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.zero_hit_prefetch_req_ids: set[str] = set()
-        self.prefetch_progress_log_counts: dict[str, int] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -1498,17 +1497,12 @@ class HiRadixCache(RadixCache):
             return True
 
         if not self.can_terminate_prefetch(operation):
-            count = self.prefetch_progress_log_counts.get(req_id, 0) + 1
-            self.prefetch_progress_log_counts[req_id] = count
-            if count in (1, 8, 64, 256):
-                logger.warning(
-                    "[HiCachePrefetchWait] rid=%s count=%s state=%s",
-                    req_id,
-                    count,
-                    self._get_prefetch_progress_debug(req_id),
-                )
+            logger.warning(
+                "[HiCachePrefetchWait] rid=%s state=%s",
+                req_id,
+                self._get_prefetch_progress_debug(req_id),
+            )
             return False
-        self.prefetch_progress_log_counts.pop(req_id, None)
         self._finalize_prefetch_progress(req_id, operation, emit_event=True)
         if self._pp_downstream_sync_enabled():
             event = self._peek_pp_host_tree_event()
