@@ -64,6 +64,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _safe_attn_tp_rank(obj) -> int:
+    return int(getattr(obj, "attn_tp_rank", 0))
+
+
 @dataclass
 class PPHostTreeEvent:
     seq: int
@@ -851,7 +855,7 @@ class HiRadixCache(RadixCache):
             "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_cleanup zero_hit=%s",
             self.pp_rank,
             self.attn_cp_rank,
-            self.attn_tp_rank,
+            _safe_attn_tp_rank(self),
             req_id,
             zero_hit,
         )
@@ -1212,7 +1216,7 @@ class HiRadixCache(RadixCache):
                 "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_finalize completed=%s matched=%s loaded=%s anchor_node=%s",
                 self.pp_rank,
                 self.attn_cp_rank,
-                self.attn_tp_rank,
+                _safe_attn_tp_rank(self),
                 req_id,
                 min_completed_tokens,
                 matched_length,
@@ -2264,7 +2268,7 @@ class HiRadixCache(RadixCache):
             "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_issue token_count=%s last_hash=%s prefix_keys=%s",
             self.pp_rank,
             self.attn_cp_rank,
-            self.attn_tp_rank,
+            _safe_attn_tp_rank(self),
             req_id,
             len(new_input_tokens),
             last_hash,
