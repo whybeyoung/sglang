@@ -1996,6 +1996,60 @@ class HiRadixCache(RadixCache):
             last_host_node = last_host_node.parent
 
         if (
+            os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1"
+            and params.req is not None
+        ):
+            host_path = []
+            walk_node = last_node
+            while walk_node is not None and walk_node is not self.root_node and len(host_path) < 8:
+                host_path.append(
+                    (
+                        walk_node.id,
+                        len(walk_node.key) if walk_node.key is not None else 0,
+                        walk_node.evicted,
+                        walk_node.backuped,
+                        len(walk_node.host_value) if walk_node.host_value is not None else 0,
+                    )
+                )
+                if not walk_node.evicted:
+                    break
+                walk_node = walk_node.parent
+
+            backup_walk = []
+            walk_node = last_host_node
+            while walk_node is not None and walk_node is not self.root_node and len(backup_walk) < 8:
+                backup_walk.append(
+                    (
+                        walk_node.id,
+                        len(walk_node.key) if walk_node.key is not None else 0,
+                        walk_node.evicted,
+                        walk_node.backuped,
+                        len(walk_node.host_value) if walk_node.host_value is not None else 0,
+                    )
+                )
+                if walk_node.backuped:
+                    break
+                walk_node = walk_node.parent
+
+            if len(params.key) >= 400 or host_hit_length == 0:
+                logger.warning(
+                    "[HiCacheMatchPath] rid=%s key_len=%s device_hit=%s host_hit=%s total_cached=%s "
+                    "last_device=%s last_host=%s host_path=%s backup_walk=%s pp=%s cp=%s tp=%s",
+                    params.req.rid,
+                    len(params.key),
+                    len(value),
+                    host_hit_length,
+                    len(value) + host_hit_length,
+                    last_node.id if last_node is not None else None,
+                    last_host_node.id if last_host_node is not None else None,
+                    host_path,
+                    backup_walk,
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.cache_controller.tp_rank,
+                )
+
+        if (
             os.getenv("SGLANG_DEBUG_HICACHE_MATCH", "0") == "1"
             and params.req is not None
         ):
@@ -2167,6 +2221,20 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
+            if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1":
+                logger.warning(
+                    "[HiCacheHostInsert] pp=%s cp=%s parent=%s node=%s key_len=%s host_len=%s "
+                    "hash_pages=%s extra_key=%s child_key=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    node.id if node is not None else None,
+                    new_node.id,
+                    len(new_node.key) if new_node.key is not None else 0,
+                    len(new_node.host_value) if new_node.host_value is not None else 0,
+                    len(new_node.hash_value) if new_node.hash_value is not None else 0,
+                    new_node.key.extra_key if new_node.key is not None else None,
+                    child_key,
+                )
 
         return matched_length
 
@@ -2221,6 +2289,25 @@ class HiRadixCache(RadixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
+
+        if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1":
+            logger.warning(
+                "[HiCacheNodeSplit] pp=%s cp=%s parent=%s new_node=%s child=%s split_len=%s "
+                "new_key_len=%s child_key_len=%s new_has_host=%s child_has_host=%s "
+                "new_hash_pages=%s child_hash_pages=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                new_node.parent.id if new_node.parent is not None else None,
+                new_node.id,
+                child.id,
+                split_len,
+                len(new_node.key) if new_node.key is not None else 0,
+                len(child.key) if child.key is not None else 0,
+                new_node.host_value is not None,
+                child.host_value is not None,
+                len(new_node.hash_value) if new_node.hash_value is not None else 0,
+                len(child.hash_value) if child.hash_value is not None else 0,
+            )
 
         return new_node
 
