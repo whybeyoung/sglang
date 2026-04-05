@@ -2465,27 +2465,6 @@ class Scheduler(
             and hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
         ):
             follow_rank_revoked_rids = set(self.tree_cache.pp_locally_revoked_req_ids)
-            bootstrap_head = []
-            if hasattr(self, "disagg_prefill_bootstrap_queue"):
-                bootstrap_head = [
-                    req.rid for req in self.disagg_prefill_bootstrap_queue.queue[:4]
-                ]
-            if (
-                follow_rank_revoked_rids
-                and bootstrap_head
-                and bootstrap_head[0] in follow_rank_revoked_rids
-            ):
-                if frontier_diag:
-                    logger.warning(
-                        "[PPFrontierDiag][locally_revoked_barrier] pp=%s cp=%s tp=%s revoked=%s waiting=%s bootstrap=%s reason=bootstrap_head",
-                        self.pp_rank,
-                        self.attn_cp_rank,
-                        self.attn_tp_rank,
-                        sorted(list(follow_rank_revoked_rids))[:8],
-                        [req.rid for req in self.waiting_queue[:8]],
-                        bootstrap_head,
-                    )
-                return None
 
         for req in self.waiting_queue:
             if follow_rank_revoked_rids and req.rid in follow_rank_revoked_rids:
