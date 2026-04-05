@@ -601,23 +601,7 @@ class SchedulerPPMixin:
                     )
 
                 self.process_prefill_chunk()
-                block_local_batch_pick = (
-                    not self.pp_group.is_first_rank
-                    and hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
-                    and bool(self.tree_cache.pp_locally_revoked_req_ids)
-                )
-                if block_local_batch_pick:
-                    self._pp_prefill_diag_log(
-                        "batch_pick_blocked",
-                        mb=mb_id,
-                        locally_revoked=self._pp_prefill_diag_rids(
-                            list(self.tree_cache.pp_locally_revoked_req_ids)
-                        ),
-                        waiting=self._pp_prefill_diag_rids(self.waiting_queue),
-                    )
-                    batch = None
-                else:
-                    batch = self.get_new_batch_prefill()
+                batch = self.get_new_batch_prefill()
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
