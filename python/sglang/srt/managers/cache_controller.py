@@ -967,7 +967,18 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                logger.warning(
+                    "[HiCachePrefetchThread][start] rid=%s token_count=%s",
+                    operation.request_id,
+                    len(operation.token_ids),
+                )
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+                logger.warning(
+                    "[HiCachePrefetchThread][query_done] rid=%s storage_hit_count=%s hash_pages=%s",
+                    operation.request_id,
+                    storage_hit_count,
+                    len(hash_value),
+                )
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -978,6 +989,13 @@ class HiCacheController:
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
+                    logger.warning(
+                        "[HiCachePrefetchThread][revoke_enqueue] rid=%s storage_hit_count=%s zero_hit=%s threshold=%s",
+                        operation.request_id,
+                        storage_hit_count,
+                        storage_hit_count == 0,
+                        self.prefetch_threshold,
+                    )
                     self.prefetch_revoke_queue.put(
                         (operation.request_id, storage_hit_count == 0)
                     )
