@@ -696,6 +696,26 @@ class HiRadixCache(RadixCache):
     def _pp_downstream_sync_enabled(self) -> bool:
         return self.enable_storage and self.pp_size > 1 and self.pp_rank > 0
 
+    def _pp_should_skip_large_shallow_prefetch(
+        self, last_host_node: TreeNode, prefetch_length: int
+    ) -> bool:
+        # In PP mode, PP0 can run ahead into a new large-suffix window and grow
+        # a deep host subtree before PP1 reaches the same request window. That
+        # early tree growth is the first observed source of host-hit divergence.
+        #
+        # Keep this guard intentionally narrow:
+        # - PP first rank only
+        # - storage-enabled PP only
+        # - only large prefetches
+        # - only when the current host anchor is still shallow
+        if not (self.enable_storage and self.pp_size > 1 and self.pp_rank == 0):
+            return False
+        if prefetch_length < self.prefetch_threshold:
+            return False
+        if last_host_node is None or last_host_node.key is None:
+            return False
+        return len(last_host_node.key) <= 16
+
     def _append_pp_host_tree_event(self, event: PPHostTreeEvent) -> None:
         if not (self.enable_storage and self.pp_size > 1):
             return
@@ -2183,6 +2203,27 @@ class HiRadixCache(RadixCache):
                         rid=req_id,
                     )
                 )
+            return
+        if self._pp_should_skip_large_shallow_prefetch(
+            last_host_node, prefetch_length
+        ):
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=skip reason=pp_first_rank_defer_large_shallow "
+                "tokens=%s aligned_tokens=%s anchor_node=%s anchor_key_len=%s threshold=%s",
+                req_id,
+                len(new_input_tokens),
+                prefetch_length,
+                last_host_node.id if last_host_node is not None else None,
+                len(last_host_node.key) if last_host_node is not None and last_host_node.key is not None else 0,
+                self.prefetch_threshold,
+            )
+            self._append_pp_host_tree_event(
+                PPHostTreeEvent(
+                    seq=self._next_pp_host_tree_seq(),
+                    kind="PREFETCH_SKIP",
+                    rid=req_id,
+                )
+            )
             return
         if self.cache_controller.prefetch_rate_limited():
             logger.warning(
