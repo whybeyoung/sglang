@@ -2503,7 +2503,7 @@ class Scheduler(
                     )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
-                    continue
+                    break
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
