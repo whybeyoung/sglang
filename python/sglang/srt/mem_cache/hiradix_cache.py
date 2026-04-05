@@ -1527,7 +1527,7 @@ class HiRadixCache(RadixCache):
                 return True
             event = self._peek_pp_host_tree_event()
             if event is not None:
-                if event.kind != "PREFETCH_FINALIZE" or event.rid != req_id:
+                if event.kind != "PREFETCH_FINALIZE":
                     logger.warning(
                         "[HiCachePrefetchWaitBlocked] rid=%s reason=pending_pp_event event_kind=%s event_rid=%s",
                         req_id,
@@ -1535,6 +1535,19 @@ class HiRadixCache(RadixCache):
                         event.rid,
                     )
                     return False
+                if event.rid == req_id:
+                    logger.warning(
+                        "[HiCachePrefetchWaitBlocked] rid=%s reason=matching_prefetch_finalize_pending event_kind=%s event_rid=%s",
+                        req_id,
+                        event.kind,
+                        event.rid,
+                    )
+                    return False
+                logger.warning(
+                    "[HiCachePrefetchWaitPass] rid=%s reason=unrelated_prefetch_finalize_pending event_rid=%s",
+                    req_id,
+                    event.rid,
+                )
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
