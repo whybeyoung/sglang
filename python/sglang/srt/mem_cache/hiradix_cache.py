@@ -542,7 +542,20 @@ class HiRadixCache(RadixCache):
         def _drain_revoke():
             if self._pp_downstream_sync_enabled():
                 for item in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                    self.pp_deferred_revoke_req_ids.append(_normalize_revoke_item(item))
+                    req_id, zero_hit = _normalize_revoke_item(item)
+                    # Local zero-hit revokes must take effect immediately on this
+                    # rank; otherwise the request can remain stuck in
+                    # ongoing_prefetch while we wait for an upstream REVOKE that
+                    # may never exist (for example when upstream skipped
+                    # prefetching entirely).
+                    self._drain_single_revoke_req(req_id, zero_hit=zero_hit)
+                    self._append_pp_host_tree_event(
+                        PPHostTreeEvent(
+                            seq=self._next_pp_host_tree_seq(),
+                            kind="REVOKE",
+                            rid=req_id,
+                        )
+                    )
                 while self.pp_pending_host_tree_events:
                     event = self.pp_pending_host_tree_events[0]
                     if event.kind != "REVOKE" or not self._try_replay_revoke_event(event):
