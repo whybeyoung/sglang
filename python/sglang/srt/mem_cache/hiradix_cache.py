@@ -1033,8 +1033,19 @@ class HiRadixCache(RadixCache):
 
     def _try_replay_prefetch_finalize_event(self, event: PPHostTreeEvent) -> bool:
         req_id = event.rid
-        if req_id is None or req_id not in self.ongoing_prefetch:
+        if req_id is None:
             return False
+        if req_id not in self.ongoing_prefetch:
+            logger.warning(
+                "[HiCachePPEvent][replay_drop_stale_finalize] pp=%s cp=%s seq=%s rid=%s loaded=%s zero_hit=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                event.seq,
+                req_id,
+                event.loaded_from_storage,
+                req_id in self.zero_hit_prefetch_req_ids,
+            )
+            return True
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[req_id]
         if operation.host_indices is None:
             return False
