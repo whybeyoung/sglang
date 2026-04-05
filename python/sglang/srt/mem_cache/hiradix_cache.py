@@ -938,11 +938,8 @@ class HiRadixCache(RadixCache):
     def _write_commit_event_matches(
         self,
         event: PPHostTreeEvent,
-        ack_list: List[int],
         nodes: List[TreeNode],
     ) -> bool:
-        if ack_list != event.node_ids:
-            return False
         if len(nodes) != len(event.node_key_lens):
             return False
         for idx, node in enumerate(nodes):
@@ -986,7 +983,7 @@ class HiRadixCache(RadixCache):
                 nodes = [self.ongoing_write_through.get(ack_id) for ack_id in ack_list]
                 if (
                     not any(node is None for node in nodes)
-                    and self._write_commit_event_matches(event, ack_list, nodes)
+                    and self._write_commit_event_matches(event, nodes)
                 ):
                     self.cache_controller.ack_write_queue.pop(0)
                     self._consume_write_ack_group(
@@ -1002,24 +999,43 @@ class HiRadixCache(RadixCache):
                     )
                     return True
 
-        if not event.node_ids:
+        if not event.node_key_lens:
             return False
 
-        nodes = [self.ongoing_write_through.get(node_id) for node_id in event.node_ids]
-        if any(node is None for node in nodes):
-            return False
-        if not self._write_commit_event_matches(event, event.node_ids, nodes):
-            return False
-
+        ack_list = None
+        nodes = None
         removed_ack_idx = None
-        for idx, (_, _, ack_list) in enumerate(self.cache_controller.ack_write_queue):
-            if ack_list == event.node_ids:
-                removed_ack_idx = idx
-                break
+        for idx, (_, _, queued_ack_list) in enumerate(self.cache_controller.ack_write_queue):
+            queued_nodes = [
+                self.ongoing_write_through.get(ack_id) for ack_id in queued_ack_list
+            ]
+            if any(node is None for node in queued_nodes):
+                continue
+            if not self._write_commit_event_matches(event, queued_nodes):
+                continue
+            removed_ack_idx = idx
+            ack_list = queued_ack_list
+            nodes = queued_nodes
+            break
+
+        if ack_list is None or nodes is None:
+            if len(event.node_ids) == len(event.node_key_lens):
+                queued_nodes = [
+                    self.ongoing_write_through.get(node_id) for node_id in event.node_ids
+                ]
+                if (
+                    not any(node is None for node in queued_nodes)
+                    and self._write_commit_event_matches(event, queued_nodes)
+                ):
+                    ack_list = list(event.node_ids)
+                    nodes = queued_nodes
+        if ack_list is None or nodes is None:
+            return False
+
         if removed_ack_idx is not None:
             self.cache_controller.ack_write_queue.pop(removed_ack_idx)
 
-        for node_id in event.node_ids:
+        for node_id in ack_list:
             backuped_node = self.ongoing_write_through.pop(node_id)
             self.dec_lock_ref(backuped_node)
 
