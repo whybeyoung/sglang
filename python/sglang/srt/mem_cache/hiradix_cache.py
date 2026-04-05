@@ -998,8 +998,34 @@ class HiRadixCache(RadixCache):
                         len(ack_list),
                     )
                     return True
+            else:
+                logger.warning(
+                    "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=ack_not_ready ack_head=%s ongoing_write=%s event_nodes=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    event.seq,
+                    ack_list[:8],
+                    len(self.ongoing_write_through),
+                    len(event.node_key_lens),
+                )
+        else:
+            logger.warning(
+                "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=no_ack_queue ongoing_write=%s event_nodes=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                event.seq,
+                len(self.ongoing_write_through),
+                len(event.node_key_lens),
+            )
 
         if not event.node_key_lens:
+            logger.warning(
+                "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=empty_event_nodes ongoing_write=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                event.seq,
+                len(self.ongoing_write_through),
+            )
             return False
 
         ack_list = None
@@ -1030,6 +1056,24 @@ class HiRadixCache(RadixCache):
                     ack_list = list(event.node_ids)
                     nodes = queued_nodes
         if ack_list is None or nodes is None:
+            sample_nodes = list(self.ongoing_write_through.items())[:4]
+            logger.warning(
+                "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=no_matching_nodes event_key_lens=%s event_hashes=%s sample_ongoing=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                event.seq,
+                event.node_key_lens[:8],
+                event.node_last_hashes[:4],
+                [
+                    (
+                        node_id,
+                        len(node.key),
+                        node.get_last_hash_value(),
+                        node.key.extra_key,
+                    )
+                    for node_id, node in sample_nodes
+                ],
+            )
             return False
 
         if removed_ack_idx is not None:
@@ -1329,10 +1373,30 @@ class HiRadixCache(RadixCache):
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
+            logger.warning(
+                "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s key_len=%s last_hash=%s extra_key=%s write_back=%s ongoing_write=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                node.id,
+                len(node.key),
+                node.get_last_hash_value(),
+                node.key.extra_key,
+                write_back,
+                len(self.ongoing_write_through),
+            )
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
         else:
+            logger.warning(
+                "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s action=alloc_failed key_len=%s last_hash=%s extra_key=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                node.id,
+                len(node.key),
+                node.get_last_hash_value(),
+                node.key.extra_key,
+            )
             return 0
 
         return len(host_indices)
