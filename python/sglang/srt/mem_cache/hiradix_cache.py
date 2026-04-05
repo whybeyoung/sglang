@@ -751,6 +751,12 @@ class HiRadixCache(RadixCache):
         # req can leave the request stuck in wait_complete while the upstream
         # rank has already bypassed/revoked the prefetch.
         if req_id in self.ongoing_prefetch:
+            logger.warning(
+                "[HiCachePPReplay][revoke_apply] rid=%s source=upstream ongoing_before=%s loaded_tokens=%s",
+                req_id,
+                True,
+                self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
+            )
             self._drain_single_revoke_req(req_id, zero_hit=True)
             return True
 
@@ -758,8 +764,18 @@ class HiRadixCache(RadixCache):
             if self.pp_deferred_revoke_req_ids:
                 deferred_req_id, deferred_zero_hit = self.pp_deferred_revoke_req_ids[0]
                 if deferred_req_id != req_id:
+                    logger.warning(
+                        "[HiCachePPReplay][revoke_wait] rid=%s reason=deferred_head_mismatch deferred_head=%s",
+                        req_id,
+                        deferred_req_id,
+                    )
                     return False
                 self.pp_deferred_revoke_req_ids.popleft()
+                logger.warning(
+                    "[HiCachePPReplay][revoke_apply] rid=%s source=deferred_queue zero_hit=%s",
+                    deferred_req_id,
+                    deferred_zero_hit,
+                )
                 self._drain_single_revoke_req(
                     deferred_req_id, zero_hit=deferred_zero_hit
                 )
@@ -768,17 +784,33 @@ class HiRadixCache(RadixCache):
             try:
                 queued_item = self.cache_controller.prefetch_revoke_queue.get_nowait()
             except Empty:
+                logger.warning(
+                    "[HiCachePPReplay][revoke_wait] rid=%s reason=no_local_revoke_queue ongoing=%s",
+                    req_id,
+                    req_id in self.ongoing_prefetch,
+                )
                 return False
             queued_req_id, queued_zero_hit = (
                 queued_item if isinstance(queued_item, tuple) else (queued_item, False)
             )
 
             if queued_req_id != req_id:
+                logger.warning(
+                    "[HiCachePPReplay][revoke_wait] rid=%s reason=queue_head_mismatch queued_head=%s queued_zero_hit=%s",
+                    req_id,
+                    queued_req_id,
+                    queued_zero_hit,
+                )
                 self.pp_deferred_revoke_req_ids.append(
                     (queued_req_id, queued_zero_hit)
                 )
                 return False
 
+            logger.warning(
+                "[HiCachePPReplay][revoke_apply] rid=%s source=local_revoke_queue zero_hit=%s",
+                queued_req_id,
+                queued_zero_hit,
+            )
             self._drain_single_revoke_req(queued_req_id, zero_hit=queued_zero_hit)
             return True
 
@@ -1488,10 +1520,20 @@ class HiRadixCache(RadixCache):
             if req_id not in self.ongoing_prefetch:
                 # The ordered PP replay may have already revoked/finalized this request
                 # on the local rank. Treat it as completed for the scheduler path.
+                logger.warning(
+                    "[HiCachePrefetchWaitResolved] rid=%s reason=pp_replay_removed_ongoing",
+                    req_id,
+                )
                 return True
             event = self._peek_pp_host_tree_event()
             if event is not None:
                 if event.kind != "PREFETCH_FINALIZE" or event.rid != req_id:
+                    logger.warning(
+                        "[HiCachePrefetchWaitBlocked] rid=%s reason=pending_pp_event event_kind=%s event_rid=%s",
+                        req_id,
+                        event.kind,
+                        event.rid,
+                    )
                     return False
 
         # todo: more policies for prefetch progress such as timeout
