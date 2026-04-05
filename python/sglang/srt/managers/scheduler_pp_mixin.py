@@ -254,6 +254,8 @@ class SchedulerPPMixin:
         for req in deferred_reqs:
             req.bootstrap_mb_id = None
             self._pp_prefill_clear_intermediate_head(req.rid)
+            if hasattr(self.tree_cache, "pp_locally_revoked_req_ids"):
+                self.tree_cache.pp_locally_revoked_req_ids.discard(req.rid)
         return [req.rid for req in deferred_reqs]
 
     def _pp_unpack_bootstrap_payload(
@@ -1256,6 +1258,11 @@ class SchedulerPPMixin:
                     return_failed_reqs=True,
                 )
             )
+            if hasattr(self.tree_cache, "pp_locally_revoked_req_ids"):
+                for req in good_reqs:
+                    self.tree_cache.pp_locally_revoked_req_ids.discard(req.rid)
+                for req in failed_reqs:
+                    self.tree_cache.pp_locally_revoked_req_ids.discard(req.rid)
             self.waiting_queue.extend(good_reqs)
             if self._pp_prefill_diag_enabled() and (
                 good_consensus_bootstrapped_rids
@@ -1371,16 +1378,17 @@ class SchedulerPPMixin:
                 and not curr_bad_bootstrapped_rids
             ):
                 head_candidate = local_candidate_reqs[0]
+                locally_revoked = (
+                    hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
+                    and head_candidate.rid in self.tree_cache.pp_locally_revoked_req_ids
+                )
                 if (
                     local_bootstrap_reqs
                     and local_bootstrap_reqs[0].rid == head_candidate.rid
                     and prev_good_bootstrapped_rids[0] == head_candidate.rid
                 ):
                     head_intermediate_rid = head_candidate.rid
-                    head_intermediate_count = self._pp_prefill_intermediate_head_count(
-                        head_intermediate_rid
-                    )
-                    if head_intermediate_count >= 32:
+                    if locally_revoked:
                         deferred_bootstrapped_rids = [head_intermediate_rid]
                         (
                             curr_good_bootstrapped_rids,
@@ -1389,6 +1397,19 @@ class SchedulerPPMixin:
                         ) = self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
                             local_candidate_reqs[1:], return_polls=True
                         )
+                    else:
+                        head_intermediate_count = self._pp_prefill_intermediate_head_count(
+                            head_intermediate_rid
+                        )
+                        if head_intermediate_count >= 32:
+                            deferred_bootstrapped_rids = [head_intermediate_rid]
+                            (
+                                curr_good_bootstrapped_rids,
+                                curr_bad_bootstrapped_rids,
+                                candidate_polls,
+                            ) = self.disagg_prefill_bootstrap_queue.get_bootstrapped_rids(
+                                local_candidate_reqs[1:], return_polls=True
+                            )
                 else:
                     self._pp_prefill_clear_intermediate_head(
                         local_bootstrap_reqs[0].rid if local_bootstrap_reqs else None
