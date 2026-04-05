@@ -980,18 +980,58 @@ class HiRadixCache(RadixCache):
             )
 
     def _try_replay_write_backup_event(self, event: PPHostTreeEvent) -> bool:
-        if not self.cache_controller.ack_write_queue:
+        if self.cache_controller.ack_write_queue:
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue[0]
+            if finish_event.query():
+                nodes = [self.ongoing_write_through.get(ack_id) for ack_id in ack_list]
+                if (
+                    not any(node is None for node in nodes)
+                    and self._write_commit_event_matches(event, ack_list, nodes)
+                ):
+                    self.cache_controller.ack_write_queue.pop(0)
+                    self._consume_write_ack_group(
+                        finish_event, ack_list, emit_event=True
+                    )
+                    logger.warning(
+                        "[HiCachePPEvent][replay_apply_write_backup] pp=%s cp=%s seq=%s source=local_ack rid=%s nodes=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        event.seq,
+                        event.rid,
+                        len(ack_list),
+                    )
+                    return True
+
+        if not event.node_ids:
             return False
-        _, finish_event, ack_list = self.cache_controller.ack_write_queue[0]
-        if not finish_event.query():
-            return False
-        nodes = [self.ongoing_write_through.get(ack_id) for ack_id in ack_list]
+
+        nodes = [self.ongoing_write_through.get(node_id) for node_id in event.node_ids]
         if any(node is None for node in nodes):
             return False
-        if not self._write_commit_event_matches(event, ack_list, nodes):
+        if not self._write_commit_event_matches(event, event.node_ids, nodes):
             return False
-        self.cache_controller.ack_write_queue.pop(0)
-        self._consume_write_ack_group(finish_event, ack_list, emit_event=True)
+
+        removed_ack_idx = None
+        for idx, (_, _, ack_list) in enumerate(self.cache_controller.ack_write_queue):
+            if ack_list == event.node_ids:
+                removed_ack_idx = idx
+                break
+        if removed_ack_idx is not None:
+            self.cache_controller.ack_write_queue.pop(removed_ack_idx)
+
+        for node_id in event.node_ids:
+            backuped_node = self.ongoing_write_through.pop(node_id)
+            self.dec_lock_ref(backuped_node)
+
+        logger.warning(
+            "[HiCachePPEvent][replay_apply_write_backup] pp=%s cp=%s seq=%s source=authoritative_event rid=%s nodes=%s removed_ack=%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            event.seq,
+            event.rid,
+            len(event.node_ids),
+            removed_ack_idx is not None,
+        )
         return True
 
     def _finalize_prefetch_progress(
