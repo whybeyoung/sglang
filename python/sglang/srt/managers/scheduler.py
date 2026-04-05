@@ -2456,6 +2456,29 @@ class Scheduler(
                 getattr(self.chunked_req, "rid", None),
                 [req.rid for req in self.running_batch.reqs[:8]],
             )
+
+        # On follow ranks, a local zero-hit revoke can temporarily make PP1 think
+        # later waiting requests are runnable before PP0 reaches the same
+        # frontier. Keep batch-pick blocked at the waiting frontier until these
+        # local revokes are consumed by the shared PP bootstrap flow.
+        if (
+            self.enable_hicache_storage
+            and hasattr(self, "pp_group")
+            and not self.pp_group.is_first_rank
+            and hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
+            and self.tree_cache.pp_locally_revoked_req_ids
+        ):
+            if frontier_diag:
+                logger.warning(
+                    "[PPFrontierDiag][locally_revoked_barrier] pp=%s cp=%s tp=%s revoked=%s waiting=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    sorted(list(self.tree_cache.pp_locally_revoked_req_ids))[:8],
+                    [req.rid for req in self.waiting_queue[:8]],
+                )
+            return None
+
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
@@ -2472,27 +2495,6 @@ class Scheduler(
                         new_lora_set
                     ):
                         continue
-
-            # On follow ranks, locally revoked zero-hit prefetches must settle in-order
-            # before later waiting requests can be launched, otherwise PP0/PP1 can pick
-            # different batch frontiers.
-            if (
-                self.enable_hicache_storage
-                and hasattr(self, "pp_group")
-                and not self.pp_group.is_first_rank
-                and hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
-                and req.rid in self.tree_cache.pp_locally_revoked_req_ids
-            ):
-                if frontier_diag:
-                    logger.warning(
-                        "[PPFrontierDiag][locally_revoked_waiting] pp=%s cp=%s tp=%s rid=%s waiting=%s",
-                        self.pp_rank,
-                        self.attn_cp_rank,
-                        self.attn_tp_rank,
-                        req.rid,
-                        [x.rid for x in self.waiting_queue[:8]],
-                    )
-                break
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
