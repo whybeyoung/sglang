@@ -783,6 +783,10 @@ class HiRadixCache(RadixCache):
             return None
         return self.pp_pending_host_tree_events[0]
 
+    def has_pending_pp_write_backup_event(self) -> bool:
+        event = self._peek_pp_host_tree_event()
+        return event is not None and event.kind == "WRITE_BACKUP_COMMITTED"
+
     def _pop_pp_host_tree_event(self) -> Optional[PPHostTreeEvent]:
         if not self.pp_pending_host_tree_events:
             return None
