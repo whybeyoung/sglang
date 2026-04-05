@@ -1122,6 +1122,7 @@ class HiRadixCache(RadixCache):
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+            req_id=req_id,
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
@@ -1148,6 +1149,36 @@ class HiRadixCache(RadixCache):
                 loaded_from_storage,
                 self.pp_rank,
                 self.attn_cp_rank,
+            )
+        if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "1") == "1":
+            anchor_hash = (
+                last_host_node.get_last_hash_value() if last_host_node is not None else None
+            )
+            first_suffix_token = (
+                fetched_token_ids[matched_length]
+                if matched_length < len(fetched_token_ids)
+                else None
+            )
+            first_suffix_hash = (
+                hash_value[matched_length // self.page_size]
+                if matched_length // self.page_size < len(hash_value)
+                else None
+            )
+            logger.warning(
+                "[HiCacheFinalizeInsert] rid=%s pp=%s cp=%s anchor_node=%s anchor_hash=%s "
+                "token_len=%s completed=%s matched=%s loaded=%s first_suffix_token=%s "
+                "first_suffix_hash=%s",
+                req_id,
+                self.pp_rank,
+                self.attn_cp_rank,
+                last_host_node.id if last_host_node is not None else None,
+                anchor_hash,
+                len(token_ids),
+                min_completed_tokens,
+                matched_length,
+                loaded_from_storage,
+                first_suffix_token,
+                first_suffix_hash,
             )
 
         if emit_event:
@@ -2185,7 +2216,7 @@ class HiRadixCache(RadixCache):
         )
 
     def _insert_helper_host(
-        self, node: TreeNode, key: RadixKey, host_value, hash_value
+        self, node: TreeNode, key: RadixKey, host_value, hash_value, req_id: str | None = None
     ):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
@@ -2223,8 +2254,10 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(node)
             if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "1") == "1":
                 logger.warning(
-                    "[HiCacheHostInsert] pp=%s cp=%s parent=%s node=%s key_len=%s host_len=%s "
-                    "hash_pages=%s extra_key=%s child_key=%s",
+                    "[HiCacheHostInsert] rid=%s pp=%s cp=%s parent=%s node=%s key_len=%s "
+                    "host_len=%s hash_pages=%s extra_key=%s child_key=%s first_token=%s "
+                    "first_hash=%s",
+                    req_id,
                     self.pp_rank,
                     self.attn_cp_rank,
                     node.id if node is not None else None,
@@ -2234,6 +2267,12 @@ class HiRadixCache(RadixCache):
                     len(new_node.hash_value) if new_node.hash_value is not None else 0,
                     new_node.key.extra_key if new_node.key is not None else None,
                     child_key,
+                    new_node.key.token_ids[0]
+                    if new_node.key is not None and len(new_node.key.token_ids) > 0
+                    else None,
+                    new_node.hash_value[0]
+                    if new_node.hash_value is not None and len(new_node.hash_value) > 0
+                    else None,
                 )
 
         return matched_length
