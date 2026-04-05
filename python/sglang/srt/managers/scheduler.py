@@ -2457,29 +2457,57 @@ class Scheduler(
                 [req.rid for req in self.running_batch.reqs[:8]],
             )
 
-        # On follow ranks, a local zero-hit revoke can temporarily make PP1 think
-        # later waiting requests are runnable before PP0 reaches the same
-        # frontier. Keep batch-pick blocked at the waiting frontier until these
-        # local revokes are consumed by the shared PP bootstrap flow.
+        follow_rank_revoked_rids = set()
         if (
             self.enable_hicache_storage
             and hasattr(self, "pp_group")
             and not self.pp_group.is_first_rank
             and hasattr(self.tree_cache, "pp_locally_revoked_req_ids")
-            and self.tree_cache.pp_locally_revoked_req_ids
         ):
-            if frontier_diag:
-                logger.warning(
-                    "[PPFrontierDiag][locally_revoked_barrier] pp=%s cp=%s tp=%s revoked=%s waiting=%s",
-                    self.pp_rank,
-                    self.attn_cp_rank,
-                    self.attn_tp_rank,
-                    sorted(list(self.tree_cache.pp_locally_revoked_req_ids))[:8],
-                    [req.rid for req in self.waiting_queue[:8]],
-                )
-            return None
+            follow_rank_revoked_rids = set(self.tree_cache.pp_locally_revoked_req_ids)
+            bootstrap_head = []
+            if hasattr(self, "disagg_prefill_bootstrap_queue"):
+                bootstrap_head = [
+                    req.rid for req in self.disagg_prefill_bootstrap_queue.queue[:4]
+                ]
+            if (
+                follow_rank_revoked_rids
+                and bootstrap_head
+                and bootstrap_head[0] in follow_rank_revoked_rids
+            ):
+                if frontier_diag:
+                    logger.warning(
+                        "[PPFrontierDiag][locally_revoked_barrier] pp=%s cp=%s tp=%s revoked=%s waiting=%s bootstrap=%s reason=bootstrap_head",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        self.attn_tp_rank,
+                        sorted(list(follow_rank_revoked_rids))[:8],
+                        [req.rid for req in self.waiting_queue[:8]],
+                        bootstrap_head,
+                    )
+                return None
 
         for req in self.waiting_queue:
+            if follow_rank_revoked_rids and req.rid in follow_rank_revoked_rids:
+                if frontier_diag:
+                    logger.warning(
+                        "[PPFrontierDiag][locally_revoked_barrier] pp=%s cp=%s tp=%s revoked=%s waiting=%s bootstrap=%s reason=waiting_head rid=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        self.attn_tp_rank,
+                        sorted(list(follow_rank_revoked_rids))[:8],
+                        [x.rid for x in self.waiting_queue[:8]],
+                        [
+                            x.rid
+                            for x in getattr(
+                                getattr(self, "disagg_prefill_bootstrap_queue", None),
+                                "queue",
+                                [],
+                            )[:4]
+                        ],
+                        req.rid,
+                    )
+                break
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
