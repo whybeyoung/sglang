@@ -239,22 +239,22 @@ class SchedulerPPMixin:
         if not deferred_rids:
             return []
         queue = self.disagg_prefill_bootstrap_queue.queue
-        deferred_prefix = []
+        deferred_index = {rid: idx for idx, rid in enumerate(deferred_rids)}
+        deferred_reqs = []
+        remaining_reqs = []
         for req in queue:
-            if len(deferred_prefix) >= len(deferred_rids):
-                break
-            if req.rid != deferred_rids[len(deferred_prefix)]:
-                break
-            deferred_prefix.append(req)
-        if not deferred_prefix:
+            if req.rid in deferred_index:
+                deferred_reqs.append(req)
+            else:
+                remaining_reqs.append(req)
+        if not deferred_reqs:
             return []
-        self.disagg_prefill_bootstrap_queue.queue = (
-            queue[len(deferred_prefix) :] + deferred_prefix
-        )
-        for req in deferred_prefix:
+        deferred_reqs.sort(key=lambda req: deferred_index[req.rid])
+        self.disagg_prefill_bootstrap_queue.queue = remaining_reqs + deferred_reqs
+        for req in deferred_reqs:
             req.bootstrap_mb_id = None
             self._pp_prefill_clear_intermediate_head(req.rid)
-        return [req.rid for req in deferred_prefix]
+        return [req.rid for req in deferred_reqs]
 
     def _pp_unpack_bootstrap_payload(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
