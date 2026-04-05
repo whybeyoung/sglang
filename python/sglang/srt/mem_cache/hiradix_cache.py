@@ -730,6 +730,8 @@ class HiRadixCache(RadixCache):
         return self.pp_pending_host_tree_events.popleft()
 
     def _drain_single_revoke_req(self, req_id: str, zero_hit: bool = False) -> None:
+        had_ongoing = req_id in self.ongoing_prefetch
+        loaded_tokens_before = self.prefetch_loaded_tokens_by_reqid.get(req_id, 0)
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is not None:
             last_host_node, token_ids, _, _ = info
@@ -740,6 +742,16 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         if zero_hit:
             self.zero_hit_prefetch_req_ids.add(req_id)
+        logger.warning(
+            "[HiCachePrefetchCleanup] rid=%s zero_hit=%s had_ongoing=%s ongoing_after=%s loaded_tokens_before=%s loaded_tokens_after=%s zero_hit_marked=%s",
+            req_id,
+            zero_hit,
+            had_ongoing,
+            req_id in self.ongoing_prefetch,
+            loaded_tokens_before,
+            self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
+            req_id in self.zero_hit_prefetch_req_ids,
+        )
 
     def _try_replay_revoke_event(self, event: PPHostTreeEvent) -> bool:
         req_id = event.rid
@@ -1560,10 +1572,20 @@ class HiRadixCache(RadixCache):
             return True
 
         if not self.can_terminate_prefetch(operation):
+            debug_state = self._get_prefetch_progress_debug(req_id)
+            logger.warning(
+                "[HiCacheEmptyPrefetchState] rid=%s zero_hit_marked=%s replay_pending=%s state=%s",
+                req_id,
+                req_id in self.zero_hit_prefetch_req_ids,
+                self._peek_pp_host_tree_event() is not None
+                if self._pp_downstream_sync_enabled()
+                else False,
+                debug_state,
+            )
             logger.warning(
                 "[HiCachePrefetchWait] rid=%s state=%s",
                 req_id,
-                self._get_prefetch_progress_debug(req_id),
+                debug_state,
             )
             return False
         self._finalize_prefetch_progress(req_id, operation, emit_event=True)
