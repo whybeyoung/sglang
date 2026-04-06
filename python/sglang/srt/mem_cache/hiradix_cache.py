@@ -817,6 +817,11 @@ class HiRadixCache(RadixCache):
         if req_id not in self.pp_retry_prefetch_req_ids:
             return False
         self.pp_retry_prefetch_req_ids.discard(req_id)
+        # Upstream finalize already decided this request should retry prefetch.
+        # Do not keep an older local zero-hit revoke residue blocking waiting-head
+        # scheduling for the same req.
+        self.discard_pp_locally_revoked_req(req_id)
+        self.zero_hit_prefetch_req_ids.discard(req_id)
         return True
 
     def _pop_pp_host_tree_event(self) -> Optional[PPHostTreeEvent]:
@@ -863,6 +868,10 @@ class HiRadixCache(RadixCache):
     def peek_pp_locally_revoked_req(self) -> Optional[str]:
         while self.pp_locally_revoked_req_queue:
             rid = self.pp_locally_revoked_req_queue[0]
+            if rid in self.pp_retry_prefetch_req_ids:
+                self.pp_locally_revoked_req_ids.discard(rid)
+                self.pp_locally_revoked_req_queue.popleft()
+                continue
             if rid in self.pp_locally_revoked_req_ids:
                 return rid
             self.pp_locally_revoked_req_queue.popleft()
@@ -1274,6 +1283,7 @@ class HiRadixCache(RadixCache):
         if req_id not in self.ongoing_prefetch:
             if event.loaded_from_storage > 0:
                 self.zero_hit_prefetch_req_ids.discard(req_id)
+                self.discard_pp_locally_revoked_req(req_id)
                 self.pp_retry_prefetch_req_ids.add(req_id)
                 logger.warning(
                     "[HiCachePPEvent][replay_mark_retry_prefetch] pp=%s cp=%s seq=%s rid=%s loaded=%s",
