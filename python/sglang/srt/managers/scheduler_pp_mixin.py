@@ -1359,13 +1359,9 @@ class SchedulerPPMixin:
                 )
             )
             if hasattr(self.tree_cache, "discard_pp_locally_revoked_req"):
-                for req in good_reqs:
-                    self.tree_cache.discard_pp_locally_revoked_req(req.rid)
                 for req in failed_reqs:
                     self.tree_cache.discard_pp_locally_revoked_req(req.rid)
             elif hasattr(self.tree_cache, "pp_locally_revoked_req_ids"):
-                for req in good_reqs:
-                    self.tree_cache.pp_locally_revoked_req_ids.discard(req.rid)
                 for req in failed_reqs:
                     self.tree_cache.pp_locally_revoked_req_ids.discard(req.rid)
             self.waiting_queue.extend(good_reqs)
