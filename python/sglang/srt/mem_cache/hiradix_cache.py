@@ -205,6 +205,7 @@ class HiRadixCache(RadixCache):
         self.pp_locally_revoked_req_ids: set[str] = set()
         self.pp_locally_revoked_req_queue: Deque[str] = deque()
         self.pp_retry_prefetch_req_ids: set[str] = set()
+        self.pp_authoritative_revoked_req_ids: set[str] = set()
         self.pp_soft_skipped_req_ids: set[str] = set()
         self.pp_staged_prefetch_skip_req_ids: set[str] = set()
         self._in_pp_host_tree_replay = False
@@ -697,6 +698,7 @@ class HiRadixCache(RadixCache):
         self.pp_locally_revoked_req_ids.clear()
         self.pp_locally_revoked_req_queue.clear()
         self.pp_retry_prefetch_req_ids.clear()
+        self.pp_authoritative_revoked_req_ids.clear()
         self.pp_soft_skipped_req_ids.clear()
         super().reset()
 
@@ -889,6 +891,9 @@ class HiRadixCache(RadixCache):
         mark_local_revoke: bool = True,
     ) -> None:
         self.clear_follow_rank_prefetch_issue_pending(req_id)
+        if req_id in self.pp_authoritative_revoked_req_ids:
+            mark_local_revoke = False
+            self.pp_authoritative_revoked_req_ids.discard(req_id)
         if req_id in self.pp_soft_skipped_req_ids:
             mark_local_revoke = False
             self.pp_soft_skipped_req_ids.discard(req_id)
@@ -942,6 +947,7 @@ class HiRadixCache(RadixCache):
 
     def discard_pp_locally_revoked_req(self, req_id: str) -> None:
         self.pp_locally_revoked_req_ids.discard(req_id)
+        self.pp_authoritative_revoked_req_ids.discard(req_id)
         self.pp_soft_skipped_req_ids.discard(req_id)
         while self.pp_locally_revoked_req_queue:
             rid = self.pp_locally_revoked_req_queue[0]
@@ -991,6 +997,7 @@ class HiRadixCache(RadixCache):
             )
             self._drain_single_revoke_req(req_id, zero_hit=True)
             self.discard_pp_locally_revoked_req(req_id)
+            self.pp_authoritative_revoked_req_ids.add(req_id)
             return True
 
         if self.pp_deferred_revoke_req_ids:
@@ -1046,6 +1053,7 @@ class HiRadixCache(RadixCache):
                     )
                     self.discard_pp_locally_revoked_req(req_id)
                     self.zero_hit_prefetch_req_ids.add(req_id)
+                    self.pp_authoritative_revoked_req_ids.add(req_id)
                     return True
                 logger.warning(
                     "[HiCachePPReplay][revoke_wait] rid=%s reason=no_local_revoke_queue ongoing=%s scanned_unrelated=%s",
@@ -2151,6 +2159,7 @@ class HiRadixCache(RadixCache):
         This should be called after check_prefetch_progress() returns True.
         """
         self.zero_hit_prefetch_req_ids.discard(req_id)
+        self.pp_authoritative_revoked_req_ids.discard(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
@@ -2275,6 +2284,7 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
+        self.pp_authoritative_revoked_req_ids.discard(req_id)
         if req_id in self.zero_hit_prefetch_req_ids:
             # This request already proved to have no storage benefit on this pass.
             # Skip re-entering the expensive prefetch -> revoke lifecycle and
