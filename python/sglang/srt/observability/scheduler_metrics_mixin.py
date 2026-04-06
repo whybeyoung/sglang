@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+DEBUG_HICACHE_STATE_GROWTH = get_bool_env_var("SGLANG_DEBUG_HICACHE_STATE_GROWTH")
+DEBUG_HICACHE_STATE_GROWTH_INTERVAL_SEC = 10.0
 
 
 @dataclasses.dataclass
@@ -748,6 +750,7 @@ class SchedulerMetricsMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self._maybe_log_hicache_state_growth()
         if not self.enable_metrics:
             return
         if not isinstance(result, GenerationBatchResult):
@@ -758,6 +761,61 @@ class SchedulerMetricsMixin:
                 forward_mode=batch.forward_mode.name.lower(),
                 balancedness=m.eplb_balancedness.item(),
             )
+
+    def _maybe_log_hicache_state_growth(self: Scheduler):
+        if not DEBUG_HICACHE_STATE_GROWTH or not self.enable_hierarchical_cache:
+            return
+
+        now = time.monotonic()
+        last = getattr(self, "_last_hicache_state_growth_log_ts", 0.0)
+        if now - last < DEBUG_HICACHE_STATE_GROWTH_INTERVAL_SEC:
+            return
+        self._last_hicache_state_growth_log_ts = now
+
+        tc = self.tree_cache
+        cc = getattr(tc, "cache_controller", None)
+
+        def _safe_len(name: str) -> int:
+            value = getattr(tc, name, None)
+            if value is None:
+                return 0
+            try:
+                return len(value)
+            except TypeError:
+                return 0
+
+        logger.warning(
+            "[HiCacheStateGrowth] pp=%s cp=%s tp=%s waiting=%s bootstrap=%s inflight=%s "
+            "ongoing_prefetch=%s loaded=%s zero_hit=%s retry=%s auth_revoke=%s "
+            "soft_skip=%s staged_skip=%s deferred_revoke=%s local_revoke=%s "
+            "local_revoke_q=%s pending_events=%s outgoing_events=%s finalize_ticket=%s "
+            "finalize_barrier=%s prefetch_tokens_occupied=%s revoke_q=%s ack_backup_q=%s "
+            "host_release_q=%s",
+            getattr(self, "pp_rank", None),
+            getattr(self, "attn_cp_rank", None),
+            getattr(self, "attn_tp_rank", None),
+            len(getattr(self, "waiting_queue", [])),
+            len(getattr(getattr(self, "disagg_prefill_bootstrap_queue", None), "queue", [])),
+            len(getattr(self, "disagg_prefill_inflight_queue", [])),
+            _safe_len("ongoing_prefetch"),
+            _safe_len("prefetch_loaded_tokens_by_reqid"),
+            _safe_len("zero_hit_prefetch_req_ids"),
+            _safe_len("pp_retry_prefetch_req_ids"),
+            _safe_len("pp_authoritative_revoked_req_ids"),
+            _safe_len("pp_soft_skipped_req_ids"),
+            _safe_len("pp_staged_prefetch_skip_req_ids"),
+            _safe_len("pp_deferred_revoke_req_ids"),
+            _safe_len("pp_locally_revoked_req_ids"),
+            _safe_len("pp_locally_revoked_req_queue"),
+            _safe_len("pp_pending_host_tree_events"),
+            _safe_len("pp_outgoing_host_tree_events"),
+            _safe_len("pp_finalize_ticket_req_ids"),
+            getattr(tc, "pp_finalize_ticket_barrier_rid", None),
+            getattr(cc, "prefetch_tokens_occupied", 0) if cc is not None else 0,
+            cc.prefetch_revoke_queue.qsize() if cc is not None else 0,
+            cc.ack_backup_queue.qsize() if cc is not None else 0,
+            cc.host_mem_release_queue.qsize() if cc is not None else 0,
+        )
 
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:
