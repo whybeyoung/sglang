@@ -1182,7 +1182,7 @@ class HiRadixCache(RadixCache):
                 self.pp_rank,
                 self.attn_cp_rank,
             )
-        if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "1") == "1":
+        if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1":
             anchor_hash = (
                 last_host_node.get_last_hash_value() if last_host_node is not None else None
             )
@@ -2070,7 +2070,7 @@ class HiRadixCache(RadixCache):
             last_host_node = last_host_node.parent
 
         if (
-            os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "1") == "1"
+            os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1"
             and params.req is not None
         ):
             host_path = []
@@ -2326,7 +2326,7 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
-            if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "1") == "1":
+            if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1":
                 logger.warning(
                     "[HiCacheHostInsert] rid=%s pp=%s cp=%s parent=%s node=%s key_len=%s "
                     "host_len=%s hash_pages=%s extra_key=%s child_key=%s first_token=%s "
@@ -2403,7 +2403,7 @@ class HiRadixCache(RadixCache):
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
-        if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "1") == "1":
+        if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1":
             logger.warning(
                 "[HiCacheNodeSplit] pp=%s cp=%s parent=%s new_node=%s child=%s split_len=%s "
                 "new_key_len=%s child_key_len=%s new_has_host=%s child_has_host=%s "
