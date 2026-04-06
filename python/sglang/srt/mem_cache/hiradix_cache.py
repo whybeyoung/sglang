@@ -953,6 +953,53 @@ class HiRadixCache(RadixCache):
                 break
             self.pp_locally_revoked_req_queue.popleft()
 
+    def _purge_matching_local_revoke_residue(self, req_id: str) -> tuple[int, int]:
+        purged_deferred = 0
+        if self.pp_deferred_revoke_req_ids:
+            kept_items = deque()
+            for deferred_req_id, deferred_zero_hit in self.pp_deferred_revoke_req_ids:
+                if deferred_req_id == req_id:
+                    purged_deferred += 1
+                    continue
+                kept_items.append((deferred_req_id, deferred_zero_hit))
+            self.pp_deferred_revoke_req_ids = kept_items
+
+        purged_queue = 0
+        revoke_queue = self.cache_controller.prefetch_revoke_queue
+        if hasattr(revoke_queue, "mutex") and hasattr(revoke_queue, "queue"):
+            with revoke_queue.mutex:
+                kept_items = deque()
+                while revoke_queue.queue:
+                    item = revoke_queue.queue.popleft()
+                    queued_req_id, queued_zero_hit = (
+                        item if isinstance(item, tuple) else (item, False)
+                    )
+                    if queued_req_id == req_id:
+                        purged_queue += 1
+                        continue
+                    kept_items.append(
+                        (queued_req_id, queued_zero_hit)
+                        if isinstance(item, tuple)
+                        else queued_req_id
+                    )
+                revoke_queue.queue.extend(kept_items)
+                if purged_queue > 0 and hasattr(revoke_queue, "unfinished_tasks"):
+                    revoke_queue.unfinished_tasks = max(
+                        0, revoke_queue.unfinished_tasks - purged_queue
+                    )
+                if purged_queue > 0 and hasattr(revoke_queue, "not_full"):
+                    revoke_queue.not_full.notify_all()
+
+        if purged_deferred or purged_queue:
+            logger.warning(
+                "[HiCachePPReplay][revoke_purge_local_residue] rid=%s purged_deferred=%s purged_queue=%s",
+                req_id,
+                purged_deferred,
+                purged_queue,
+            )
+
+        return purged_deferred, purged_queue
+
     def _try_replay_prefetch_skip_event(self, event: PPHostTreeEvent) -> bool:
         req_id = event.rid
         if req_id is None:
@@ -994,6 +1041,7 @@ class HiRadixCache(RadixCache):
                 self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
             )
             self.pp_authoritative_revoked_req_ids.add(req_id)
+            self._purge_matching_local_revoke_residue(req_id)
             self._drain_single_revoke_req(
                 req_id,
                 zero_hit=True,
@@ -1053,6 +1101,7 @@ class HiRadixCache(RadixCache):
                         req_id,
                         [rid for rid, _ in scanned_unrelated[:4]],
                     )
+                    self._purge_matching_local_revoke_residue(req_id)
                     self.discard_pp_locally_revoked_req(req_id)
                     self.zero_hit_prefetch_req_ids.add(req_id)
                     self.pp_authoritative_revoked_req_ids.add(req_id)
@@ -2161,7 +2210,6 @@ class HiRadixCache(RadixCache):
         This should be called after check_prefetch_progress() returns True.
         """
         self.zero_hit_prefetch_req_ids.discard(req_id)
-        self.pp_authoritative_revoked_req_ids.discard(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
