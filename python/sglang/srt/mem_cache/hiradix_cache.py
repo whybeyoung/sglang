@@ -206,6 +206,8 @@ class HiRadixCache(RadixCache):
         self.pp_locally_revoked_req_queue: Deque[str] = deque()
         self.pp_retry_prefetch_req_ids: set[str] = set()
         self.pp_soft_skipped_req_ids: set[str] = set()
+        self.pp_staged_prefetch_skip_req_ids: set[str] = set()
+        self.pp_prefetch_skip_defer_once_req_ids: set[str] = set()
         self._in_pp_host_tree_replay = False
 
         # Detach storage backend automatically on process shutdown
@@ -806,6 +808,83 @@ class HiRadixCache(RadixCache):
                 )
             )
 
+    def stage_pp_incoming_prefetch_skip_events(
+        self, events: List[dict[str, Any]]
+    ) -> None:
+        if not self._pp_downstream_sync_enabled() or not events:
+            return
+
+        staged_rids = []
+        for event in events:
+            if str(event.get("kind")) != "PREFETCH_SKIP":
+                continue
+            req_id = event.get("rid")
+            if req_id is None:
+                continue
+            req_id = str(req_id)
+            if req_id in self.pp_staged_prefetch_skip_req_ids:
+                continue
+            self.pp_staged_prefetch_skip_req_ids.add(req_id)
+            staged_rids.append(req_id)
+
+        if staged_rids:
+            logger.warning(
+                "[HiCachePPEvent][stage_prefetch_skip] pp=%s cp=%s count=%s rids=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                len(staged_rids),
+                staged_rids[:8],
+            )
+
+    def poll_follow_rank_prefetch_issue_action(
+        self,
+        req_id: str,
+        new_input_tokens: List[int],
+        prefix_len: int,
+        host_hit_length: int,
+    ) -> Optional[str]:
+        if not self._pp_downstream_sync_enabled():
+            return None
+
+        if req_id in self.pp_staged_prefetch_skip_req_ids:
+            self.pp_staged_prefetch_skip_req_ids.discard(req_id)
+            self.pp_prefetch_skip_defer_once_req_ids.discard(req_id)
+            return "skip"
+
+        aligned_tokens = (
+            convert_to_bigram_key(new_input_tokens)
+            if self.is_eagle
+            else new_input_tokens
+        )
+        prefetch_length = len(aligned_tokens) - (len(aligned_tokens) % self.page_size)
+        high_risk = (
+            prefetch_length >= self.prefetch_threshold
+            and host_hit_length == 0
+            and prefix_len <= 64
+        )
+        if not high_risk:
+            self.pp_prefetch_skip_defer_once_req_ids.discard(req_id)
+            return None
+
+        if req_id in self.pp_prefetch_skip_defer_once_req_ids:
+            self.pp_prefetch_skip_defer_once_req_ids.discard(req_id)
+            return None
+
+        self.pp_prefetch_skip_defer_once_req_ids.add(req_id)
+        return "defer"
+
+    def has_follow_rank_prefetch_issue_pending(self, req_id: str) -> bool:
+        if req_id in self.ongoing_prefetch:
+            return False
+        return (
+            req_id in self.pp_staged_prefetch_skip_req_ids
+            or req_id in self.pp_prefetch_skip_defer_once_req_ids
+        )
+
+    def clear_follow_rank_prefetch_issue_pending(self, req_id: str) -> None:
+        self.pp_staged_prefetch_skip_req_ids.discard(req_id)
+        self.pp_prefetch_skip_defer_once_req_ids.discard(req_id)
+
     def _peek_pp_host_tree_event(self) -> Optional[PPHostTreeEvent]:
         if not self.pp_pending_host_tree_events:
             return None
@@ -819,6 +898,7 @@ class HiRadixCache(RadixCache):
         if req_id not in self.pp_retry_prefetch_req_ids:
             return False
         self.pp_retry_prefetch_req_ids.discard(req_id)
+        self.clear_follow_rank_prefetch_issue_pending(req_id)
         # Upstream finalize already decided this request should retry prefetch.
         # Do not keep an older local zero-hit revoke residue blocking waiting-head
         # scheduling for the same req.
@@ -837,6 +917,7 @@ class HiRadixCache(RadixCache):
         zero_hit: bool = False,
         mark_local_revoke: bool = True,
     ) -> None:
+        self.clear_follow_rank_prefetch_issue_pending(req_id)
         if req_id in self.pp_soft_skipped_req_ids:
             mark_local_revoke = False
             self.pp_soft_skipped_req_ids.discard(req_id)
@@ -901,6 +982,7 @@ class HiRadixCache(RadixCache):
         req_id = event.rid
         if req_id is None:
             return False
+        self.clear_follow_rank_prefetch_issue_pending(req_id)
         self.pp_soft_skipped_req_ids.add(req_id)
         if req_id in self.ongoing_prefetch:
             logger.warning(

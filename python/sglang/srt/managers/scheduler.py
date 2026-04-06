@@ -1550,6 +1550,14 @@ class Scheduler(
 
         if self.pp_rank > 0:
             self.pp_hicache_host_tree_events = list(pp_hicache_host_tree_events or [])
+            if (
+                self.enable_hicache_storage
+                and self.tree_cache is not None
+                and hasattr(self.tree_cache, "stage_pp_incoming_prefetch_skip_events")
+            ):
+                self.tree_cache.stage_pp_incoming_prefetch_skip_events(
+                    self.pp_hicache_host_tree_events
+                )
         else:
             self.pp_hicache_host_tree_events = []
 
@@ -1962,6 +1970,38 @@ class Scheduler(
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
+
+                if (
+                    self.pp_group is not None
+                    and not self.pp_group.is_first_rank
+                    and hasattr(
+                        self.tree_cache, "poll_follow_rank_prefetch_issue_action"
+                    )
+                ):
+                    action = self.tree_cache.poll_follow_rank_prefetch_issue_action(
+                        req.rid,
+                        new_input_tokens,
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                    )
+                    if action == "skip":
+                        logger.warning(
+                            "[HiCachePrefetchDecision] rid=%s action=skip reason=pp_upstream_prefetch_skip_known tokens=%s prefix=%s host_hit=%s",
+                            req.rid,
+                            len(new_input_tokens),
+                            len(req.prefix_indices),
+                            req.host_hit_length,
+                        )
+                        return
+                    if action == "defer":
+                        logger.warning(
+                            "[HiCachePrefetchDecision] rid=%s action=defer reason=pp_wait_upstream_prefetch_skip tokens=%s prefix=%s host_hit=%s",
+                            req.rid,
+                            len(new_input_tokens),
+                            len(req.prefix_indices),
+                            req.host_hit_length,
+                        )
+                        return
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -2600,6 +2640,16 @@ class Scheduler(
                 and not self.pp_group.is_first_rank
                 and hasattr(self.tree_cache, "consume_pp_retry_prefetch_req")
                 and self.tree_cache.consume_pp_retry_prefetch_req(req.rid)
+            ):
+                self._prefetch_kvcache(req)
+            elif (
+                self.enable_hicache_storage
+                and self.pp_group is not None
+                and not self.pp_group.is_first_rank
+                and hasattr(
+                    self.tree_cache, "has_follow_rank_prefetch_issue_pending"
+                )
+                and self.tree_cache.has_follow_rank_prefetch_issue_pending(req.rid)
             ):
                 self._prefetch_kvcache(req)
 
