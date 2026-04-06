@@ -954,6 +954,20 @@ class HiRadixCache(RadixCache):
             except Empty:
                 for queued_req_id, queued_zero_hit in scanned_unrelated:
                     self.pp_deferred_revoke_req_ids.append((queued_req_id, queued_zero_hit))
+                # Upstream REVOKE is authoritative. If the downstream rank has
+                # already quiesced this request locally (no ongoing prefetch and
+                # no matching local revoke item to drain), treat the revoke as an
+                # idempotent no-op so it does not become a permanent PP queue
+                # head blocker.
+                if req_id not in self.ongoing_prefetch:
+                    logger.warning(
+                        "[HiCachePPReplay][revoke_apply] rid=%s source=noop_quiescent scanned_unrelated=%s",
+                        req_id,
+                        [rid for rid, _ in scanned_unrelated[:4]],
+                    )
+                    self.discard_pp_locally_revoked_req(req_id)
+                    self.zero_hit_prefetch_req_ids.add(req_id)
+                    return True
                 logger.warning(
                     "[HiCachePPReplay][revoke_wait] rid=%s reason=no_local_revoke_queue ongoing=%s scanned_unrelated=%s",
                     req_id,
