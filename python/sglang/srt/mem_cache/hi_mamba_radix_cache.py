@@ -1972,6 +1972,9 @@ class HiMambaRadixCache(MambaRadixCache):
         self.prefetch_abort(operation.pool_transfers)
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
+    def release_finished_request(self, rid: str):
+        self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+
     def _flush_pending_storage_backups_before_reset(self) -> None:
         if not self.enable_storage:
             return

@@ -1168,6 +1168,11 @@ class SchedulerOutputProcessorMixin:
                     dp_ranks=dp_ranks,
                 )
             )
+        if hasattr(self.tree_cache, "release_finished_request"):
+            for req in reqs:
+                if req is skip_req or not req.finished():
+                    continue
+                self.tree_cache.release_finished_request(req.rid)
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
@@ -1208,3 +1213,8 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts=retraction_counts,
             )
         )
+        if hasattr(self.tree_cache, "release_finished_request"):
+            for req in reqs:
+                if not req.finished():
+                    continue
+                self.tree_cache.release_finished_request(req.rid)

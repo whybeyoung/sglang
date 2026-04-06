@@ -953,6 +953,26 @@ class HiRadixCache(RadixCache):
                 break
             self.pp_locally_revoked_req_queue.popleft()
 
+    def _release_request_ephemeral_state(self, req_id: str) -> None:
+        """Clear per-request PP/HiCache bookkeeping after the request is done.
+
+        This must only run on terminal request paths (finished output or abort).
+        Some suppress markers intentionally survive intermediate scheduler steps
+        to avoid revoke re-hardening races, so they should not be cleared earlier.
+        """
+        self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+        self.zero_hit_prefetch_req_ids.discard(req_id)
+        self.pp_retry_prefetch_req_ids.discard(req_id)
+        self.pp_authoritative_revoked_req_ids.discard(req_id)
+        self.pp_soft_skipped_req_ids.discard(req_id)
+        self.pp_staged_prefetch_skip_req_ids.discard(req_id)
+        self.clear_follow_rank_prefetch_issue_pending(req_id)
+        self.discard_pp_locally_revoked_req(req_id)
+        self._purge_matching_local_revoke_residue(req_id)
+
+    def release_finished_request(self, rid: str) -> None:
+        self._release_request_ephemeral_state(rid)
+
     def _purge_matching_local_revoke_residue(self, req_id: str) -> tuple[int, int]:
         purged_deferred = 0
         if self.pp_deferred_revoke_req_ids:
@@ -2684,9 +2704,8 @@ class HiRadixCache(RadixCache):
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):
-        # Clean up storage hit tracking for aborted request
-        self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        self.zero_hit_prefetch_req_ids.discard(rid)
+        # Clean up per-request transient PP/HiCache state for aborted requests.
+        self._release_request_ephemeral_state(rid)
 
         if rid not in self.ongoing_prefetch:
             return
