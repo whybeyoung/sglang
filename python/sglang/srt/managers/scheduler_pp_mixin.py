@@ -136,6 +136,13 @@ class SchedulerPPMixin:
             return []
         return [self._pp_prefill_req_shape(req) for req in batch.reqs[:limit]]
 
+    def _pp_prefill_batch_rids(
+        self: Scheduler, batch: Optional[ScheduleBatch], limit: int = 16
+    ) -> List[str]:
+        if batch is None:
+            return []
+        return self._pp_prefill_diag_rids(batch.reqs[:limit])
+
     def _pp_prefill_queue_shape(
         self: Scheduler, queue, limit: int = 6
     ) -> List[Dict[str, object]]:
@@ -271,6 +278,61 @@ class SchedulerPPMixin:
         good_rids, bad_rids, shared_capacity = bootstrapped_rids
         return good_rids, bad_rids, [], shared_capacity
 
+    def _pp_pack_release_payload(
+        self: Scheduler,
+        release_rids: Optional[List[str]],
+        launch_ack_mb_id: Optional[int] = None,
+        launch_ack_rids: Optional[List[str]] = None,
+    ):
+        if launch_ack_mb_id is None and not launch_ack_rids:
+            return release_rids
+        return {
+            "release_rids": list(release_rids or []),
+            "launch_frontier_ack": {
+                "mb_id": launch_ack_mb_id,
+                "rids": list(launch_ack_rids or []),
+            },
+        }
+
+    def _pp_unpack_release_payload(
+        self: Scheduler, payload
+    ) -> Tuple[Optional[List[str]], Optional[int], List[str]]:
+        if payload is None:
+            return None, None, []
+        if isinstance(payload, dict):
+            release_rids = payload.get("release_rids")
+            ack_payload = payload.get("launch_frontier_ack") or {}
+            ack_mb_id = ack_payload.get("mb_id")
+            ack_rids = list(ack_payload.get("rids") or [])
+            return release_rids, ack_mb_id, ack_rids
+        return payload, None, []
+
+    def _pp_record_launch_frontier_ack(
+        self: Scheduler, ack_mb_id: Optional[int], ack_rids: List[str]
+    ) -> None:
+        if ack_mb_id is None:
+            return
+        self.pp_launch_frontier_ack_by_mb[ack_mb_id] = list(ack_rids)
+        if self._pp_prefill_diag_enabled():
+            logger.warning(
+                "[PPPrefillDiag][launch_frontier_ack_recv] pp=%s cp=%s tp=%s mb=%s ack=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                ack_mb_id,
+                ack_rids[:8],
+            )
+
+    def _pp_get_launch_frontier_ack(
+        self: Scheduler, mb_id: Optional[int]
+    ) -> Optional[List[str]]:
+        if mb_id is None:
+            return None
+        ack = self.pp_launch_frontier_ack_by_mb.get(mb_id)
+        if ack is None:
+            return None
+        return list(ack)
+
     def _pp_prefill_shape_snapshot_log(
         self: Scheduler,
         tag: str,
@@ -399,6 +461,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self.pp_current_prefill_mb_id = mb_id
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
@@ -607,6 +670,18 @@ class SchedulerPPMixin:
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
+                launch_frontier_ack_rids = []
+                if self.pp_group.is_last_rank:
+                    launch_frontier_ack_rids = self._pp_prefill_batch_rids(batch)
+                    if batch is not None and self._pp_prefill_diag_enabled():
+                        logger.warning(
+                            "[PPPrefillDiag][launch_frontier_ack_emit] pp=%s cp=%s tp=%s mb=%s ack=%s",
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            self.attn_tp_rank,
+                            mb_id,
+                            launch_frontier_ack_rids[:8],
+                        )
                 if batch or self.waiting_queue:
                     self._pp_prefill_diag_log(
                         "batch_pick",
@@ -673,7 +748,12 @@ class SchedulerPPMixin:
                 )
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                        tmbs,
+                        next_first_rank_mb_id,
+                        release_rids,
+                        transferred_rids,
+                        launch_ack_mb_id=mb_id if self.pp_group.is_last_rank else None,
+                        launch_ack_rids=launch_frontier_ack_rids,
                     )
                 )
 
@@ -771,12 +851,18 @@ class SchedulerPPMixin:
                     bmbs[next_mb_id] = None
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    if next_release_rids:
+                    next_release_payload = self._pp_recv_pyobj_from_prev_stage()
+                    next_release_rids, ack_mb_id, ack_rids = (
+                        self._pp_unpack_release_payload(next_release_payload)
+                    )
+                    self._pp_record_launch_frontier_ack(ack_mb_id, ack_rids)
+                    if next_release_rids or ack_rids:
                         self._pp_prefill_diag_log(
                             "release_recv",
                             mb=next_mb_id,
                             release=self._pp_prefill_diag_rids(next_release_rids),
+                            launch_ack_mb=ack_mb_id,
+                            launch_ack=ack_rids[:8],
                         )
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
@@ -1058,6 +1144,8 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        self.pp_launch_frontier_ack_by_mb: Dict[int, List[str]] = {}
+        self.pp_current_prefill_mb_id: Optional[int] = None
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1697,11 +1785,17 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         release_rids: List[str],
         transferred_rids: List[str],
+        launch_ack_mb_id: Optional[int] = None,
+        launch_ack_rids: Optional[List[str]] = None,
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
             if tmbs[next_first_rank_mb_id] is not None:
-                release_rids = transferred_rids
+                release_rids = self._pp_pack_release_payload(
+                    transferred_rids,
+                    launch_ack_mb_id=launch_ack_mb_id,
+                    launch_ack_rids=launch_ack_rids,
+                )
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
