@@ -747,6 +747,11 @@ class HiRadixCache(RadixCache):
     def _append_pp_host_tree_event(self, event: PPHostTreeEvent) -> None:
         if not (self.enable_storage and self.pp_size > 1):
             return
+        # The last PP rank has no downstream peer to consume these events.
+        # Keeping them would only create an append-only Python list that grows
+        # for the lifetime of the process.
+        if self.pp_rank >= self.pp_size - 1:
+            return
         logger.warning(
             "[HiCachePPEvent][emit] pp=%s cp=%s seq=%s kind=%s rid=%s loaded=%s outgoing_before=%s",
             self.pp_rank,
