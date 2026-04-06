@@ -2051,6 +2051,9 @@ class HiRadixCache(RadixCache):
                 self.cache_controller.storage_backend.get_stats()
             )
 
+    def sync_hicache_attn_groups(self) -> None:
+        self._barrier_attn_groups()
+
     def drain_storage_control_queues(self):
         """
         Combine prefetch revoke, backup ack, and host mem release checks

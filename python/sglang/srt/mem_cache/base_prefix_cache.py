@@ -253,6 +253,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def sync_hicache_attn_groups(self) -> None:
+        """Synchronize attention-parallel workers after HiCache event pumping.
+
+        Most caches do not need an extra sync here. HiCache storage-backed caches can
+        override this to prevent later PP control collectives from interleaving with
+        storage-control drains.
+        """
+        pass
+
     def take_events(self):
         return []
 

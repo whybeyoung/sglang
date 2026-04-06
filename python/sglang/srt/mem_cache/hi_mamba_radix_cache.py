@@ -511,6 +511,10 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.cache_controller.storage_backend.get_stats()
             )
 
+    def sync_hicache_attn_groups(self) -> None:
+        if self.tp_world_size > 1:
+            torch.distributed.barrier(group=self.tp_group)
+
     def _protect_host_node(self, node: TreeNode, protect_mamba: bool = True):
         node.protect_host()
         self.evictable_full_host_leaves.discard(node)
