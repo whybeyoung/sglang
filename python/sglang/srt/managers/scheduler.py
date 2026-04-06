@@ -1993,15 +1993,6 @@ class Scheduler(
                             req.host_hit_length,
                         )
                         return
-                    if action == "defer":
-                        logger.warning(
-                            "[HiCachePrefetchDecision] rid=%s action=defer reason=pp_wait_upstream_prefetch_skip tokens=%s prefix=%s host_hit=%s",
-                            req.rid,
-                            len(new_input_tokens),
-                            len(req.prefix_indices),
-                            req.host_hit_length,
-                        )
-                        return
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)

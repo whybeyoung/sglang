@@ -207,7 +207,6 @@ class HiRadixCache(RadixCache):
         self.pp_retry_prefetch_req_ids: set[str] = set()
         self.pp_soft_skipped_req_ids: set[str] = set()
         self.pp_staged_prefetch_skip_req_ids: set[str] = set()
-        self.pp_prefetch_skip_defer_once_req_ids: set[str] = set()
         self._in_pp_host_tree_replay = False
 
         # Detach storage backend automatically on process shutdown
@@ -848,42 +847,14 @@ class HiRadixCache(RadixCache):
 
         if req_id in self.pp_staged_prefetch_skip_req_ids:
             self.pp_staged_prefetch_skip_req_ids.discard(req_id)
-            self.pp_prefetch_skip_defer_once_req_ids.discard(req_id)
             return "skip"
-
-        aligned_tokens = (
-            convert_to_bigram_key(new_input_tokens)
-            if self.is_eagle
-            else new_input_tokens
-        )
-        prefetch_length = len(aligned_tokens) - (len(aligned_tokens) % self.page_size)
-        high_risk = (
-            prefetch_length >= self.prefetch_threshold
-            and host_hit_length == 0
-            and prefix_len <= 64
-        )
-        if not high_risk:
-            self.pp_prefetch_skip_defer_once_req_ids.discard(req_id)
-            return None
-
-        if req_id in self.pp_prefetch_skip_defer_once_req_ids:
-            self.pp_prefetch_skip_defer_once_req_ids.discard(req_id)
-            return None
-
-        self.pp_prefetch_skip_defer_once_req_ids.add(req_id)
-        return "defer"
+        return None
 
     def has_follow_rank_prefetch_issue_pending(self, req_id: str) -> bool:
-        if req_id in self.ongoing_prefetch:
-            return False
-        return (
-            req_id in self.pp_staged_prefetch_skip_req_ids
-            or req_id in self.pp_prefetch_skip_defer_once_req_ids
-        )
+        return False
 
     def clear_follow_rank_prefetch_issue_pending(self, req_id: str) -> None:
         self.pp_staged_prefetch_skip_req_ids.discard(req_id)
-        self.pp_prefetch_skip_defer_once_req_ids.discard(req_id)
 
     def _peek_pp_host_tree_event(self) -> Optional[PPHostTreeEvent]:
         if not self.pp_pending_host_tree_events:
