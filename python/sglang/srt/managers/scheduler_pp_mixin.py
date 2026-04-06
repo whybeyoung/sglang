@@ -284,7 +284,7 @@ class SchedulerPPMixin:
         launch_ack_mb_id: Optional[int] = None,
         launch_ack_rids: Optional[List[str]] = None,
     ):
-        if launch_ack_mb_id is None and not launch_ack_rids:
+        if launch_ack_mb_id is None or not launch_ack_rids:
             return release_rids
         return {
             "release_rids": list(release_rids or []),
@@ -310,7 +310,7 @@ class SchedulerPPMixin:
     def _pp_record_launch_frontier_ack(
         self: Scheduler, ack_mb_id: Optional[int], ack_rids: List[str]
     ) -> None:
-        if ack_mb_id is None:
+        if ack_mb_id is None or not ack_rids:
             return
         self.pp_launch_frontier_ack_by_mb[ack_mb_id] = list(ack_rids)
         if self._pp_prefill_diag_enabled():
@@ -323,12 +323,12 @@ class SchedulerPPMixin:
                 ack_rids[:8],
             )
 
-    def _pp_get_launch_frontier_ack(
+    def _pp_consume_launch_frontier_ack(
         self: Scheduler, mb_id: Optional[int]
     ) -> Optional[List[str]]:
         if mb_id is None:
             return None
-        ack = self.pp_launch_frontier_ack_by_mb.get(mb_id)
+        ack = self.pp_launch_frontier_ack_by_mb.pop(mb_id, None)
         if ack is None:
             return None
         return list(ack)

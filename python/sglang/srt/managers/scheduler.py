@@ -2442,9 +2442,9 @@ class Scheduler(
             self.pp_size > 1
             and self.pp_group is not None
             and self.pp_group.is_first_rank
-            and hasattr(self, "_pp_get_launch_frontier_ack")
+            and hasattr(self, "_pp_consume_launch_frontier_ack")
         ):
-            launch_ack_rids = self._pp_get_launch_frontier_ack(
+            launch_ack_rids = self._pp_consume_launch_frontier_ack(
                 getattr(self, "pp_current_prefill_mb_id", None)
             )
             if frontier_diag and launch_ack_rids is not None:
