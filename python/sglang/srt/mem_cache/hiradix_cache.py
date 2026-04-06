@@ -64,6 +64,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _HiCacheDebugFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if os.getenv("SGLANG_DEBUG_HICACHE_VERBOSE", "0") == "1":
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not (
+            message.startswith("[HiCache")
+            or message.startswith("[PPReqPhase]")
+            or message.startswith("[PPHiCacheSync]")
+        )
+
+
+if not any(isinstance(f, _HiCacheDebugFilter) for f in logger.filters):
+    logger.addFilter(_HiCacheDebugFilter())
+
+
 def _safe_attn_tp_rank(obj) -> int:
     return int(getattr(obj, "attn_tp_rank", 0))
 

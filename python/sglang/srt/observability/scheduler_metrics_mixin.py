@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -44,7 +45,9 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
-DEBUG_HICACHE_STATE_GROWTH = get_bool_env_var("SGLANG_DEBUG_HICACHE_STATE_GROWTH")
+DEBUG_HICACHE_STATE_GROWTH = (
+    os.getenv("SGLANG_DEBUG_HICACHE_STATE_GROWTH", "1") == "1"
+)
 DEBUG_HICACHE_STATE_GROWTH_INTERVAL_SEC = 10.0
 
 

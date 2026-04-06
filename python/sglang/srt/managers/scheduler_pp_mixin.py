@@ -34,6 +34,24 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 
 logger = logging.getLogger(__name__)
 
+
+class _PPPrefillDebugFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if os.getenv("SGLANG_DEBUG_HICACHE_VERBOSE", "0") == "1":
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not (
+            message.startswith("[PPReqPhase]")
+            or message.startswith("[PP Dynamic Chunk]")
+        )
+
+
+if not any(isinstance(f, _PPPrefillDebugFilter) for f in logger.filters):
+    logger.addFilter(_PPPrefillDebugFilter())
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 

@@ -238,6 +238,27 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+class _PPSchedulerDebugFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if os.getenv("SGLANG_DEBUG_HICACHE_VERBOSE", "0") == "1":
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not (
+            message.startswith("[PPReqPhase]")
+            or message.startswith("[PPShape]")
+            or message.startswith("[PPFrontierDiag]")
+            or message.startswith("[HiCachePrefetchDecision]")
+            or message.startswith("[PP Dynamic Chunk]")
+        )
+
+
+if not any(isinstance(f, _PPSchedulerDebugFilter) for f in logger.filters):
+    logger.addFilter(_PPSchedulerDebugFilter())
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
