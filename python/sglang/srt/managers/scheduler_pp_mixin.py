@@ -283,59 +283,78 @@ class SchedulerPPMixin:
         release_rids: Optional[List[str]],
         launch_ack_mb_id: Optional[int] = None,
         launch_ack_rids: Optional[List[str]] = None,
+        launch_ack_barrier_rid: Optional[str] = None,
     ):
-        if launch_ack_mb_id is None or not launch_ack_rids:
+        if (
+            launch_ack_mb_id is None
+            or (
+                not launch_ack_rids
+                and launch_ack_barrier_rid is None
+            )
+        ):
             return release_rids
         return {
             "release_rids": list(release_rids or []),
             "launch_frontier_ack": {
                 "mb_id": launch_ack_mb_id,
                 "rids": list(launch_ack_rids or []),
+                "barrier_rid": launch_ack_barrier_rid,
             },
         }
 
     def _pp_unpack_release_payload(
         self: Scheduler, payload
-    ) -> Tuple[Optional[List[str]], Optional[int], List[str]]:
+    ) -> Tuple[Optional[List[str]], Optional[int], List[str], Optional[str]]:
         if payload is None:
-            return None, None, []
+            return None, None, [], None
         if isinstance(payload, dict):
             release_rids = payload.get("release_rids")
             ack_payload = payload.get("launch_frontier_ack") or {}
             ack_mb_id = ack_payload.get("mb_id")
             ack_rids = list(ack_payload.get("rids") or [])
-            return release_rids, ack_mb_id, ack_rids
-        return payload, None, []
+            ack_barrier_rid = ack_payload.get("barrier_rid")
+            return release_rids, ack_mb_id, ack_rids, ack_barrier_rid
+        return payload, None, [], None
 
     def _pp_record_launch_frontier_ack(
-        self: Scheduler, ack_mb_id: Optional[int], ack_rids: List[str]
+        self: Scheduler,
+        ack_mb_id: Optional[int],
+        ack_rids: List[str],
+        ack_barrier_rid: Optional[str] = None,
     ) -> None:
-        if ack_mb_id is None or not ack_rids:
+        if ack_mb_id is None or (not ack_rids and ack_barrier_rid is None):
             return
         # Apply launch-frontier acks on the next visit of the same mb_id.
         # This keeps the semantics "PP0 may lead by at most one microbatch"
         # instead of trying to retroactively constrain the microbatch that is
         # already in flight when the downstream ack arrives.
-        self.pp_pending_launch_frontier_ack_by_mb[ack_mb_id] = list(ack_rids)
+        self.pp_pending_launch_frontier_ack_by_mb[ack_mb_id] = {
+            "rids": list(ack_rids),
+            "barrier_rid": ack_barrier_rid,
+        }
         if self._pp_prefill_diag_enabled():
             logger.warning(
-                "[PPPrefillDiag][launch_frontier_ack_recv] pp=%s cp=%s tp=%s mb=%s ack=%s",
+                "[PPPrefillDiag][launch_frontier_ack_recv] pp=%s cp=%s tp=%s mb=%s ack=%s barrier=%s",
                 self.pp_rank,
                 self.attn_cp_rank,
                 self.attn_tp_rank,
                 ack_mb_id,
                 ack_rids[:8],
+                ack_barrier_rid,
             )
 
     def _pp_consume_launch_frontier_ack(
         self: Scheduler, mb_id: Optional[int]
-    ) -> Optional[List[str]]:
+    ) -> Optional[Dict[str, object]]:
         if mb_id is None:
             return None
         ack = self.pp_launch_frontier_ack_by_mb.pop(mb_id, None)
         if ack is None:
             return None
-        return list(ack)
+        return {
+            "rids": list(ack.get("rids") or []),
+            "barrier_rid": ack.get("barrier_rid"),
+        }
 
     def _pp_activate_launch_frontier_ack(self: Scheduler, mb_id: int) -> None:
         pending_ack = self.pp_pending_launch_frontier_ack_by_mb.pop(mb_id, None)
@@ -344,12 +363,13 @@ class SchedulerPPMixin:
         self.pp_launch_frontier_ack_by_mb[mb_id] = pending_ack
         if self._pp_prefill_diag_enabled():
             logger.warning(
-                "[PPPrefillDiag][launch_frontier_ack_activate] pp=%s cp=%s tp=%s mb=%s ack=%s",
+                "[PPPrefillDiag][launch_frontier_ack_activate] pp=%s cp=%s tp=%s mb=%s ack=%s barrier=%s",
                 self.pp_rank,
                 self.attn_cp_rank,
                 self.attn_tp_rank,
                 mb_id,
-                pending_ack[:8],
+                list(pending_ack.get("rids") or [])[:8],
+                pending_ack.get("barrier_rid"),
             )
 
     def _pp_prefill_shape_snapshot_log(
@@ -691,16 +711,29 @@ class SchedulerPPMixin:
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
                 launch_frontier_ack_rids = []
+                launch_frontier_ack_barrier_rid = None
                 if self.pp_group.is_last_rank:
                     launch_frontier_ack_rids = self._pp_prefill_batch_rids(batch)
-                    if batch is not None and self._pp_prefill_diag_enabled():
+                    if (
+                        self.enable_hicache_storage
+                        and hasattr(self.tree_cache, "peek_pp_locally_revoked_req")
+                        and self.waiting_queue
+                    ):
+                        revoked_head_rid = self.tree_cache.peek_pp_locally_revoked_req()
+                        if revoked_head_rid == self.waiting_queue[0].rid:
+                            launch_frontier_ack_barrier_rid = revoked_head_rid
+                    if (
+                        (batch is not None or launch_frontier_ack_barrier_rid is not None)
+                        and self._pp_prefill_diag_enabled()
+                    ):
                         logger.warning(
-                            "[PPPrefillDiag][launch_frontier_ack_emit] pp=%s cp=%s tp=%s mb=%s ack=%s",
+                            "[PPPrefillDiag][launch_frontier_ack_emit] pp=%s cp=%s tp=%s mb=%s ack=%s barrier=%s",
                             self.pp_rank,
                             self.attn_cp_rank,
                             self.attn_tp_rank,
                             mb_id,
                             launch_frontier_ack_rids[:8],
+                            launch_frontier_ack_barrier_rid,
                         )
                 if batch or self.waiting_queue:
                     self._pp_prefill_diag_log(
@@ -774,6 +807,7 @@ class SchedulerPPMixin:
                         transferred_rids,
                         launch_ack_mb_id=mb_id if self.pp_group.is_last_rank else None,
                         launch_ack_rids=launch_frontier_ack_rids,
+                        launch_ack_barrier_rid=launch_frontier_ack_barrier_rid,
                     )
                 )
 
@@ -872,17 +906,20 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_payload = self._pp_recv_pyobj_from_prev_stage()
-                    next_release_rids, ack_mb_id, ack_rids = (
+                    next_release_rids, ack_mb_id, ack_rids, ack_barrier_rid = (
                         self._pp_unpack_release_payload(next_release_payload)
                     )
-                    self._pp_record_launch_frontier_ack(ack_mb_id, ack_rids)
-                    if next_release_rids or ack_rids:
+                    self._pp_record_launch_frontier_ack(
+                        ack_mb_id, ack_rids, ack_barrier_rid
+                    )
+                    if next_release_rids or ack_rids or ack_barrier_rid is not None:
                         self._pp_prefill_diag_log(
                             "release_recv",
                             mb=next_mb_id,
                             release=self._pp_prefill_diag_rids(next_release_rids),
                             launch_ack_mb=ack_mb_id,
                             launch_ack=ack_rids[:8],
+                            launch_ack_barrier=ack_barrier_rid,
                         )
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
@@ -1164,8 +1201,8 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
-        self.pp_launch_frontier_ack_by_mb: Dict[int, List[str]] = {}
-        self.pp_pending_launch_frontier_ack_by_mb: Dict[int, List[str]] = {}
+        self.pp_launch_frontier_ack_by_mb: Dict[int, Dict[str, object]] = {}
+        self.pp_pending_launch_frontier_ack_by_mb: Dict[int, Dict[str, object]] = {}
         self.pp_current_prefill_mb_id: Optional[int] = None
 
     def profile_and_init_predictor(self: Scheduler):
