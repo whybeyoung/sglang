@@ -1991,6 +1991,41 @@ class Scheduler(
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
+                if os.getenv("SGLANG_DEBUG_PP_PREFETCH_TRACE", "0") == "1":
+                    wait_age_ms = 0.0
+                    bootstrap_age_ms = 0.0
+                    if hasattr(self, "_pp_prefill_req_age_sec"):
+                        wait_age_ms = (
+                            self._pp_prefill_req_age_sec(
+                                req, "wait_queue_entry_time"
+                            )
+                            * 1000.0
+                        )
+                        bootstrap_age_ms = (
+                            self._pp_prefill_req_age_sec(
+                                req, "prefill_bootstrap_queue_entry_time"
+                            )
+                            * 1000.0
+                        )
+                    logger.warning(
+                        "[PPPrefetchTrace] pp=%s cp=%s tp=%s rid=%s phase=prepare "
+                        "prefix=%s host_hit=%s matched_len=%s new_tokens=%s "
+                        "anchor_node=%s anchor_backuped=%s last_hash=%s "
+                        "wait_age_ms=%.1f bootstrap_age_ms=%.1f",
+                        self.pp_rank if self.pp_group is not None else -1,
+                        self.attn_cp_rank,
+                        self.attn_tp_rank,
+                        req.rid,
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                        matched_len,
+                        len(new_input_tokens),
+                        last_host_node.id if last_host_node is not None else None,
+                        last_host_node.backuped if last_host_node is not None else None,
+                        last_hash,
+                        wait_age_ms,
+                        bootstrap_age_ms,
+                    )
 
                 if (
                     self.pp_group is not None

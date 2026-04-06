@@ -211,6 +211,7 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_issue_count_by_reqid: dict[str, int] = {}
         self.zero_hit_prefetch_req_ids: set[str] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -709,6 +710,7 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.prefetch_issue_count_by_reqid.clear()
         self.zero_hit_prefetch_req_ids.clear()
         self.evictable_host_leaves.clear()
         self.pp_outgoing_host_tree_events.clear()
@@ -985,6 +987,7 @@ class HiRadixCache(RadixCache):
         to avoid revoke re-hardening races, so they should not be cleared earlier.
         """
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+        self.prefetch_issue_count_by_reqid.pop(req_id, None)
         self.zero_hit_prefetch_req_ids.discard(req_id)
         self.pp_retry_prefetch_req_ids.discard(req_id)
         self.pp_authoritative_revoked_req_ids.discard(req_id)
@@ -2488,6 +2491,23 @@ class HiRadixCache(RadixCache):
             prefix_keys,
             **self._get_extra_pools(),
         )
+        issue_idx = self.prefetch_issue_count_by_reqid.get(req_id, 0) + 1
+        self.prefetch_issue_count_by_reqid[req_id] = issue_idx
+        if os.getenv("SGLANG_DEBUG_PP_PREFETCH_TRACE", "0") == "1":
+            logger.warning(
+                "[PPPrefetchTrace] pp=%s cp=%s tp=%s rid=%s phase=issue issue_idx=%s "
+                "aligned_tokens=%s anchor_node=%s anchor_backuped=%s last_hash=%s prefix_keys=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                _safe_attn_tp_rank(self),
+                req_id,
+                issue_idx,
+                prefetch_length,
+                last_host_node.id if last_host_node is not None else None,
+                last_host_node.backuped if last_host_node is not None else None,
+                last_hash,
+                0 if prefix_keys is None else len(prefix_keys),
+            )
         logger.warning(
             "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_issue token_count=%s last_hash=%s prefix_keys=%s",
             self.pp_rank,
