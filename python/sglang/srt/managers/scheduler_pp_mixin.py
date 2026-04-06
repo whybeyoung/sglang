@@ -312,7 +312,11 @@ class SchedulerPPMixin:
     ) -> None:
         if ack_mb_id is None or not ack_rids:
             return
-        self.pp_launch_frontier_ack_by_mb[ack_mb_id] = list(ack_rids)
+        # Apply launch-frontier acks on the next visit of the same mb_id.
+        # This keeps the semantics "PP0 may lead by at most one microbatch"
+        # instead of trying to retroactively constrain the microbatch that is
+        # already in flight when the downstream ack arrives.
+        self.pp_pending_launch_frontier_ack_by_mb[ack_mb_id] = list(ack_rids)
         if self._pp_prefill_diag_enabled():
             logger.warning(
                 "[PPPrefillDiag][launch_frontier_ack_recv] pp=%s cp=%s tp=%s mb=%s ack=%s",
@@ -332,6 +336,21 @@ class SchedulerPPMixin:
         if ack is None:
             return None
         return list(ack)
+
+    def _pp_activate_launch_frontier_ack(self: Scheduler, mb_id: int) -> None:
+        pending_ack = self.pp_pending_launch_frontier_ack_by_mb.pop(mb_id, None)
+        if pending_ack is None:
+            return
+        self.pp_launch_frontier_ack_by_mb[mb_id] = pending_ack
+        if self._pp_prefill_diag_enabled():
+            logger.warning(
+                "[PPPrefillDiag][launch_frontier_ack_activate] pp=%s cp=%s tp=%s mb=%s ack=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                mb_id,
+                pending_ack[:8],
+            )
 
     def _pp_prefill_shape_snapshot_log(
         self: Scheduler,
@@ -461,6 +480,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self._pp_activate_launch_frontier_ack(mb_id)
                 self.pp_current_prefill_mb_id = mb_id
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
@@ -1145,6 +1165,7 @@ class SchedulerPPMixin:
             defaultdict(deque)
         )
         self.pp_launch_frontier_ack_by_mb: Dict[int, List[str]] = {}
+        self.pp_pending_launch_frontier_ack_by_mb: Dict[int, List[str]] = {}
         self.pp_current_prefill_mb_id: Optional[int] = None
 
     def profile_and_init_predictor(self: Scheduler):
