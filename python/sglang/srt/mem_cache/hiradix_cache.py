@@ -893,7 +893,6 @@ class HiRadixCache(RadixCache):
         self.clear_follow_rank_prefetch_issue_pending(req_id)
         if req_id in self.pp_authoritative_revoked_req_ids:
             mark_local_revoke = False
-            self.pp_authoritative_revoked_req_ids.discard(req_id)
         if req_id in self.pp_soft_skipped_req_ids:
             mark_local_revoke = False
             self.pp_soft_skipped_req_ids.discard(req_id)
@@ -947,7 +946,6 @@ class HiRadixCache(RadixCache):
 
     def discard_pp_locally_revoked_req(self, req_id: str) -> None:
         self.pp_locally_revoked_req_ids.discard(req_id)
-        self.pp_authoritative_revoked_req_ids.discard(req_id)
         self.pp_soft_skipped_req_ids.discard(req_id)
         while self.pp_locally_revoked_req_queue:
             rid = self.pp_locally_revoked_req_queue[0]
@@ -995,9 +993,13 @@ class HiRadixCache(RadixCache):
                 True,
                 self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
             )
-            self._drain_single_revoke_req(req_id, zero_hit=True)
-            self.discard_pp_locally_revoked_req(req_id)
             self.pp_authoritative_revoked_req_ids.add(req_id)
+            self._drain_single_revoke_req(
+                req_id,
+                zero_hit=True,
+                mark_local_revoke=False,
+            )
+            self.discard_pp_locally_revoked_req(req_id)
             return True
 
         if self.pp_deferred_revoke_req_ids:
