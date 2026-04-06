@@ -829,7 +829,12 @@ class HiRadixCache(RadixCache):
             return None
         return self.pp_pending_host_tree_events.popleft()
 
-    def _drain_single_revoke_req(self, req_id: str, zero_hit: bool = False) -> None:
+    def _drain_single_revoke_req(
+        self,
+        req_id: str,
+        zero_hit: bool = False,
+        mark_local_revoke: bool = True,
+    ) -> None:
         had_ongoing = req_id in self.ongoing_prefetch
         loaded_tokens_before = self.prefetch_loaded_tokens_by_reqid.get(req_id, 0)
         info = self.ongoing_prefetch.pop(req_id, None)
@@ -842,14 +847,15 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         if zero_hit:
             self.zero_hit_prefetch_req_ids.add(req_id)
-            if self._pp_downstream_sync_enabled():
+            if mark_local_revoke and self._pp_downstream_sync_enabled():
                 if req_id not in self.pp_locally_revoked_req_ids:
                     self.pp_locally_revoked_req_ids.add(req_id)
                     self.pp_locally_revoked_req_queue.append(req_id)
         logger.warning(
-            "[HiCachePrefetchCleanup] rid=%s zero_hit=%s had_ongoing=%s ongoing_after=%s loaded_tokens_before=%s loaded_tokens_after=%s zero_hit_marked=%s",
+            "[HiCachePrefetchCleanup] rid=%s zero_hit=%s mark_local_revoke=%s had_ongoing=%s ongoing_after=%s loaded_tokens_before=%s loaded_tokens_after=%s zero_hit_marked=%s",
             req_id,
             zero_hit,
+            mark_local_revoke,
             had_ongoing,
             req_id in self.ongoing_prefetch,
             loaded_tokens_before,
@@ -891,14 +897,18 @@ class HiRadixCache(RadixCache):
             return False
         if req_id in self.ongoing_prefetch:
             logger.warning(
-                "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=cleanup_ongoing",
+                "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=cleanup_ongoing_soft",
                 req_id,
             )
-            self._drain_single_revoke_req(req_id, zero_hit=True)
+            self._drain_single_revoke_req(
+                req_id,
+                zero_hit=True,
+                mark_local_revoke=False,
+            )
             return True
         self.zero_hit_prefetch_req_ids.add(req_id)
         logger.warning(
-            "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=mark_zero_hit",
+            "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=mark_zero_hit_soft",
             req_id,
         )
         return True
