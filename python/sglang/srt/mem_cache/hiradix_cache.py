@@ -205,6 +205,7 @@ class HiRadixCache(RadixCache):
         self.pp_locally_revoked_req_ids: set[str] = set()
         self.pp_locally_revoked_req_queue: Deque[str] = deque()
         self.pp_retry_prefetch_req_ids: set[str] = set()
+        self.pp_soft_skipped_req_ids: set[str] = set()
         self._in_pp_host_tree_replay = False
 
         # Detach storage backend automatically on process shutdown
@@ -695,6 +696,7 @@ class HiRadixCache(RadixCache):
         self.pp_locally_revoked_req_ids.clear()
         self.pp_locally_revoked_req_queue.clear()
         self.pp_retry_prefetch_req_ids.clear()
+        self.pp_soft_skipped_req_ids.clear()
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
@@ -835,6 +837,9 @@ class HiRadixCache(RadixCache):
         zero_hit: bool = False,
         mark_local_revoke: bool = True,
     ) -> None:
+        if req_id in self.pp_soft_skipped_req_ids:
+            mark_local_revoke = False
+            self.pp_soft_skipped_req_ids.discard(req_id)
         had_ongoing = req_id in self.ongoing_prefetch
         loaded_tokens_before = self.prefetch_loaded_tokens_by_reqid.get(req_id, 0)
         info = self.ongoing_prefetch.pop(req_id, None)
@@ -885,6 +890,7 @@ class HiRadixCache(RadixCache):
 
     def discard_pp_locally_revoked_req(self, req_id: str) -> None:
         self.pp_locally_revoked_req_ids.discard(req_id)
+        self.pp_soft_skipped_req_ids.discard(req_id)
         while self.pp_locally_revoked_req_queue:
             rid = self.pp_locally_revoked_req_queue[0]
             if rid in self.pp_locally_revoked_req_ids:
@@ -895,6 +901,7 @@ class HiRadixCache(RadixCache):
         req_id = event.rid
         if req_id is None:
             return False
+        self.pp_soft_skipped_req_ids.add(req_id)
         if req_id in self.ongoing_prefetch:
             logger.warning(
                 "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=cleanup_ongoing_soft",
