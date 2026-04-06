@@ -2256,7 +2256,9 @@ class HiRadixCache(RadixCache):
         Returns 0 if no prefetch was done or was revoked.
         This should be called after check_prefetch_progress() returns True.
         """
-        self.zero_hit_prefetch_req_ids.discard(req_id)
+        # Keep the zero-hit marker until an explicit retry signal or request
+        # teardown clears it. Otherwise the same waiting req can re-enter local
+        # storage prefetch immediately after a zero-hit revoke.
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
