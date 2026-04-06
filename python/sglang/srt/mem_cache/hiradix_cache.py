@@ -911,36 +911,54 @@ class HiRadixCache(RadixCache):
                 self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
             )
             self._drain_single_revoke_req(req_id, zero_hit=True)
+            self.discard_pp_locally_revoked_req(req_id)
             return True
 
-        while True:
-            if self.pp_deferred_revoke_req_ids:
-                deferred_req_id, deferred_zero_hit = self.pp_deferred_revoke_req_ids[0]
-                if deferred_req_id != req_id:
-                    logger.warning(
-                        "[HiCachePPReplay][revoke_wait] rid=%s reason=deferred_head_mismatch deferred_head=%s",
-                        req_id,
-                        deferred_req_id,
+        if self.pp_deferred_revoke_req_ids:
+            deferred_req_ids = [rid for rid, _ in self.pp_deferred_revoke_req_ids]
+            if req_id in deferred_req_ids:
+                deferred_items = list(self.pp_deferred_revoke_req_ids)
+                self.pp_deferred_revoke_req_ids.clear()
+                matched_zero_hit = False
+                skipped = 0
+                for deferred_req_id, deferred_zero_hit in deferred_items:
+                    if deferred_req_id == req_id:
+                        matched_zero_hit = deferred_zero_hit
+                        continue
+                    skipped += 1
+                    self.pp_deferred_revoke_req_ids.append(
+                        (deferred_req_id, deferred_zero_hit)
                     )
-                    return False
-                self.pp_deferred_revoke_req_ids.popleft()
                 logger.warning(
-                    "[HiCachePPReplay][revoke_apply] rid=%s source=deferred_queue zero_hit=%s",
-                    deferred_req_id,
-                    deferred_zero_hit,
+                    "[HiCachePPReplay][revoke_apply] rid=%s source=deferred_queue zero_hit=%s skipped_unrelated=%s",
+                    req_id,
+                    matched_zero_hit,
+                    skipped,
                 )
-                self._drain_single_revoke_req(
-                    deferred_req_id, zero_hit=deferred_zero_hit
-                )
+                self._drain_single_revoke_req(req_id, zero_hit=matched_zero_hit)
+                self.discard_pp_locally_revoked_req(req_id)
                 return True
 
+            deferred_head = deferred_req_ids[0]
+            logger.warning(
+                "[HiCachePPReplay][revoke_wait] rid=%s reason=deferred_head_mismatch deferred_head=%s deferred_pending=%s",
+                req_id,
+                deferred_head,
+                deferred_req_ids[:4],
+            )
+
+        scanned_unrelated = []
+        while True:
             try:
                 queued_item = self.cache_controller.prefetch_revoke_queue.get_nowait()
             except Empty:
+                for queued_req_id, queued_zero_hit in scanned_unrelated:
+                    self.pp_deferred_revoke_req_ids.append((queued_req_id, queued_zero_hit))
                 logger.warning(
-                    "[HiCachePPReplay][revoke_wait] rid=%s reason=no_local_revoke_queue ongoing=%s",
+                    "[HiCachePPReplay][revoke_wait] rid=%s reason=no_local_revoke_queue ongoing=%s scanned_unrelated=%s",
                     req_id,
                     req_id in self.ongoing_prefetch,
+                    [rid for rid, _ in scanned_unrelated[:4]],
                 )
                 return False
             queued_req_id, queued_zero_hit = (
@@ -948,23 +966,21 @@ class HiRadixCache(RadixCache):
             )
 
             if queued_req_id != req_id:
-                logger.warning(
-                    "[HiCachePPReplay][revoke_wait] rid=%s reason=queue_head_mismatch queued_head=%s queued_zero_hit=%s",
-                    req_id,
-                    queued_req_id,
-                    queued_zero_hit,
-                )
-                self.pp_deferred_revoke_req_ids.append(
-                    (queued_req_id, queued_zero_hit)
-                )
-                return False
+                scanned_unrelated.append((queued_req_id, queued_zero_hit))
+                continue
 
+            for unrelated_req_id, unrelated_zero_hit in scanned_unrelated:
+                self.pp_deferred_revoke_req_ids.append(
+                    (unrelated_req_id, unrelated_zero_hit)
+                )
             logger.warning(
-                "[HiCachePPReplay][revoke_apply] rid=%s source=local_revoke_queue zero_hit=%s",
+                "[HiCachePPReplay][revoke_apply] rid=%s source=local_revoke_queue zero_hit=%s skipped_unrelated=%s",
                 queued_req_id,
                 queued_zero_hit,
+                len(scanned_unrelated),
             )
             self._drain_single_revoke_req(queued_req_id, zero_hit=queued_zero_hit)
+            self.discard_pp_locally_revoked_req(queued_req_id)
             return True
 
     def _write_commit_event_matches(
@@ -1371,17 +1387,22 @@ class HiRadixCache(RadixCache):
             return False
 
         skipped_unrelated_finalize = 0
+        skipped_unrelated_revoke = 0
         for event in self.pp_pending_host_tree_events:
             if event.kind == "PREFETCH_FINALIZE" and event.rid != req_id:
                 skipped_unrelated_finalize += 1
+                continue
+            if event.kind == "REVOKE" and event.rid != req_id:
+                skipped_unrelated_revoke += 1
                 continue
             if event.kind == "REVOKE" and event.rid == req_id:
                 if self._try_replay_revoke_event(event):
                     self.pp_pending_host_tree_events.remove(event)
                     logger.warning(
-                        "[HiCachePPReplay][revoke_fast_apply] rid=%s skipped_unrelated_finalize=%s",
+                        "[HiCachePPReplay][revoke_fast_apply] rid=%s skipped_unrelated_finalize=%s skipped_unrelated_revoke=%s",
                         req_id,
                         skipped_unrelated_finalize,
+                        skipped_unrelated_revoke,
                     )
                     return True
                 return False
