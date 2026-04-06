@@ -1841,6 +1841,7 @@ class SchedulerPPMixin:
         transferred_rids: List[str],
         launch_ack_mb_id: Optional[int] = None,
         launch_ack_rids: Optional[List[str]] = None,
+        launch_ack_barrier_rid: Optional[str] = None,
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
@@ -1849,6 +1850,7 @@ class SchedulerPPMixin:
                     transferred_rids,
                     launch_ack_mb_id=launch_ack_mb_id,
                     launch_ack_rids=launch_ack_rids,
+                    launch_ack_barrier_rid=launch_ack_barrier_rid,
                 )
                 send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
