@@ -726,6 +726,9 @@ class HiRadixCache(RadixCache):
     def _pp_downstream_sync_enabled(self) -> bool:
         return self.enable_storage and self.pp_size > 1 and self.pp_rank > 0
 
+    def _pp_write_backup_replay_enabled(self) -> bool:
+        return os.getenv("SGLANG_ENABLE_PP_WRITE_BACKUP_REPLAY", "0") == "1"
+
     def _pp_should_skip_large_shallow_prefetch(
         self, last_host_node: TreeNode, prefetch_length: int
     ) -> bool:
@@ -748,6 +751,11 @@ class HiRadixCache(RadixCache):
 
     def _append_pp_host_tree_event(self, event: PPHostTreeEvent) -> None:
         if not (self.enable_storage and self.pp_size > 1):
+            return
+        if (
+            event.kind == "WRITE_BACKUP_COMMITTED"
+            and not self._pp_write_backup_replay_enabled()
+        ):
             return
         # The last PP rank has no downstream peer to consume these events.
         # Keeping them would only create an append-only Python list that grows
@@ -822,6 +830,11 @@ class HiRadixCache(RadixCache):
             ],
         )
         for event in events:
+            if (
+                str(event.get("kind")) == "WRITE_BACKUP_COMMITTED"
+                and not self._pp_write_backup_replay_enabled()
+            ):
+                continue
             self.pp_pending_host_tree_events.append(
                 PPHostTreeEvent(
                     seq=int(event.get("seq", 0)),
@@ -890,6 +903,8 @@ class HiRadixCache(RadixCache):
         return self.pp_pending_host_tree_events[0]
 
     def has_pending_pp_write_backup_event(self) -> bool:
+        if not self._pp_write_backup_replay_enabled():
+            return False
         event = self._peek_pp_host_tree_event()
         return event is not None and event.kind == "WRITE_BACKUP_COMMITTED"
 
@@ -1533,6 +1548,22 @@ class HiRadixCache(RadixCache):
         try:
             while self.pp_pending_host_tree_events:
                 event = self.pp_pending_host_tree_events[0]
+                if (
+                    event.kind == "WRITE_BACKUP_COMMITTED"
+                    and not self._pp_write_backup_replay_enabled()
+                ):
+                    self.pp_pending_host_tree_events.popleft()
+                    logger.warning(
+                        "[HiCachePPEvent][replay_skip] pp=%s cp=%s seq=%s kind=%s rid=%s reason=write_backup_replay_disabled pending_after=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        event.seq,
+                        event.kind,
+                        event.rid,
+                        len(self.pp_pending_host_tree_events),
+                    )
+                    replayed += 1
+                    continue
                 progressed = False
                 if event.kind == "WRITE_BACKUP_COMMITTED":
                     progressed = self._try_replay_write_backup_event(event)
@@ -1739,7 +1770,10 @@ class HiRadixCache(RadixCache):
         if len(self.ongoing_write_through) == 0:
             return
 
-        if self._pp_downstream_sync_enabled():
+        if (
+            self._pp_downstream_sync_enabled()
+            and self._pp_write_backup_replay_enabled()
+        ):
             while self.pp_pending_host_tree_events:
                 event = self.pp_pending_host_tree_events[0]
                 if event.kind != "WRITE_BACKUP_COMMITTED":
