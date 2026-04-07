@@ -667,6 +667,7 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
+        prefill_diag_enabled = self._pp_prefill_diag_enabled()
 
         while True:
             server_is_idle = True
@@ -685,47 +686,48 @@ class SchedulerPPMixin:
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
                 self._pp_apply_hicache_sync_before_batch()
-                recv_diag = self._pp_prefill_diag_rids(recv_reqs)
-                waiting_diag = self._pp_prefill_diag_rids(self.waiting_queue)
-                bootstrap_diag = self._pp_prefill_diag_rids(
-                    self.disagg_prefill_bootstrap_queue.queue
-                )
-                inflight_diag = self._pp_prefill_diag_rids(
-                    self.disagg_prefill_inflight_queue
-                )
-                if recv_diag or waiting_diag or bootstrap_diag or inflight_diag:
-                    self._pp_prefill_diag_log(
-                        "recv",
-                        mb=mb_id,
-                        recv=recv_diag,
-                        waiting=waiting_diag,
-                        bootstrap_q=bootstrap_diag,
-                        inflight_q=inflight_diag,
+                if prefill_diag_enabled:
+                    recv_diag = self._pp_prefill_diag_rids(recv_reqs)
+                    waiting_diag = self._pp_prefill_diag_rids(self.waiting_queue)
+                    bootstrap_diag = self._pp_prefill_diag_rids(
+                        self.disagg_prefill_bootstrap_queue.queue
                     )
-                self._pp_prefill_maybe_log_age(
-                    "bootstrap_head_age",
-                    self.disagg_prefill_bootstrap_queue.queue[0]
-                    if self.disagg_prefill_bootstrap_queue.queue
-                    else None,
-                    "prefill_bootstrap_queue_entry_time",
-                    waiting_queue=self.waiting_queue,
-                    bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
-                    inflight_queue=self.disagg_prefill_inflight_queue,
-                )
-                self._pp_prefill_maybe_log_age(
-                    "inflight_head_age",
-                    self.disagg_prefill_inflight_queue[0]
-                    if self.disagg_prefill_inflight_queue
-                    else None,
-                    "prefill_transfer_queue_entry_time",
-                    waiting_queue=self.waiting_queue,
-                    bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
-                    inflight_queue=self.disagg_prefill_inflight_queue,
-                )
+                    inflight_diag = self._pp_prefill_diag_rids(
+                        self.disagg_prefill_inflight_queue
+                    )
+                    if recv_diag or waiting_diag or bootstrap_diag or inflight_diag:
+                        self._pp_prefill_diag_log(
+                            "recv",
+                            mb=mb_id,
+                            recv=recv_diag,
+                            waiting=waiting_diag,
+                            bootstrap_q=bootstrap_diag,
+                            inflight_q=inflight_diag,
+                        )
+                    self._pp_prefill_maybe_log_age(
+                        "bootstrap_head_age",
+                        self.disagg_prefill_bootstrap_queue.queue[0]
+                        if self.disagg_prefill_bootstrap_queue.queue
+                        else None,
+                        "prefill_bootstrap_queue_entry_time",
+                        waiting_queue=self.waiting_queue,
+                        bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
+                        inflight_queue=self.disagg_prefill_inflight_queue,
+                    )
+                    self._pp_prefill_maybe_log_age(
+                        "inflight_head_age",
+                        self.disagg_prefill_inflight_queue[0]
+                        if self.disagg_prefill_inflight_queue
+                        else None,
+                        "prefill_transfer_queue_entry_time",
+                        waiting_queue=self.waiting_queue,
+                        bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
+                        inflight_queue=self.disagg_prefill_inflight_queue,
+                    )
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids(mb_id)
                 bmbs[mb_id] = bootstrapped_rids
-                if bootstrapped_rids[0] or bootstrapped_rids[1]:
+                if prefill_diag_enabled and (bootstrapped_rids[0] or bootstrapped_rids[1]):
                     self._pp_prefill_diag_log(
                         "bootstrap_poll",
                         mb=mb_id,
@@ -734,7 +736,7 @@ class SchedulerPPMixin:
                     )
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 tmbs[mb_id] = transferred_rids
-                if transferred_rids:
+                if prefill_diag_enabled and transferred_rids:
                     self._pp_prefill_diag_log(
                         "transfer_poll",
                         mb=mb_id,
@@ -760,7 +762,7 @@ class SchedulerPPMixin:
                             launch_frontier_ack_barrier_rid = revoked_head_rid
                     if (
                         (batch is not None or launch_frontier_ack_barrier_rid is not None)
-                        and self._pp_prefill_diag_enabled()
+                        and prefill_diag_enabled
                     ):
                         logger.warning(
                             "[PPPrefillDiag][launch_frontier_ack_emit] pp=%s cp=%s tp=%s mb=%s ack=%s barrier=%s",
@@ -771,26 +773,29 @@ class SchedulerPPMixin:
                             launch_frontier_ack_rids[:8],
                             launch_frontier_ack_barrier_rid,
                         )
-                if batch or self.waiting_queue:
+                if prefill_diag_enabled and (batch or self.waiting_queue):
                     self._pp_prefill_diag_log(
                         "batch_pick",
                         mb=mb_id,
                         batch=self._pp_prefill_diag_rids(batch.reqs if batch else []),
                         waiting_after_pick=self._pp_prefill_diag_rids(self.waiting_queue),
                     )
-                batch_rids = tuple(self._pp_prefill_diag_rids(batch.reqs if batch else []))
-                waiting_rids = tuple(
-                    self._pp_prefill_diag_rids(self.waiting_queue)
-                )
-                bootstrap_rids = tuple(
-                    self._pp_prefill_diag_rids(
-                        self.disagg_prefill_bootstrap_queue.queue
+                if (
+                    prefill_diag_enabled
+                    and (batch or self.waiting_queue or self.disagg_prefill_bootstrap_queue.queue)
+                ):
+                    batch_rids = tuple(
+                        self._pp_prefill_diag_rids(batch.reqs if batch else [])
                     )
-                )
-                inflight_rids = tuple(
-                    self._pp_prefill_diag_rids(self.disagg_prefill_inflight_queue)
-                )
-                if batch or self.waiting_queue or self.disagg_prefill_bootstrap_queue.queue:
+                    waiting_rids = tuple(self._pp_prefill_diag_rids(self.waiting_queue))
+                    bootstrap_rids = tuple(
+                        self._pp_prefill_diag_rids(
+                            self.disagg_prefill_bootstrap_queue.queue
+                        )
+                    )
+                    inflight_rids = tuple(
+                        self._pp_prefill_diag_rids(self.disagg_prefill_inflight_queue)
+                    )
                     self._pp_prefill_shape_snapshot_log(
                         "batch_shape_snapshot",
                         key=(mb_id, batch_rids, waiting_rids, bootstrap_rids, inflight_rids),
@@ -827,6 +832,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
@@ -835,6 +841,7 @@ class SchedulerPPMixin:
                         bootstrapped_rids,
                     )
                 )
+                self._pp_commit_comm_work(send_release_work)
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs,
@@ -856,7 +863,7 @@ class SchedulerPPMixin:
                             recv_consensus_bootstrapped_rids
                         )
                     )
-                    if recv_good or recv_bad or recv_deferred:
+                    if prefill_diag_enabled and (recv_good or recv_bad or recv_deferred):
                         self._pp_prefill_diag_log(
                             "bootstrap_consensus_recv",
                             mb=next_mb_id,
@@ -873,7 +880,7 @@ class SchedulerPPMixin:
                                 next_consensus_bootstrapped_rids
                             )
                         )
-                        if local_good or local_bad or local_deferred:
+                        if prefill_diag_enabled and (local_good or local_bad or local_deferred):
                             self._pp_prefill_diag_log(
                                 "bootstrap_apply_source",
                                 mb=next_mb_id,
@@ -913,7 +920,7 @@ class SchedulerPPMixin:
                         else []
                     )
                     waiting_after_apply = self._pp_prefill_diag_rids(self.waiting_queue)
-                    if (
+                    if prefill_diag_enabled and (
                         released_good
                         or released_bad
                         or released_deferred
@@ -927,7 +934,7 @@ class SchedulerPPMixin:
                             released_deferred=released_deferred,
                             waiting_after_apply=waiting_after_apply,
                         )
-                    if released_good:
+                    if prefill_diag_enabled and released_good:
                         for rid in released_good[:8]:
                             logger.warning(
                                 "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=bootstrap_to_waiting mb=%s",
@@ -939,7 +946,6 @@ class SchedulerPPMixin:
                             )
                     # Consume this microbatch's bootstrap consensus exactly once.
                     bmbs[next_mb_id] = None
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_payload = self._pp_recv_pyobj_from_prev_stage()
                     next_release_rids, ack_mb_id, ack_rids, ack_barrier_rid = (
@@ -948,7 +954,9 @@ class SchedulerPPMixin:
                     self._pp_record_launch_frontier_ack(
                         ack_mb_id, ack_rids, ack_barrier_rid
                     )
-                    if next_release_rids or ack_rids or ack_barrier_rid is not None:
+                    if prefill_diag_enabled and (
+                        next_release_rids or ack_rids or ack_barrier_rid is not None
+                    ):
                         self._pp_prefill_diag_log(
                             "release_recv",
                             mb=next_mb_id,
@@ -957,7 +965,6 @@ class SchedulerPPMixin:
                             launch_ack=ack_rids[:8],
                             launch_ack_barrier=ack_barrier_rid,
                         )
-                self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -975,23 +982,26 @@ class SchedulerPPMixin:
                     waiting_after_release = self._pp_prefill_diag_rids(
                         self.waiting_queue
                     )
-                    if next_release_rids or inflight_after_apply or waiting_after_release:
+                    if prefill_diag_enabled and (
+                        next_release_rids or inflight_after_apply or waiting_after_release
+                    ):
                         self._pp_prefill_diag_log(
                             "release_apply",
                             mb=next_mb_id,
                             inflight_after_apply=inflight_after_apply,
                             waiting_after_release=waiting_after_release,
                         )
-                    self._pp_prefill_maybe_log_age(
-                        "inflight_head_age",
-                        self.disagg_prefill_inflight_queue[0]
-                        if self.disagg_prefill_inflight_queue
-                        else None,
-                        "prefill_transfer_queue_entry_time",
-                        waiting_queue=self.waiting_queue,
-                        bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
-                        inflight_queue=self.disagg_prefill_inflight_queue,
-                    )
+                    if prefill_diag_enabled:
+                        self._pp_prefill_maybe_log_age(
+                            "inflight_head_age",
+                            self.disagg_prefill_inflight_queue[0]
+                            if self.disagg_prefill_inflight_queue
+                            else None,
+                            "prefill_transfer_queue_entry_time",
+                            waiting_queue=self.waiting_queue,
+                            bootstrap_queue=self.disagg_prefill_bootstrap_queue.queue,
+                            inflight_queue=self.disagg_prefill_inflight_queue,
+                        )
                     # Consume this microbatch's release consensus exactly once.
                     tmbs[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
@@ -1061,15 +1071,21 @@ class SchedulerPPMixin:
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
 
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+
                 # reaching consensus through PP ranks
                 retract_rids = self._pp_pd_get_retract_ids(mb_id)
                 rmbs[mb_id] = retract_rids
+                self._pp_commit_comm_work(send_retract_work)
 
                 prealloc_rids = self._pp_pd_get_prealloc_ids()
                 pmbs[mb_id] = prealloc_rids
+                self._pp_commit_comm_work(send_prealloc_work)
 
                 transferred_rids = self._pp_pd_get_decode_transferred_ids()
                 tmbs[mb_id] = transferred_rids
+                self._pp_commit_comm_work(send_transfer_work)
 
                 # get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
@@ -1170,19 +1186,15 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    self._pp_commit_comm_work(send_retract_work)
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
                     )
-                    self._pp_commit_comm_work(send_prealloc_work)
                     send_prealloc_work = self._pp_send_pyobj_to_next_stage(
                         prealloc_rids, async_send=True
                     )
-                    self._pp_commit_comm_work(send_transfer_work)
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
