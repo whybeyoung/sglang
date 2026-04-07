@@ -5,12 +5,13 @@ import heapq
 import json
 import logging
 import os
+import struct
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from queue import Empty
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple
 
 import torch
 
@@ -75,6 +76,8 @@ _PP_EVENT_KIND_TO_CODE = {
     "PREFETCH_FINALIZE": _PP_EVENT_PREFETCH_FINALIZE,
 }
 _PP_EVENT_CODE_TO_KIND = {value: key for key, value in _PP_EVENT_KIND_TO_CODE.items()}
+_PP_HOST_TREE_EVENTS_V1 = "__pp_host_tree_events_v1__"
+_PP_LIGHT_EVENT_HEADER = struct.Struct("<BQII")
 
 
 class _HiCacheDebugFilter(logging.Filter):
@@ -181,6 +184,70 @@ def _decode_pp_host_tree_wire_event(event) -> PPHostTreeEvent:
             node_parent_extra_keys=list(event.get("node_parent_extra_keys", [])),
         )
     raise TypeError(f"Unsupported PP host tree event wire type: {type(event)!r}")
+
+
+def _encode_pp_light_host_tree_events(events: List[PPHostTreeEvent]) -> bytes:
+    out = bytearray()
+    for event in events:
+        kind_code = _PP_EVENT_KIND_TO_CODE[event.kind]
+        if kind_code == _PP_EVENT_WRITE_BACKUP_COMMITTED:
+            raise ValueError("write-back events must stay on the heavy path")
+        rid_bytes = (event.rid or "").encode("utf-8")
+        out.extend(
+            _PP_LIGHT_EVENT_HEADER.pack(
+                kind_code,
+                int(event.seq),
+                int(event.loaded_from_storage),
+                len(rid_bytes),
+            )
+        )
+        out.extend(rid_bytes)
+    return bytes(out)
+
+
+def _decode_pp_light_host_tree_events(blob: bytes) -> List[PPHostTreeEvent]:
+    if not blob:
+        return []
+    view = memoryview(blob)
+    offset = 0
+    events: List[PPHostTreeEvent] = []
+    while offset < len(view):
+        if len(view) < offset + _PP_LIGHT_EVENT_HEADER.size:
+            raise ValueError("PP light event blob truncated")
+        kind_code, seq, loaded_from_storage, rid_len = _PP_LIGHT_EVENT_HEADER.unpack_from(
+            view, offset
+        )
+        offset += _PP_LIGHT_EVENT_HEADER.size
+        end = offset + rid_len
+        if len(view) < end:
+            raise ValueError("PP light event rid truncated")
+        rid = None
+        if rid_len:
+            rid = view[offset:end].tobytes().decode("utf-8")
+        offset = end
+        events.append(
+            PPHostTreeEvent(
+                seq=int(seq),
+                kind=_PP_EVENT_CODE_TO_KIND[int(kind_code)],
+                rid=rid,
+                loaded_from_storage=int(loaded_from_storage),
+            )
+        )
+    return events
+
+
+def _decode_pp_host_tree_transport(events) -> List[PPHostTreeEvent]:
+    if (
+        isinstance(events, tuple)
+        and len(events) == 3
+        and events[0] == _PP_HOST_TREE_EVENTS_V1
+    ):
+        decoded = _decode_pp_light_host_tree_events(events[1] or b"")
+        decoded.extend(
+            _decode_pp_host_tree_wire_event(event) for event in (events[2] or ())
+        )
+        return decoded
+    return [_decode_pp_host_tree_wire_event(event) for event in (events or ())]
 
 
 class HiRadixCache(RadixCache):
@@ -1084,10 +1151,27 @@ class HiRadixCache(RadixCache):
         self.pp_host_tree_event_seq += 1
         return self.pp_host_tree_event_seq
 
-    def consume_pp_host_tree_events(self) -> List[dict[str, Any]]:
+    def consume_pp_host_tree_events(self) -> Any:
         events = self.pp_outgoing_host_tree_events
         self.pp_outgoing_host_tree_events = []
-        if events and self._hicache_verbose_enabled():
+        if not events:
+            return []
+
+        light_events: List[PPHostTreeEvent] = []
+        heavy_events = []
+        for event in events:
+            decoded = _decode_pp_host_tree_wire_event(event)
+            if decoded.kind == "WRITE_BACKUP_COMMITTED":
+                heavy_events.append(event)
+            else:
+                light_events.append(decoded)
+        transport = (
+            _PP_HOST_TREE_EVENTS_V1,
+            _encode_pp_light_host_tree_events(light_events),
+            tuple(heavy_events),
+        )
+
+        if self._hicache_verbose_enabled():
             logger.warning(
                 "[HiCachePPEvent][consume] pp=%s cp=%s count=%s events=%s",
                 self.pp_rank,
@@ -1100,24 +1184,20 @@ class HiRadixCache(RadixCache):
                         decoded.rid,
                         decoded.loaded_from_storage,
                     )
-                    for decoded in [
-                        _decode_pp_host_tree_wire_event(event) for event in events[:8]
-                    ]
+                    for decoded in _decode_pp_host_tree_transport(transport)[:8]
                 ],
             )
-        return events
+        return transport
 
     def prepare_pp_incoming_host_tree_events(
-        self, events: List[dict[str, Any]]
+        self, events
     ) -> List[PPHostTreeEvent]:
         if not self._pp_downstream_sync_enabled() or not events:
             return []
 
-        prepared_events: List[PPHostTreeEvent] = []
+        prepared_events = _decode_pp_host_tree_transport(events)
         staged_rids = []
-        for event in events:
-            decoded = _decode_pp_host_tree_wire_event(event)
-            prepared_events.append(decoded)
+        for decoded in prepared_events:
             if decoded.kind != "PREFETCH_SKIP":
                 continue
             req_id = decoded.rid
@@ -1140,15 +1220,16 @@ class HiRadixCache(RadixCache):
 
         return prepared_events
 
-    def enqueue_pp_host_tree_events(self, events: List[dict[str, Any]]) -> None:
+    def enqueue_pp_host_tree_events(self, events) -> None:
         if not self._pp_downstream_sync_enabled() or not events:
             return
+        decoded_events = _decode_pp_host_tree_transport(events)
         if self._hicache_verbose_enabled():
             logger.warning(
                 "[HiCachePPEvent][enqueue] pp=%s cp=%s count=%s pending_before=%s events=%s",
                 self.pp_rank,
                 self.attn_cp_rank,
-                len(events),
+                len(decoded_events),
                 len(self.pp_pending_host_tree_events),
                 [
                     (
@@ -1157,13 +1238,10 @@ class HiRadixCache(RadixCache):
                         decoded.rid,
                         decoded.loaded_from_storage,
                     )
-                    for decoded in [
-                        _decode_pp_host_tree_wire_event(event) for event in events[:8]
-                    ]
+                    for decoded in decoded_events[:8]
                 ],
             )
-        for event in events:
-            decoded = _decode_pp_host_tree_wire_event(event)
+        for decoded in decoded_events:
             if (
                 decoded.kind == "WRITE_BACKUP_COMMITTED"
                 and not self._pp_write_backup_replay_enabled()

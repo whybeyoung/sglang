@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import struct
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -36,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 _PP_REQ_PAYLOAD_V1 = "__pp_req_payload_v1__"
 _PP_RELEASE_PAYLOAD_V1 = "__pp_release_payload_v1__"
+_PP_RELEASE_PAYLOAD_V2 = "__pp_release_payload_v2__"
+_PP_FRONTIER_ACK_HEADER = struct.Struct("<qI?")
+_PP_FRONTIER_ACK_LEN = struct.Struct("<I")
 
 
 class _PPPrefillDebugFilter(logging.Filter):
@@ -99,6 +103,68 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_encode_frontier_ack_blob(
+        self: Scheduler,
+        mb_id: int,
+        ack_rids,
+        barrier_rid: Optional[str],
+    ) -> bytes:
+        ack_rids = tuple(ack_rids or ())
+        out = bytearray(
+            _PP_FRONTIER_ACK_HEADER.pack(
+                int(mb_id),
+                len(ack_rids),
+                barrier_rid is not None,
+            )
+        )
+        for rid in ack_rids:
+            rid_bytes = str(rid).encode("utf-8")
+            out.extend(_PP_FRONTIER_ACK_LEN.pack(len(rid_bytes)))
+            out.extend(rid_bytes)
+        if barrier_rid is not None:
+            barrier_bytes = str(barrier_rid).encode("utf-8")
+            out.extend(_PP_FRONTIER_ACK_LEN.pack(len(barrier_bytes)))
+            out.extend(barrier_bytes)
+        return bytes(out)
+
+    def _pp_decode_frontier_ack_blob(
+        self: Scheduler, blob: bytes
+    ) -> Tuple[Optional[int], tuple[str, ...], Optional[str]]:
+        if not blob:
+            return None, (), None
+        view = memoryview(blob)
+        if len(view) < _PP_FRONTIER_ACK_HEADER.size:
+            raise ValueError("launch_frontier_ack blob truncated")
+        mb_id, ack_count, has_barrier = _PP_FRONTIER_ACK_HEADER.unpack_from(
+            view, 0
+        )
+        offset = _PP_FRONTIER_ACK_HEADER.size
+        ack_rids = []
+        for _ in range(int(ack_count)):
+            if len(view) < offset + _PP_FRONTIER_ACK_LEN.size:
+                raise ValueError("launch_frontier_ack rid length truncated")
+            rid_len = _PP_FRONTIER_ACK_LEN.unpack_from(view, offset)[0]
+            offset += _PP_FRONTIER_ACK_LEN.size
+            end = offset + rid_len
+            if len(view) < end:
+                raise ValueError("launch_frontier_ack rid truncated")
+            ack_rids.append(view[offset:end].tobytes().decode("utf-8"))
+            offset = end
+        barrier_rid = None
+        if has_barrier:
+            if len(view) < offset + _PP_FRONTIER_ACK_LEN.size:
+                raise ValueError("launch_frontier_ack barrier length truncated")
+            barrier_len = _PP_FRONTIER_ACK_LEN.unpack_from(view, offset)[0]
+            offset += _PP_FRONTIER_ACK_LEN.size
+            end = offset + barrier_len
+            if len(view) < end:
+                raise ValueError("launch_frontier_ack barrier truncated")
+            barrier_rid = view[offset:end].tobytes().decode("utf-8")
+            offset = end
+        if offset != len(view):
+            raise ValueError("launch_frontier_ack blob has trailing bytes")
+        return int(mb_id), tuple(ack_rids), barrier_rid
+
     def _pp_pack_req_payload(
         self: Scheduler, recv_reqs, hicache_host_tree_events: List[object]
     ):
@@ -338,12 +404,15 @@ class SchedulerPPMixin:
             )
         ):
             return release_rids
-        return (
-            _PP_RELEASE_PAYLOAD_V1,
-            list(release_rids or []),
+        ack_blob = self._pp_encode_frontier_ack_blob(
             launch_ack_mb_id,
-            tuple(launch_ack_rids or ()),
+            launch_ack_rids,
             launch_ack_barrier_rid,
+        )
+        return (
+            _PP_RELEASE_PAYLOAD_V2,
+            list(release_rids or []),
+            ack_blob,
         )
 
     def _pp_unpack_release_payload(
@@ -351,6 +420,15 @@ class SchedulerPPMixin:
     ) -> Tuple[Optional[List[str]], Optional[int], tuple[str, ...], Optional[str]]:
         if payload is None:
             return None, None, (), None
+        if (
+            isinstance(payload, tuple)
+            and len(payload) == 3
+            and payload[0] == _PP_RELEASE_PAYLOAD_V2
+        ):
+            ack_mb_id, ack_rids, ack_barrier_rid = self._pp_decode_frontier_ack_blob(
+                payload[2]
+            )
+            return payload[1], ack_mb_id, ack_rids, ack_barrier_rid
         if (
             isinstance(payload, tuple)
             and len(payload) == 5
