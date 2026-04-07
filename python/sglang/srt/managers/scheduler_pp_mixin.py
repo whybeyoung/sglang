@@ -552,13 +552,6 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
                     self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            self._pp_build_req_payload(recv_reqs),
-                            async_send=True,
-                        )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self._pp_apply_hicache_sync_before_batch()
                     self.mbs[mb_id] = self.get_next_batch_to_run()
@@ -601,6 +594,12 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            self._pp_build_req_payload(recv_reqs),
+                            async_send=True,
+                        )
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(self.launch_event)
                         with torch.profiler.record_function(
@@ -724,9 +723,6 @@ class SchedulerPPMixin:
                     inflight_queue=self.disagg_prefill_inflight_queue,
                 )
 
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids(mb_id)
                 bmbs[mb_id] = bootstrapped_rids
                 if bootstrapped_rids[0] or bootstrapped_rids[1]:
@@ -736,10 +732,7 @@ class SchedulerPPMixin:
                         boot_good=self._pp_prefill_diag_rids(bootstrapped_rids[0]),
                         boot_bad=self._pp_prefill_diag_rids(bootstrapped_rids[1]),
                     )
-                self._pp_commit_comm_work(send_bootstrapped_work)
-
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
                 if transferred_rids:
                     self._pp_prefill_diag_log(
@@ -1002,12 +995,15 @@ class SchedulerPPMixin:
                     # Consume this microbatch's release consensus exactly once.
                     tmbs[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         self._pp_build_req_payload(recv_reqs), async_send=True
                     )
+                    self._pp_commit_comm_work(send_bootstrapped_work)
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
+                    self._pp_commit_comm_work(send_transfer_work)
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -1065,21 +1061,15 @@ class SchedulerPPMixin:
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
 
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-
                 # reaching consensus through PP ranks
                 retract_rids = self._pp_pd_get_retract_ids(mb_id)
                 rmbs[mb_id] = retract_rids
-                self._pp_commit_comm_work(send_retract_work)
 
                 prealloc_rids = self._pp_pd_get_prealloc_ids()
                 pmbs[mb_id] = prealloc_rids
-                self._pp_commit_comm_work(send_prealloc_work)
 
                 transferred_rids = self._pp_pd_get_decode_transferred_ids()
                 tmbs[mb_id] = transferred_rids
-                self._pp_commit_comm_work(send_transfer_work)
 
                 # get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
@@ -1180,15 +1170,19 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
+                    self._pp_commit_comm_work(send_retract_work)
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
                     )
+                    self._pp_commit_comm_work(send_prealloc_work)
                     send_prealloc_work = self._pp_send_pyobj_to_next_stage(
                         prealloc_rids, async_send=True
                     )
+                    self._pp_commit_comm_work(send_transfer_work)
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
