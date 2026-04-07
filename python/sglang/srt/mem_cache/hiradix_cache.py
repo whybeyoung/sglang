@@ -1031,6 +1031,9 @@ class HiRadixCache(RadixCache):
     def _pp_write_backup_replay_enabled(self) -> bool:
         return os.getenv("SGLANG_ENABLE_PP_WRITE_BACKUP_REPLAY", "1") == "1"
 
+    def _hicache_verbose_enabled(self) -> bool:
+        return os.getenv("SGLANG_DEBUG_HICACHE_VERBOSE", "0") == "1"
+
     def _pp_should_skip_large_shallow_prefetch(
         self, last_host_node: TreeNode, prefetch_length: int
     ) -> bool:
@@ -1064,16 +1067,17 @@ class HiRadixCache(RadixCache):
         # for the lifetime of the process.
         if self.pp_rank >= self.pp_size - 1:
             return
-        logger.warning(
-            "[HiCachePPEvent][emit] pp=%s cp=%s seq=%s kind=%s rid=%s loaded=%s outgoing_before=%s",
-            self.pp_rank,
-            self.attn_cp_rank,
-            event.seq,
-            event.kind,
-            event.rid,
-            event.loaded_from_storage,
-            len(self.pp_outgoing_host_tree_events),
-        )
+        if self._hicache_verbose_enabled():
+            logger.warning(
+                "[HiCachePPEvent][emit] pp=%s cp=%s seq=%s kind=%s rid=%s loaded=%s outgoing_before=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                event.seq,
+                event.kind,
+                event.rid,
+                event.loaded_from_storage,
+                len(self.pp_outgoing_host_tree_events),
+            )
         self.pp_outgoing_host_tree_events.append(_encode_pp_host_tree_wire_event(event))
 
     def _next_pp_host_tree_seq(self) -> int:
@@ -1083,7 +1087,7 @@ class HiRadixCache(RadixCache):
     def consume_pp_host_tree_events(self) -> List[dict[str, Any]]:
         events = list(self.pp_outgoing_host_tree_events)
         self.pp_outgoing_host_tree_events.clear()
-        if events:
+        if events and self._hicache_verbose_enabled():
             logger.warning(
                 "[HiCachePPEvent][consume] pp=%s cp=%s count=%s events=%s",
                 self.pp_rank,
@@ -1106,24 +1110,25 @@ class HiRadixCache(RadixCache):
     def enqueue_pp_host_tree_events(self, events: List[dict[str, Any]]) -> None:
         if not self._pp_downstream_sync_enabled() or not events:
             return
-        logger.warning(
-            "[HiCachePPEvent][enqueue] pp=%s cp=%s count=%s pending_before=%s events=%s",
-            self.pp_rank,
-            self.attn_cp_rank,
-            len(events),
-            len(self.pp_pending_host_tree_events),
-            [
-                (
-                    decoded.seq,
-                    decoded.kind,
-                    decoded.rid,
-                    decoded.loaded_from_storage,
-                )
-                for decoded in [
-                    _decode_pp_host_tree_wire_event(event) for event in events[:8]
-                ]
-            ],
-        )
+        if self._hicache_verbose_enabled():
+            logger.warning(
+                "[HiCachePPEvent][enqueue] pp=%s cp=%s count=%s pending_before=%s events=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                len(events),
+                len(self.pp_pending_host_tree_events),
+                [
+                    (
+                        decoded.seq,
+                        decoded.kind,
+                        decoded.rid,
+                        decoded.loaded_from_storage,
+                    )
+                    for decoded in [
+                        _decode_pp_host_tree_wire_event(event) for event in events[:8]
+                    ]
+                ],
+            )
         for event in events:
             decoded = _decode_pp_host_tree_wire_event(event)
             if (
@@ -1153,7 +1158,7 @@ class HiRadixCache(RadixCache):
             self.pp_staged_prefetch_skip_req_ids.add(req_id)
             staged_rids.append(req_id)
 
-        if staged_rids:
+        if staged_rids and self._hicache_verbose_enabled():
             logger.warning(
                 "[HiCachePPEvent][stage_prefetch_skip] pp=%s cp=%s count=%s rids=%s",
                 self.pp_rank,
@@ -1621,46 +1626,50 @@ class HiRadixCache(RadixCache):
                         finish_event, ack_list, emit_event=True
                     )
                     self._write_backup_replay_apply_local_ack += 1
-                    logger.warning(
-                        "[HiCachePPEvent][replay_apply_write_backup] pp=%s cp=%s seq=%s source=local_ack rid=%s nodes=%s",
-                        self.pp_rank,
-                        self.attn_cp_rank,
-                        event.seq,
-                        event.rid,
-                        len(ack_list),
-                    )
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePPEvent][replay_apply_write_backup] pp=%s cp=%s seq=%s source=local_ack rid=%s nodes=%s",
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            event.seq,
+                            event.rid,
+                            len(ack_list),
+                        )
                     return True
             else:
                 _record_miss()
+                if self._hicache_verbose_enabled():
+                    logger.warning(
+                        "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=ack_not_ready ack_head=%s ongoing_write=%s event_nodes=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        event.seq,
+                        ack_list[:8],
+                        len(self.ongoing_write_through),
+                        len(event.node_key_lens),
+                    )
+        else:
+            _record_miss()
+            if self._hicache_verbose_enabled():
                 logger.warning(
-                    "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=ack_not_ready ack_head=%s ongoing_write=%s event_nodes=%s",
+                    "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=no_ack_queue ongoing_write=%s event_nodes=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     event.seq,
-                    ack_list[:8],
                     len(self.ongoing_write_through),
                     len(event.node_key_lens),
                 )
-        else:
-            _record_miss()
-            logger.warning(
-                "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=no_ack_queue ongoing_write=%s event_nodes=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                event.seq,
-                len(self.ongoing_write_through),
-                len(event.node_key_lens),
-            )
 
         if not event.node_key_lens:
             _record_miss()
-            logger.warning(
-                "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=empty_event_nodes ongoing_write=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                event.seq,
-                len(self.ongoing_write_through),
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=empty_event_nodes ongoing_write=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    event.seq,
+                    len(self.ongoing_write_through),
+                )
             return False
 
         ack_list = None
@@ -1693,23 +1702,24 @@ class HiRadixCache(RadixCache):
         if ack_list is None or nodes is None:
             sample_nodes = list(self.ongoing_write_through.items())[:4]
             _record_miss()
-            logger.warning(
-                "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=no_matching_nodes event_key_lens=%s event_hashes=%s sample_ongoing=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                event.seq,
-                event.node_key_lens[:8],
-                event.node_last_hashes[:4],
-                [
-                    (
-                        node_id,
-                        len(node.key),
-                        node.get_last_hash_value(),
-                        node.key.extra_key,
-                    )
-                    for node_id, node in sample_nodes
-                ],
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=no_matching_nodes event_key_lens=%s event_hashes=%s sample_ongoing=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    event.seq,
+                    event.node_key_lens[:8],
+                    event.node_last_hashes[:4],
+                    [
+                        (
+                            node_id,
+                            len(node.key),
+                            node.get_last_hash_value(),
+                            node.key.extra_key,
+                        )
+                        for node_id, node in sample_nodes
+                    ],
+                )
             return False
 
         if removed_ack_idx is not None:
@@ -1720,15 +1730,16 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(backuped_node)
 
         self._write_backup_replay_apply_authoritative += 1
-        logger.warning(
-            "[HiCachePPEvent][replay_apply_write_backup] pp=%s cp=%s seq=%s source=authoritative_event rid=%s nodes=%s removed_ack=%s",
-            self.pp_rank,
-            self.attn_cp_rank,
-            event.seq,
-            event.rid,
-            len(event.node_ids),
-            removed_ack_idx is not None,
-        )
+        if self._hicache_verbose_enabled():
+            logger.warning(
+                "[HiCachePPEvent][replay_apply_write_backup] pp=%s cp=%s seq=%s source=authoritative_event rid=%s nodes=%s removed_ack=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                event.seq,
+                event.rid,
+                len(event.node_ids),
+                removed_ack_idx is not None,
+            )
         return True
 
     def _finalize_prefetch_progress(
@@ -1851,23 +1862,25 @@ class HiRadixCache(RadixCache):
                 self.zero_hit_prefetch_req_ids.discard(req_id)
                 self.discard_pp_locally_revoked_req(req_id)
                 self.pp_retry_prefetch_req_ids.add(req_id)
+                if self._hicache_verbose_enabled():
+                    logger.warning(
+                        "[HiCachePPEvent][replay_mark_retry_prefetch] pp=%s cp=%s seq=%s rid=%s loaded=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        event.seq,
+                        req_id,
+                        event.loaded_from_storage,
+                    )
+            if self._hicache_verbose_enabled():
                 logger.warning(
-                    "[HiCachePPEvent][replay_mark_retry_prefetch] pp=%s cp=%s seq=%s rid=%s loaded=%s",
+                    "[HiCachePPEvent][replay_drop_stale_finalize] pp=%s cp=%s seq=%s rid=%s loaded=%s zero_hit=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     event.seq,
                     req_id,
                     event.loaded_from_storage,
+                    req_id in self.zero_hit_prefetch_req_ids,
                 )
-            logger.warning(
-                "[HiCachePPEvent][replay_drop_stale_finalize] pp=%s cp=%s seq=%s rid=%s loaded=%s zero_hit=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                event.seq,
-                req_id,
-                event.loaded_from_storage,
-                req_id in self.zero_hit_prefetch_req_ids,
-            )
             return True
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[req_id]
         if operation.host_indices is None:
@@ -1928,15 +1941,16 @@ class HiRadixCache(RadixCache):
                     and not self._pp_write_backup_replay_enabled()
                 ):
                     self.pp_pending_host_tree_events.popleft()
-                    logger.warning(
-                        "[HiCachePPEvent][replay_skip] pp=%s cp=%s seq=%s kind=%s rid=%s reason=write_backup_replay_disabled pending_after=%s",
-                        self.pp_rank,
-                        self.attn_cp_rank,
-                        event.seq,
-                        event.kind,
-                        event.rid,
-                        len(self.pp_pending_host_tree_events),
-                    )
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePPEvent][replay_skip] pp=%s cp=%s seq=%s kind=%s rid=%s reason=write_backup_replay_disabled pending_after=%s",
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            event.seq,
+                            event.kind,
+                            event.rid,
+                            len(self.pp_pending_host_tree_events),
+                        )
                     replayed += 1
                     continue
                 progressed = False
@@ -1949,8 +1963,23 @@ class HiRadixCache(RadixCache):
                 elif event.kind == "PREFETCH_FINALIZE":
                     progressed = self._try_replay_prefetch_finalize_event(event)
                 if not progressed:
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePPEvent][replay_blocked] pp=%s cp=%s seq=%s kind=%s rid=%s pending=%s ongoing=%s zero_hit=%s",
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            event.seq,
+                            event.kind,
+                            event.rid,
+                            len(self.pp_pending_host_tree_events),
+                            event.rid in self.ongoing_prefetch if event.rid is not None else False,
+                            event.rid in self.zero_hit_prefetch_req_ids if event.rid is not None else False,
+                        )
+                    break
+                self.pp_pending_host_tree_events.popleft()
+                if self._hicache_verbose_enabled():
                     logger.warning(
-                        "[HiCachePPEvent][replay_blocked] pp=%s cp=%s seq=%s kind=%s rid=%s pending=%s ongoing=%s zero_hit=%s",
+                        "[HiCachePPEvent][replay_applied] pp=%s cp=%s seq=%s kind=%s rid=%s pending_after=%s ongoing=%s zero_hit=%s loaded=%s",
                         self.pp_rank,
                         self.attn_cp_rank,
                         event.seq,
@@ -1959,23 +1988,10 @@ class HiRadixCache(RadixCache):
                         len(self.pp_pending_host_tree_events),
                         event.rid in self.ongoing_prefetch if event.rid is not None else False,
                         event.rid in self.zero_hit_prefetch_req_ids if event.rid is not None else False,
+                        self.prefetch_loaded_tokens_by_reqid.get(event.rid, 0)
+                        if event.rid is not None
+                        else 0,
                     )
-                    break
-                self.pp_pending_host_tree_events.popleft()
-                logger.warning(
-                    "[HiCachePPEvent][replay_applied] pp=%s cp=%s seq=%s kind=%s rid=%s pending_after=%s ongoing=%s zero_hit=%s loaded=%s",
-                    self.pp_rank,
-                    self.attn_cp_rank,
-                    event.seq,
-                    event.kind,
-                    event.rid,
-                    len(self.pp_pending_host_tree_events),
-                    event.rid in self.ongoing_prefetch if event.rid is not None else False,
-                    event.rid in self.zero_hit_prefetch_req_ids if event.rid is not None else False,
-                    self.prefetch_loaded_tokens_by_reqid.get(event.rid, 0)
-                    if event.rid is not None
-                    else 0,
-                )
                 replayed += 1
         finally:
             self._in_pp_host_tree_replay = False
@@ -2004,12 +2020,13 @@ class HiRadixCache(RadixCache):
             if event.kind == "REVOKE" and event.rid == req_id:
                 if self._try_replay_revoke_event(event):
                     self.pp_pending_host_tree_events.remove(event)
-                    logger.warning(
-                        "[HiCachePPReplay][revoke_fast_apply] rid=%s skipped_unrelated_finalize=%s skipped_unrelated_revoke=%s",
-                        req_id,
-                        skipped_unrelated_finalize,
-                        skipped_unrelated_revoke,
-                    )
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePPReplay][revoke_fast_apply] rid=%s skipped_unrelated_finalize=%s skipped_unrelated_revoke=%s",
+                            req_id,
+                            skipped_unrelated_finalize,
+                            skipped_unrelated_revoke,
+                        )
                     return True
                 return False
             return False
@@ -2074,30 +2091,32 @@ class HiRadixCache(RadixCache):
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
-            logger.warning(
-                "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s key_len=%s last_hash=%s extra_key=%s write_back=%s ongoing_write=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                node.id,
-                len(node.key),
-                node.get_last_hash_value(),
-                node.key.extra_key,
-                write_back,
-                len(self.ongoing_write_through),
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s key_len=%s last_hash=%s extra_key=%s write_back=%s ongoing_write=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    node.id,
+                    len(node.key),
+                    node.get_last_hash_value(),
+                    node.key.extra_key,
+                    write_back,
+                    len(self.ongoing_write_through),
+                )
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
         else:
-            logger.warning(
-                "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s action=alloc_failed key_len=%s last_hash=%s extra_key=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                node.id,
-                len(node.key),
-                node.get_last_hash_value(),
-                node.key.extra_key,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s action=alloc_failed key_len=%s last_hash=%s extra_key=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    node.id,
+                    len(node.key),
+                    node.get_last_hash_value(),
+                    node.key.extra_key,
+                )
             return 0
 
         return len(host_indices)
@@ -2574,47 +2593,53 @@ class HiRadixCache(RadixCache):
             if req_id not in self.ongoing_prefetch:
                 # The ordered PP replay may have already revoked/finalized this request
                 # on the local rank. Treat it as completed for the scheduler path.
-                logger.warning(
-                    "[HiCachePrefetchWaitResolved] rid=%s reason=pp_replay_removed_ongoing",
-                    req_id,
-                )
+                if self._hicache_verbose_enabled():
+                    logger.warning(
+                        "[HiCachePrefetchWaitResolved] rid=%s reason=pp_replay_removed_ongoing",
+                        req_id,
+                    )
                 return True
             if self._try_fast_forward_revoke_for_req(req_id):
                 if req_id not in self.ongoing_prefetch:
-                    logger.warning(
-                        "[HiCachePrefetchWaitResolved] rid=%s reason=fast_forward_revoke",
-                        req_id,
-                    )
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePrefetchWaitResolved] rid=%s reason=fast_forward_revoke",
+                            req_id,
+                        )
                     return True
             event = self._peek_pp_host_tree_event()
             if event is not None:
                 if event.kind == "WRITE_BACKUP_COMMITTED":
-                    logger.warning(
-                        "[HiCachePrefetchWaitPass] rid=%s reason=unrelated_write_backup_pending event_seq=%s",
-                        req_id,
-                        event.seq,
-                    )
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePrefetchWaitPass] rid=%s reason=unrelated_write_backup_pending event_seq=%s",
+                            req_id,
+                            event.seq,
+                        )
                 elif event.kind != "PREFETCH_FINALIZE":
-                    logger.warning(
-                        "[HiCachePrefetchWaitBlocked] rid=%s reason=pending_pp_event event_kind=%s event_rid=%s",
-                        req_id,
-                        event.kind,
-                        event.rid,
-                    )
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePrefetchWaitBlocked] rid=%s reason=pending_pp_event event_kind=%s event_rid=%s",
+                            req_id,
+                            event.kind,
+                            event.rid,
+                        )
                     return False
                 if event.rid == req_id:
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePrefetchWaitBlocked] rid=%s reason=matching_prefetch_finalize_pending event_kind=%s event_rid=%s",
+                            req_id,
+                            event.kind,
+                            event.rid,
+                        )
+                    return False
+                if self._hicache_verbose_enabled():
                     logger.warning(
-                        "[HiCachePrefetchWaitBlocked] rid=%s reason=matching_prefetch_finalize_pending event_kind=%s event_rid=%s",
+                        "[HiCachePrefetchWaitPass] rid=%s reason=unrelated_prefetch_finalize_pending event_rid=%s",
                         req_id,
-                        event.kind,
                         event.rid,
                     )
-                    return False
-                logger.warning(
-                    "[HiCachePrefetchWaitPass] rid=%s reason=unrelated_prefetch_finalize_pending event_rid=%s",
-                    req_id,
-                    event.rid,
-                )
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
@@ -2628,20 +2653,21 @@ class HiRadixCache(RadixCache):
 
         if not self.can_terminate_prefetch(operation):
             debug_state = self._get_prefetch_progress_debug(req_id)
-            logger.warning(
-                "[HiCacheEmptyPrefetchState] rid=%s zero_hit_marked=%s replay_pending=%s state=%s",
-                req_id,
-                req_id in self.zero_hit_prefetch_req_ids,
-                self._peek_pp_host_tree_event() is not None
-                if self._pp_downstream_sync_enabled()
-                else False,
-                debug_state,
-            )
-            logger.warning(
-                "[HiCachePrefetchWait] rid=%s state=%s",
-                req_id,
-                debug_state,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCacheEmptyPrefetchState] rid=%s zero_hit_marked=%s replay_pending=%s state=%s",
+                    req_id,
+                    req_id in self.zero_hit_prefetch_req_ids,
+                    self._peek_pp_host_tree_event() is not None
+                    if self._pp_downstream_sync_enabled()
+                    else False,
+                    debug_state,
+                )
+                logger.warning(
+                    "[HiCachePrefetchWait] rid=%s state=%s",
+                    req_id,
+                    debug_state,
+                )
             return False
         self._finalize_prefetch_progress(req_id, operation, emit_event=True)
         if self._pp_downstream_sync_enabled():
