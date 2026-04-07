@@ -97,6 +97,9 @@ class PPHostTreeEvent:
     node_key_lens: List[int] = field(default_factory=list)
     node_last_hashes: List[Optional[str]] = field(default_factory=list)
     node_extra_keys: List[Optional[str]] = field(default_factory=list)
+    node_parent_key_lens: List[int] = field(default_factory=list)
+    node_parent_last_hashes: List[Optional[str]] = field(default_factory=list)
+    node_parent_extra_keys: List[Optional[str]] = field(default_factory=list)
 
 
 class HiRadixCache(RadixCache):
@@ -782,6 +785,9 @@ class HiRadixCache(RadixCache):
                 "node_key_lens": list(event.node_key_lens),
                 "node_last_hashes": list(event.node_last_hashes),
                 "node_extra_keys": list(event.node_extra_keys),
+                "node_parent_key_lens": list(event.node_parent_key_lens),
+                "node_parent_last_hashes": list(event.node_parent_last_hashes),
+                "node_parent_extra_keys": list(event.node_parent_extra_keys),
             }
         )
 
@@ -845,6 +851,15 @@ class HiRadixCache(RadixCache):
                     node_key_lens=[int(v) for v in event.get("node_key_lens", [])],
                     node_last_hashes=list(event.get("node_last_hashes", [])),
                     node_extra_keys=list(event.get("node_extra_keys", [])),
+                    node_parent_key_lens=[
+                        int(v) for v in event.get("node_parent_key_lens", [])
+                    ],
+                    node_parent_last_hashes=list(
+                        event.get("node_parent_last_hashes", [])
+                    ),
+                    node_parent_extra_keys=list(
+                        event.get("node_parent_extra_keys", [])
+                    ),
                 )
             )
 
@@ -908,13 +923,10 @@ class HiRadixCache(RadixCache):
         event = self._peek_pp_host_tree_event()
         return event is not None and event.kind == "WRITE_BACKUP_COMMITTED"
 
-    def _write_backup_event_affects_node_path(
-        self, event: PPHostTreeEvent, last_node: Optional[TreeNode]
-    ) -> bool:
-        if event.kind != "WRITE_BACKUP_COMMITTED" or last_node is None:
-            return False
-
-        path_meta = set()
+    def _collect_node_path_meta(
+        self, last_node: Optional[TreeNode]
+    ) -> set[tuple[int, Optional[str], Optional[str]]]:
+        path_meta: set[tuple[int, Optional[str], Optional[str]]] = set()
         walk_node = last_node
         while walk_node is not None and walk_node is not self.root_node:
             path_meta.add(
@@ -925,6 +937,18 @@ class HiRadixCache(RadixCache):
                 )
             )
             walk_node = walk_node.parent
+        return path_meta
+
+    def _write_backup_event_affects_req(self, event: PPHostTreeEvent, req) -> bool:
+        if event.kind != "WRITE_BACKUP_COMMITTED":
+            return False
+
+        path_meta = self._collect_node_path_meta(getattr(req, "last_node", None))
+        path_meta.update(
+            self._collect_node_path_meta(getattr(req, "last_host_node", None))
+        )
+        if not path_meta:
+            return False
 
         for idx, key_len in enumerate(event.node_key_lens):
             node_meta = (
@@ -934,20 +958,26 @@ class HiRadixCache(RadixCache):
             )
             if node_meta in path_meta:
                 return True
+
+            if idx < len(event.node_parent_key_lens):
+                parent_meta = (
+                    event.node_parent_key_lens[idx],
+                    event.node_parent_last_hashes[idx],
+                    event.node_parent_extra_keys[idx],
+                )
+                if parent_meta in path_meta:
+                    return True
         return False
 
     def has_pending_pp_write_backup_event_for_req(self, req) -> bool:
         if not self._pp_write_backup_replay_enabled():
             return False
-        event = self._peek_pp_host_tree_event()
-        if event is None or event.kind != "WRITE_BACKUP_COMMITTED":
-            return False
-
-        last_node = getattr(req, "last_node", None)
-        if self._write_backup_event_affects_node_path(event, last_node):
-            return True
-        last_host_node = getattr(req, "last_host_node", None)
-        return self._write_backup_event_affects_node_path(event, last_host_node)
+        for event in self.pp_pending_host_tree_events:
+            if event.kind != "WRITE_BACKUP_COMMITTED":
+                break
+            if self._write_backup_event_affects_req(event, req):
+                return True
+        return False
 
     def consume_pp_retry_prefetch_req(self, req_id: str) -> bool:
         if req_id not in self.pp_retry_prefetch_req_ids:
@@ -1276,6 +1306,24 @@ class HiRadixCache(RadixCache):
                         node.get_last_hash_value() for node in committed_nodes
                     ],
                     node_extra_keys=[node.key.extra_key for node in committed_nodes],
+                    node_parent_key_lens=[
+                        len(node.parent.key)
+                        if node.parent is not None and node.parent.key is not None
+                        else 0
+                        for node in committed_nodes
+                    ],
+                    node_parent_last_hashes=[
+                        node.parent.get_last_hash_value()
+                        if node.parent is not None
+                        else None
+                        for node in committed_nodes
+                    ],
+                    node_parent_extra_keys=[
+                        node.parent.key.extra_key
+                        if node.parent is not None and node.parent.key is not None
+                        else None
+                        for node in committed_nodes
+                    ],
                 )
             )
 
