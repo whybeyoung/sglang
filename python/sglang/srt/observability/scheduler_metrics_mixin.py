@@ -121,6 +121,29 @@ class SchedulerMetricsMixin:
         self._prefill_post_calls = 0
         self._prefill_post_total_ms = 0.0
         self._prefill_post_max_ms = 0.0
+        self._pp_comm_send_calls = 0
+        self._pp_comm_send_total_ms = 0.0
+        self._pp_comm_send_max_ms = 0.0
+        self._pp_comm_recv_calls = 0
+        self._pp_comm_recv_total_ms = 0.0
+        self._pp_comm_recv_max_ms = 0.0
+        self._pp_comm_tp_bcast_calls = 0
+        self._pp_comm_tp_bcast_total_ms = 0.0
+        self._pp_comm_tp_bcast_max_ms = 0.0
+        self._pp_comm_cp_bcast_calls = 0
+        self._pp_comm_cp_bcast_total_ms = 0.0
+        self._pp_comm_cp_bcast_max_ms = 0.0
+        self._pp_comm_wait_calls = 0
+        self._pp_comm_wait_total_ms = 0.0
+        self._pp_comm_wait_max_ms = 0.0
+        self._pp_frontier_ack_recv_count = 0
+        self._pp_frontier_ack_activate_count = 0
+        self._pp_frontier_ack_consume_count = 0
+        self._pp_frontier_ack_consume_miss_count = 0
+        self._pp_frontier_ack_pending_same_mb_miss_count = 0
+        self._pp_frontier_ack_chunked_mismatch_count = 0
+        self._pp_frontier_ack_waiting_mismatch_count = 0
+        self._pp_frontier_ack_exhausted_count = 0
 
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
@@ -372,6 +395,60 @@ class SchedulerMetricsMixin:
         self._prefill_post_total_ms += elapsed_ms
         self._prefill_post_max_ms = max(self._prefill_post_max_ms, elapsed_ms)
 
+    def _record_pp_comm_send_timing(self: Scheduler, elapsed_ms: float):
+        self._pp_comm_send_calls += 1
+        self._pp_comm_send_total_ms += elapsed_ms
+        self._pp_comm_send_max_ms = max(self._pp_comm_send_max_ms, elapsed_ms)
+
+    def _record_pp_comm_recv_timing(self: Scheduler, elapsed_ms: float):
+        self._pp_comm_recv_calls += 1
+        self._pp_comm_recv_total_ms += elapsed_ms
+        self._pp_comm_recv_max_ms = max(self._pp_comm_recv_max_ms, elapsed_ms)
+
+    def _record_pp_comm_tp_bcast_timing(self: Scheduler, elapsed_ms: float):
+        self._pp_comm_tp_bcast_calls += 1
+        self._pp_comm_tp_bcast_total_ms += elapsed_ms
+        self._pp_comm_tp_bcast_max_ms = max(
+            self._pp_comm_tp_bcast_max_ms, elapsed_ms
+        )
+
+    def _record_pp_comm_cp_bcast_timing(self: Scheduler, elapsed_ms: float):
+        self._pp_comm_cp_bcast_calls += 1
+        self._pp_comm_cp_bcast_total_ms += elapsed_ms
+        self._pp_comm_cp_bcast_max_ms = max(
+            self._pp_comm_cp_bcast_max_ms, elapsed_ms
+        )
+
+    def _record_pp_comm_wait_timing(self: Scheduler, elapsed_ms: float):
+        self._pp_comm_wait_calls += 1
+        self._pp_comm_wait_total_ms += elapsed_ms
+        self._pp_comm_wait_max_ms = max(self._pp_comm_wait_max_ms, elapsed_ms)
+
+    def _record_pp_frontier_ack_recv(self: Scheduler):
+        self._pp_frontier_ack_recv_count += 1
+
+    def _record_pp_frontier_ack_activate(self: Scheduler):
+        self._pp_frontier_ack_activate_count += 1
+
+    def _record_pp_frontier_ack_consume(self: Scheduler):
+        self._pp_frontier_ack_consume_count += 1
+
+    def _record_pp_frontier_ack_consume_miss(
+        self: Scheduler, pending_same_mb: bool = False
+    ):
+        self._pp_frontier_ack_consume_miss_count += 1
+        if pending_same_mb:
+            self._pp_frontier_ack_pending_same_mb_miss_count += 1
+
+    def _record_pp_frontier_ack_chunked_mismatch(self: Scheduler):
+        self._pp_frontier_ack_chunked_mismatch_count += 1
+
+    def _record_pp_frontier_ack_waiting_mismatch(self: Scheduler):
+        self._pp_frontier_ack_waiting_mismatch_count += 1
+
+    def _record_pp_frontier_ack_exhausted(self: Scheduler):
+        self._pp_frontier_ack_exhausted_count += 1
+
     def consume_prefill_stage_perf_snapshot(self: Scheduler) -> dict[str, float]:
         def _avg(total: float, calls: int) -> float:
             return total / calls if calls else 0.0
@@ -412,6 +489,69 @@ class SchedulerMetricsMixin:
         self._prefill_post_calls = 0
         self._prefill_post_total_ms = 0.0
         self._prefill_post_max_ms = 0.0
+        return snapshot
+
+    def consume_pp_comm_perf_snapshot(self: Scheduler) -> dict[str, float]:
+        def _avg(total: float, calls: int) -> float:
+            return total / calls if calls else 0.0
+
+        snapshot = {
+            "send_calls": self._pp_comm_send_calls,
+            "send_avg_ms": _avg(self._pp_comm_send_total_ms, self._pp_comm_send_calls),
+            "send_max_ms": self._pp_comm_send_max_ms,
+            "recv_calls": self._pp_comm_recv_calls,
+            "recv_avg_ms": _avg(self._pp_comm_recv_total_ms, self._pp_comm_recv_calls),
+            "recv_max_ms": self._pp_comm_recv_max_ms,
+            "tp_bcast_calls": self._pp_comm_tp_bcast_calls,
+            "tp_bcast_avg_ms": _avg(
+                self._pp_comm_tp_bcast_total_ms, self._pp_comm_tp_bcast_calls
+            ),
+            "tp_bcast_max_ms": self._pp_comm_tp_bcast_max_ms,
+            "cp_bcast_calls": self._pp_comm_cp_bcast_calls,
+            "cp_bcast_avg_ms": _avg(
+                self._pp_comm_cp_bcast_total_ms, self._pp_comm_cp_bcast_calls
+            ),
+            "cp_bcast_max_ms": self._pp_comm_cp_bcast_max_ms,
+            "wait_calls": self._pp_comm_wait_calls,
+            "wait_avg_ms": _avg(self._pp_comm_wait_total_ms, self._pp_comm_wait_calls),
+            "wait_max_ms": self._pp_comm_wait_max_ms,
+        }
+        self._pp_comm_send_calls = 0
+        self._pp_comm_send_total_ms = 0.0
+        self._pp_comm_send_max_ms = 0.0
+        self._pp_comm_recv_calls = 0
+        self._pp_comm_recv_total_ms = 0.0
+        self._pp_comm_recv_max_ms = 0.0
+        self._pp_comm_tp_bcast_calls = 0
+        self._pp_comm_tp_bcast_total_ms = 0.0
+        self._pp_comm_tp_bcast_max_ms = 0.0
+        self._pp_comm_cp_bcast_calls = 0
+        self._pp_comm_cp_bcast_total_ms = 0.0
+        self._pp_comm_cp_bcast_max_ms = 0.0
+        self._pp_comm_wait_calls = 0
+        self._pp_comm_wait_total_ms = 0.0
+        self._pp_comm_wait_max_ms = 0.0
+        return snapshot
+
+    def consume_pp_frontier_ack_snapshot(self: Scheduler) -> dict[str, int]:
+        snapshot = {
+            "recv": self._pp_frontier_ack_recv_count,
+            "activate": self._pp_frontier_ack_activate_count,
+            "consume": self._pp_frontier_ack_consume_count,
+            "consume_miss": self._pp_frontier_ack_consume_miss_count,
+            "pending_same_mb_miss": self._pp_frontier_ack_pending_same_mb_miss_count,
+            "chunked_mismatch": self._pp_frontier_ack_chunked_mismatch_count,
+            "waiting_mismatch": self._pp_frontier_ack_waiting_mismatch_count,
+            "ack_exhausted": self._pp_frontier_ack_exhausted_count,
+        }
+        self._pp_frontier_ack_recv_count = 0
+        self._pp_frontier_ack_activate_count = 0
+        self._pp_frontier_ack_consume_count = 0
+        self._pp_frontier_ack_consume_miss_count = 0
+        self._pp_frontier_ack_pending_same_mb_miss_count = 0
+        self._pp_frontier_ack_chunked_mismatch_count = 0
+        self._pp_frontier_ack_waiting_mismatch_count = 0
+        self._pp_frontier_ack_exhausted_count = 0
         return snapshot
 
     def report_prefill_stats(
@@ -878,6 +1018,16 @@ class SchedulerMetricsMixin:
             if hasattr(self, "consume_prefill_stage_perf_snapshot")
             else {}
         )
+        pp_comm_perf = (
+            self.consume_pp_comm_perf_snapshot()
+            if hasattr(self, "consume_pp_comm_perf_snapshot")
+            else {}
+        )
+        pp_frontier_ack = (
+            self.consume_pp_frontier_ack_snapshot()
+            if hasattr(self, "consume_pp_frontier_ack_snapshot")
+            else {}
+        )
         tree_churn = (
             tc.consume_tree_churn_snapshot()
             if hasattr(tc, "consume_tree_churn_snapshot")
@@ -927,6 +1077,14 @@ class SchedulerMetricsMixin:
             "prefill_forward_calls=%s prefill_forward_avg_ms=%.3f prefill_forward_max_ms=%.3f "
             "prefill_copy_wait_calls=%s prefill_copy_wait_avg_ms=%.3f prefill_copy_wait_max_ms=%.3f "
             "prefill_post_calls=%s prefill_post_avg_ms=%.3f prefill_post_max_ms=%.3f "
+            "pp_send_calls=%s pp_send_avg_ms=%.3f pp_send_max_ms=%.3f "
+            "pp_recv_calls=%s pp_recv_avg_ms=%.3f pp_recv_max_ms=%.3f "
+            "pp_tp_bcast_calls=%s pp_tp_bcast_avg_ms=%.3f pp_tp_bcast_max_ms=%.3f "
+            "pp_cp_bcast_calls=%s pp_cp_bcast_avg_ms=%.3f pp_cp_bcast_max_ms=%.3f "
+            "pp_wait_calls=%s pp_wait_avg_ms=%.3f pp_wait_max_ms=%.3f "
+            "ack_recv=%s ack_activate=%s ack_consume=%s ack_consume_miss=%s "
+            "ack_pending_same_mb_miss=%s ack_chunked_mismatch=%s "
+            "ack_waiting_mismatch=%s ack_exhausted=%s ack_pending_slots=%s ack_active_slots=%s "
             "wb_barrier_hits=%s wb_replay_local=%s wb_replay_auth=%s wb_replay_miss=%s "
             "wb_pending=%s wb_commit_nodes=%s wb_event_count=%s wb_event_avg_nodes=%.2f "
             "wb_event_max_nodes=%s wb_event_est_bytes=%s wb_event_avg_est_bytes=%.2f "
@@ -996,6 +1154,31 @@ class SchedulerMetricsMixin:
             prefill_stage_perf.get("post_calls", 0),
             prefill_stage_perf.get("post_avg_ms", 0.0),
             prefill_stage_perf.get("post_max_ms", 0.0),
+            pp_comm_perf.get("send_calls", 0),
+            pp_comm_perf.get("send_avg_ms", 0.0),
+            pp_comm_perf.get("send_max_ms", 0.0),
+            pp_comm_perf.get("recv_calls", 0),
+            pp_comm_perf.get("recv_avg_ms", 0.0),
+            pp_comm_perf.get("recv_max_ms", 0.0),
+            pp_comm_perf.get("tp_bcast_calls", 0),
+            pp_comm_perf.get("tp_bcast_avg_ms", 0.0),
+            pp_comm_perf.get("tp_bcast_max_ms", 0.0),
+            pp_comm_perf.get("cp_bcast_calls", 0),
+            pp_comm_perf.get("cp_bcast_avg_ms", 0.0),
+            pp_comm_perf.get("cp_bcast_max_ms", 0.0),
+            pp_comm_perf.get("wait_calls", 0),
+            pp_comm_perf.get("wait_avg_ms", 0.0),
+            pp_comm_perf.get("wait_max_ms", 0.0),
+            pp_frontier_ack.get("recv", 0),
+            pp_frontier_ack.get("activate", 0),
+            pp_frontier_ack.get("consume", 0),
+            pp_frontier_ack.get("consume_miss", 0),
+            pp_frontier_ack.get("pending_same_mb_miss", 0),
+            pp_frontier_ack.get("chunked_mismatch", 0),
+            pp_frontier_ack.get("waiting_mismatch", 0),
+            pp_frontier_ack.get("ack_exhausted", 0),
+            len(getattr(self, "pp_pending_launch_frontier_ack_by_mb", {})),
+            len(getattr(self, "pp_launch_frontier_ack_by_mb", {})),
             barrier_hits_delta,
             replay_perf.get("apply_local_ack", 0),
             replay_perf.get("apply_authoritative", 0),

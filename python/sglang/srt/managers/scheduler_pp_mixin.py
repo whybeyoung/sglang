@@ -461,6 +461,8 @@ class SchedulerPPMixin:
             "rids": ack_rids,
             "barrier_rid": ack_barrier_rid,
         }
+        if hasattr(self, "_record_pp_frontier_ack_recv"):
+            self._record_pp_frontier_ack_recv()
         if self._pp_prefill_diag_enabled():
             logger.warning(
                 "[PPPrefillDiag][launch_frontier_ack_recv] pp=%s cp=%s tp=%s mb=%s ack=%s barrier=%s",
@@ -480,6 +482,8 @@ class SchedulerPPMixin:
         ack = self.pp_launch_frontier_ack_by_mb.pop(mb_id, None)
         if ack is None:
             return None
+        if hasattr(self, "_record_pp_frontier_ack_consume"):
+            self._record_pp_frontier_ack_consume()
         return {
             "rids": ack.get("rids") or (),
             "barrier_rid": ack.get("barrier_rid"),
@@ -490,6 +494,8 @@ class SchedulerPPMixin:
         if pending_ack is None:
             return
         self.pp_launch_frontier_ack_by_mb[mb_id] = pending_ack
+        if hasattr(self, "_record_pp_frontier_ack_activate"):
+            self._record_pp_frontier_ack_activate()
         if self._pp_prefill_diag_enabled():
             logger.warning(
                 "[PPPrefillDiag][launch_frontier_ack_activate] pp=%s cp=%s tp=%s mb=%s ack=%s barrier=%s",
@@ -1992,9 +1998,13 @@ class SchedulerPPMixin:
         return send_release_work, release_rids
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
+        start = time.perf_counter()
         for p2p_work in work:
             p2p_work.work.wait()
         work.clear()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if elapsed_ms > 0 and hasattr(self, "_record_pp_comm_wait_timing"):
+            self._record_pp_comm_wait_timing(elapsed_ms)
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
@@ -2018,6 +2028,7 @@ class SchedulerPPMixin:
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+        start = time.perf_counter()
         p2p_work = []
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
@@ -2029,9 +2040,13 @@ class SchedulerPPMixin:
                 ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
                 async_send=async_send,
             )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if hasattr(self, "_record_pp_comm_send_timing"):
+            self._record_pp_comm_send_timing(elapsed_ms)
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+        recv_start = time.perf_counter()
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
@@ -2043,22 +2058,34 @@ class SchedulerPPMixin:
             )
         else:
             data = None
+        if hasattr(self, "_record_pp_comm_recv_timing"):
+            self._record_pp_comm_recv_timing((time.perf_counter() - recv_start) * 1000.0)
 
         if self.attn_tp_size > 1:
+            tp_bcast_start = time.perf_counter()
             data = broadcast_pyobj(
                 data,
                 self.attn_tp_group.rank,
                 self.attn_tp_cpu_group,
                 src=self.attn_tp_group.ranks[0],
             )
+            if hasattr(self, "_record_pp_comm_tp_bcast_timing"):
+                self._record_pp_comm_tp_bcast_timing(
+                    (time.perf_counter() - tp_bcast_start) * 1000.0
+                )
 
         if self.attn_cp_size > 1:
+            cp_bcast_start = time.perf_counter()
             data = broadcast_pyobj(
                 data,
                 self.attn_cp_group.rank,
                 self.attn_cp_cpu_group,
                 src=self.attn_cp_group.ranks[0],
             )
+            if hasattr(self, "_record_pp_comm_cp_bcast_timing"):
+                self._record_pp_comm_cp_bcast_timing(
+                    (time.perf_counter() - cp_bcast_start) * 1000.0
+                )
 
         return data
 
