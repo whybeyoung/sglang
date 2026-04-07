@@ -232,6 +232,21 @@ class HiRadixCache(RadixCache):
         self.pp_soft_skipped_req_ids: set[str] = set()
         self.pp_staged_prefetch_skip_req_ids: set[str] = set()
         self._in_pp_host_tree_replay = False
+        self._match_perf_calls = 0
+        self._match_perf_total_ms = 0.0
+        self._match_perf_max_ms = 0.0
+        self._match_perf_total_walk_steps = 0
+        self._match_perf_max_walk_steps = 0
+        self._match_perf_total_splits = 0
+        self._match_perf_max_splits = 0
+        self._match_perf_total_host_climb = 0
+        self._match_perf_max_host_climb = 0
+        self._match_perf_total_backup_climb = 0
+        self._match_perf_max_backup_climb = 0
+        self._match_perf_total_value_segments = 0
+        self._write_backup_replay_apply_local_ack = 0
+        self._write_backup_replay_apply_authoritative = 0
+        self._write_backup_replay_miss = 0
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -257,6 +272,107 @@ class HiRadixCache(RadixCache):
                 waited = True
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
+
+    def consume_match_perf_snapshot(self) -> dict[str, int | float]:
+        snapshot = {
+            "calls": self._match_perf_calls,
+            "avg_ms": (
+                self._match_perf_total_ms / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "max_ms": self._match_perf_max_ms,
+            "avg_walk": (
+                self._match_perf_total_walk_steps / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "max_walk": self._match_perf_max_walk_steps,
+            "avg_splits": (
+                self._match_perf_total_splits / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "max_splits": self._match_perf_max_splits,
+            "avg_host_climb": (
+                self._match_perf_total_host_climb / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "max_host_climb": self._match_perf_max_host_climb,
+            "avg_backup_climb": (
+                self._match_perf_total_backup_climb / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "max_backup_climb": self._match_perf_max_backup_climb,
+            "avg_segments": (
+                self._match_perf_total_value_segments / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+        }
+        self._match_perf_calls = 0
+        self._match_perf_total_ms = 0.0
+        self._match_perf_max_ms = 0.0
+        self._match_perf_total_walk_steps = 0
+        self._match_perf_max_walk_steps = 0
+        self._match_perf_total_splits = 0
+        self._match_perf_max_splits = 0
+        self._match_perf_total_host_climb = 0
+        self._match_perf_max_host_climb = 0
+        self._match_perf_total_backup_climb = 0
+        self._match_perf_max_backup_climb = 0
+        self._match_perf_total_value_segments = 0
+        return snapshot
+
+    def consume_write_backup_replay_snapshot(self) -> dict[str, int]:
+        snapshot = {
+            "apply_local_ack": self._write_backup_replay_apply_local_ack,
+            "apply_authoritative": self._write_backup_replay_apply_authoritative,
+            "miss": self._write_backup_replay_miss,
+            "pending_wb_events": sum(
+                1
+                for event in self.pp_pending_host_tree_events
+                if event.kind == "WRITE_BACKUP_COMMITTED"
+            ),
+        }
+        self._write_backup_replay_apply_local_ack = 0
+        self._write_backup_replay_apply_authoritative = 0
+        self._write_backup_replay_miss = 0
+        return snapshot
+
+    def get_tree_shape_snapshot(self) -> dict[str, int]:
+        stack = [(self.root_node, 0)]
+        total_nodes = 0
+        evicted_nodes = 0
+        backuped_nodes = 0
+        leaf_nodes = 0
+        max_depth = 0
+        max_fanout = 0
+        while stack:
+            node, depth = stack.pop()
+            if node is not self.root_node:
+                total_nodes += 1
+                if node.evicted:
+                    evicted_nodes += 1
+                if node.backuped:
+                    backuped_nodes += 1
+                if not node.children:
+                    leaf_nodes += 1
+                max_depth = max(max_depth, depth)
+            max_fanout = max(max_fanout, len(node.children))
+            for child in node.children.values():
+                stack.append((child, depth + 1))
+        return {
+            "nodes": total_nodes,
+            "evicted_nodes": evicted_nodes,
+            "backuped_nodes": backuped_nodes,
+            "leaf_nodes": leaf_nodes,
+            "max_depth": max_depth,
+            "max_fanout": max_fanout,
+            "allocated_node_id": max(0, TreeNode.counter - 1),
+        }
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -1328,6 +1444,14 @@ class HiRadixCache(RadixCache):
             )
 
     def _try_replay_write_backup_event(self, event: PPHostTreeEvent) -> bool:
+        miss_recorded = False
+
+        def _record_miss() -> None:
+            nonlocal miss_recorded
+            if not miss_recorded:
+                self._write_backup_replay_miss += 1
+                miss_recorded = True
+
         if self.cache_controller.ack_write_queue:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue[0]
             if finish_event.query():
@@ -1340,6 +1464,7 @@ class HiRadixCache(RadixCache):
                     self._consume_write_ack_group(
                         finish_event, ack_list, emit_event=True
                     )
+                    self._write_backup_replay_apply_local_ack += 1
                     logger.warning(
                         "[HiCachePPEvent][replay_apply_write_backup] pp=%s cp=%s seq=%s source=local_ack rid=%s nodes=%s",
                         self.pp_rank,
@@ -1350,6 +1475,7 @@ class HiRadixCache(RadixCache):
                     )
                     return True
             else:
+                _record_miss()
                 logger.warning(
                     "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=ack_not_ready ack_head=%s ongoing_write=%s event_nodes=%s",
                     self.pp_rank,
@@ -1360,6 +1486,7 @@ class HiRadixCache(RadixCache):
                     len(event.node_key_lens),
                 )
         else:
+            _record_miss()
             logger.warning(
                 "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=no_ack_queue ongoing_write=%s event_nodes=%s",
                 self.pp_rank,
@@ -1370,6 +1497,7 @@ class HiRadixCache(RadixCache):
             )
 
         if not event.node_key_lens:
+            _record_miss()
             logger.warning(
                 "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=empty_event_nodes ongoing_write=%s",
                 self.pp_rank,
@@ -1408,6 +1536,7 @@ class HiRadixCache(RadixCache):
                     nodes = queued_nodes
         if ack_list is None or nodes is None:
             sample_nodes = list(self.ongoing_write_through.items())[:4]
+            _record_miss()
             logger.warning(
                 "[HiCachePPEvent][replay_write_backup_miss] pp=%s cp=%s seq=%s reason=no_matching_nodes event_key_lens=%s event_hashes=%s sample_ongoing=%s",
                 self.pp_rank,
@@ -1434,6 +1563,7 @@ class HiRadixCache(RadixCache):
             backuped_node = self.ongoing_write_through.pop(node_id)
             self.dec_lock_ref(backuped_node)
 
+        self._write_backup_replay_apply_authoritative += 1
         logger.warning(
             "[HiCachePPEvent][replay_apply_write_backup] pp=%s cp=%s seq=%s source=authoritative_event rid=%s nodes=%s removed_ack=%s",
             self.pp_rank,
@@ -2388,6 +2518,7 @@ class HiRadixCache(RadixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
+        start_time = time.perf_counter()
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key, _ = self.maybe_bigram_convert(key)
@@ -2404,7 +2535,10 @@ class HiRadixCache(RadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        value, last_node, walk_steps, split_count = self._match_prefix_helper(
+            self.root_node, key
+        )
+        value_segments = len(value)
         if value:
             value = torch.cat(value)
         else:
@@ -2412,11 +2546,35 @@ class HiRadixCache(RadixCache):
 
         host_hit_length = 0
         last_host_node = last_node
+        host_climb_steps = 0
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
+            host_climb_steps += 1
+        backup_climb_steps = 0
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
+            backup_climb_steps += 1
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        self._match_perf_calls += 1
+        self._match_perf_total_ms += elapsed_ms
+        self._match_perf_max_ms = max(self._match_perf_max_ms, elapsed_ms)
+        self._match_perf_total_walk_steps += walk_steps
+        self._match_perf_max_walk_steps = max(
+            self._match_perf_max_walk_steps, walk_steps
+        )
+        self._match_perf_total_splits += split_count
+        self._match_perf_max_splits = max(self._match_perf_max_splits, split_count)
+        self._match_perf_total_host_climb += host_climb_steps
+        self._match_perf_max_host_climb = max(
+            self._match_perf_max_host_climb, host_climb_steps
+        )
+        self._match_perf_total_backup_climb += backup_climb_steps
+        self._match_perf_max_backup_climb = max(
+            self._match_perf_max_backup_climb, backup_climb_steps
+        )
+        self._match_perf_total_value_segments += value_segments
 
         if (
             os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1"
@@ -2722,13 +2880,17 @@ class HiRadixCache(RadixCache):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
+        walk_steps = 0
+        split_count = 0
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+            walk_steps += 1
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                split_count += 1
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
@@ -2742,7 +2904,7 @@ class HiRadixCache(RadixCache):
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
-        return value, node
+        return value, node, walk_steps, split_count
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child

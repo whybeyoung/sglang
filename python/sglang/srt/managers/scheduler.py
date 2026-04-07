@@ -2746,6 +2746,9 @@ class Scheduler(
                 and hasattr(self.tree_cache, "has_pending_pp_write_backup_event_for_req")
                 and self.tree_cache.has_pending_pp_write_backup_event_for_req(req)
             ):
+                self._hicache_write_backup_barrier_hits = (
+                    getattr(self, "_hicache_write_backup_barrier_hits", 0) + 1
+                )
                 if frontier_diag:
                     logger.warning(
                         "[PPFrontierDiag][write_backup_barrier] pp=%s cp=%s tp=%s rid=%s last_device=%s last_host=%s waiting=%s",

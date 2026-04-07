@@ -104,6 +104,8 @@ class SchedulerMetricsMixin:
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
+        self._hicache_write_backup_barrier_hits = 0
+        self._last_hicache_write_backup_barrier_hits = 0
 
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
@@ -777,6 +779,29 @@ class SchedulerMetricsMixin:
 
         tc = self.tree_cache
         cc = getattr(tc, "cache_controller", None)
+        match_perf = (
+            tc.consume_match_perf_snapshot()
+            if hasattr(tc, "consume_match_perf_snapshot")
+            else {}
+        )
+        replay_perf = (
+            tc.consume_write_backup_replay_snapshot()
+            if hasattr(tc, "consume_write_backup_replay_snapshot")
+            else {}
+        )
+        tree_shape = (
+            tc.get_tree_shape_snapshot()
+            if hasattr(tc, "get_tree_shape_snapshot")
+            and getattr(self, "attn_tp_rank", 0) == 0
+            and getattr(self, "attn_cp_rank", 0) == 0
+            else {}
+        )
+        barrier_hits = getattr(self, "_hicache_write_backup_barrier_hits", 0)
+        last_barrier_hits = getattr(
+            self, "_last_hicache_write_backup_barrier_hits", 0
+        )
+        barrier_hits_delta = barrier_hits - last_barrier_hits
+        self._last_hicache_write_backup_barrier_hits = barrier_hits
 
         def _safe_len(name: str) -> int:
             value = getattr(tc, name, None)
@@ -793,7 +818,12 @@ class SchedulerMetricsMixin:
             "soft_skip=%s staged_skip=%s deferred_revoke=%s local_revoke=%s "
             "local_revoke_q=%s pending_events=%s outgoing_events=%s finalize_ticket=%s "
             "finalize_barrier=%s prefetch_tokens_occupied=%s revoke_q=%s ack_backup_q=%s "
-            "host_release_q=%s",
+            "host_release_q=%s match_calls=%s match_avg_ms=%.3f match_max_ms=%.3f "
+            "match_avg_walk=%.2f match_max_walk=%s match_avg_splits=%.2f "
+            "match_avg_host_climb=%.2f match_avg_backup_climb=%.2f match_avg_segments=%.2f "
+            "wb_barrier_hits=%s wb_replay_local=%s wb_replay_auth=%s wb_replay_miss=%s "
+            "wb_pending=%s tree_nodes=%s tree_evicted=%s tree_backuped=%s tree_leaves=%s "
+            "tree_max_depth=%s tree_max_fanout=%s tree_allocated_id=%s",
             getattr(self, "pp_rank", None),
             getattr(self, "attn_cp_rank", None),
             getattr(self, "attn_tp_rank", None),
@@ -818,6 +848,27 @@ class SchedulerMetricsMixin:
             cc.prefetch_revoke_queue.qsize() if cc is not None else 0,
             cc.ack_backup_queue.qsize() if cc is not None else 0,
             cc.host_mem_release_queue.qsize() if cc is not None else 0,
+            match_perf.get("calls", 0),
+            match_perf.get("avg_ms", 0.0),
+            match_perf.get("max_ms", 0.0),
+            match_perf.get("avg_walk", 0.0),
+            match_perf.get("max_walk", 0),
+            match_perf.get("avg_splits", 0.0),
+            match_perf.get("avg_host_climb", 0.0),
+            match_perf.get("avg_backup_climb", 0.0),
+            match_perf.get("avg_segments", 0.0),
+            barrier_hits_delta,
+            replay_perf.get("apply_local_ack", 0),
+            replay_perf.get("apply_authoritative", 0),
+            replay_perf.get("miss", 0),
+            replay_perf.get("pending_wb_events", 0),
+            tree_shape.get("nodes", -1),
+            tree_shape.get("evicted_nodes", -1),
+            tree_shape.get("backuped_nodes", -1),
+            tree_shape.get("leaf_nodes", -1),
+            tree_shape.get("max_depth", -1),
+            tree_shape.get("max_fanout", -1),
+            tree_shape.get("allocated_node_id", -1),
         )
 
     def _emit_kv_metrics(self: Scheduler):
