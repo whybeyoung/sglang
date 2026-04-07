@@ -2418,6 +2418,7 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        prefill_pick_start = time.perf_counter()
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get token usage from several pools
@@ -2448,6 +2449,11 @@ class Scheduler(
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
+
+        if hasattr(self, "_record_prefill_pick_timing"):
+            self._record_prefill_pick_timing(
+                (time.perf_counter() - prefill_pick_start) * 1000.0
+            )
 
         return ret
 
@@ -3017,6 +3023,9 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        prefill_run_start = (
+            time.perf_counter() if batch.forward_mode == ForwardMode.EXTEND else None
+        )
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -3057,10 +3066,22 @@ class Scheduler(
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    forward_start = (
+                        time.perf_counter()
+                        if batch.forward_mode == ForwardMode.EXTEND
+                        else None
+                    )
                     with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
                             # here pp is not compatible with overlap
+                        )
+                    if (
+                        forward_start is not None
+                        and hasattr(self, "_record_prefill_forward_timing")
+                    ):
+                        self._record_prefill_forward_timing(
+                            (time.perf_counter() - forward_start) * 1000.0
                         )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
@@ -3089,7 +3110,19 @@ class Scheduler(
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                forward_start = (
+                    time.perf_counter()
+                    if batch.forward_mode == ForwardMode.EXTEND
+                    else None
+                )
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                if (
+                    forward_start is not None
+                    and hasattr(self, "_record_prefill_forward_timing")
+                ):
+                    self._record_prefill_forward_timing(
+                        (time.perf_counter() - forward_start) * 1000.0
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 kwargs = (
@@ -3097,9 +3130,21 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                forward_start = (
+                    time.perf_counter()
+                    if batch.forward_mode == ForwardMode.EXTEND
+                    else None
+                )
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
+                    )
+                if (
+                    forward_start is not None
+                    and hasattr(self, "_record_prefill_forward_timing")
+                ):
+                    self._record_prefill_forward_timing(
+                        (time.perf_counter() - forward_start) * 1000.0
                     )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -3132,13 +3177,37 @@ class Scheduler(
                 self.record_batch_in_overlap(model_worker_batch)
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    forward_start = (
+                        time.perf_counter()
+                        if batch.forward_mode == ForwardMode.EXTEND
+                        else None
+                    )
                     embeddings = self.tp_worker.forward_batch_embedding(
                         model_worker_batch
                     )
+                    if (
+                        forward_start is not None
+                        and hasattr(self, "_record_prefill_forward_timing")
+                    ):
+                        self._record_prefill_forward_timing(
+                            (time.perf_counter() - forward_start) * 1000.0
+                        )
                     ret = EmbeddingBatchResult(embeddings=embeddings)
                     ret.copy_to_cpu()
             else:
+                forward_start = (
+                    time.perf_counter()
+                    if batch.forward_mode == ForwardMode.EXTEND
+                    else None
+                )
                 embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+                if (
+                    forward_start is not None
+                    and hasattr(self, "_record_prefill_forward_timing")
+                ):
+                    self._record_prefill_forward_timing(
+                        (time.perf_counter() - forward_start) * 1000.0
+                    )
                 ret = EmbeddingBatchResult(embeddings=embeddings)
 
         # Capture prefill end time for EXTEND mode
@@ -3158,6 +3227,10 @@ class Scheduler(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
             )
 
+        if prefill_run_start is not None and hasattr(self, "_record_prefill_run_timing"):
+            self._record_prefill_run_timing(
+                (time.perf_counter() - prefill_run_start) * 1000.0
+            )
         return ret
 
     def launch_batch_sample_if_needed(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -125,11 +126,15 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        prefill_post_start = time.perf_counter()
+        copy_wait_ms = 0.0
         skip_stream_req = None
 
         if self.is_generation:
             if result.copy_done is not None:
+                copy_wait_start = time.perf_counter()
                 result.copy_done.synchronize()
+                copy_wait_ms += (time.perf_counter() - copy_wait_start) * 1000.0
 
             (
                 logits_output,
@@ -277,7 +282,9 @@ class SchedulerOutputProcessorMixin:
 
         else:  # embedding or reward model
             if result.copy_done is not None:
+                copy_wait_start = time.perf_counter()
                 result.copy_done.synchronize()
+                copy_wait_ms += (time.perf_counter() - copy_wait_start) * 1000.0
 
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -328,6 +335,12 @@ class SchedulerOutputProcessorMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+        if copy_wait_ms > 0.0 and hasattr(self, "_record_prefill_copy_wait_timing"):
+            self._record_prefill_copy_wait_timing(copy_wait_ms)
+        if hasattr(self, "_record_prefill_post_timing"):
+            self._record_prefill_post_timing(
+                (time.perf_counter() - prefill_post_start) * 1000.0
+            )
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch

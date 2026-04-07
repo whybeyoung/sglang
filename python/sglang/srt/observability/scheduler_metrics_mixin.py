@@ -106,6 +106,21 @@ class SchedulerMetricsMixin:
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
         self._hicache_write_backup_barrier_hits = 0
         self._last_hicache_write_backup_barrier_hits = 0
+        self._prefill_pick_calls = 0
+        self._prefill_pick_total_ms = 0.0
+        self._prefill_pick_max_ms = 0.0
+        self._prefill_run_calls = 0
+        self._prefill_run_total_ms = 0.0
+        self._prefill_run_max_ms = 0.0
+        self._prefill_forward_calls = 0
+        self._prefill_forward_total_ms = 0.0
+        self._prefill_forward_max_ms = 0.0
+        self._prefill_copy_wait_calls = 0
+        self._prefill_copy_wait_total_ms = 0.0
+        self._prefill_copy_wait_max_ms = 0.0
+        self._prefill_post_calls = 0
+        self._prefill_post_total_ms = 0.0
+        self._prefill_post_max_ms = 0.0
 
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
@@ -329,6 +344,75 @@ class SchedulerMetricsMixin:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
+
+    def _record_prefill_pick_timing(self: Scheduler, elapsed_ms: float):
+        self._prefill_pick_calls += 1
+        self._prefill_pick_total_ms += elapsed_ms
+        self._prefill_pick_max_ms = max(self._prefill_pick_max_ms, elapsed_ms)
+
+    def _record_prefill_run_timing(self: Scheduler, elapsed_ms: float):
+        self._prefill_run_calls += 1
+        self._prefill_run_total_ms += elapsed_ms
+        self._prefill_run_max_ms = max(self._prefill_run_max_ms, elapsed_ms)
+
+    def _record_prefill_forward_timing(self: Scheduler, elapsed_ms: float):
+        self._prefill_forward_calls += 1
+        self._prefill_forward_total_ms += elapsed_ms
+        self._prefill_forward_max_ms = max(self._prefill_forward_max_ms, elapsed_ms)
+
+    def _record_prefill_copy_wait_timing(self: Scheduler, elapsed_ms: float):
+        self._prefill_copy_wait_calls += 1
+        self._prefill_copy_wait_total_ms += elapsed_ms
+        self._prefill_copy_wait_max_ms = max(
+            self._prefill_copy_wait_max_ms, elapsed_ms
+        )
+
+    def _record_prefill_post_timing(self: Scheduler, elapsed_ms: float):
+        self._prefill_post_calls += 1
+        self._prefill_post_total_ms += elapsed_ms
+        self._prefill_post_max_ms = max(self._prefill_post_max_ms, elapsed_ms)
+
+    def consume_prefill_stage_perf_snapshot(self: Scheduler) -> dict[str, float]:
+        def _avg(total: float, calls: int) -> float:
+            return total / calls if calls else 0.0
+
+        snapshot = {
+            "pick_calls": self._prefill_pick_calls,
+            "pick_avg_ms": _avg(self._prefill_pick_total_ms, self._prefill_pick_calls),
+            "pick_max_ms": self._prefill_pick_max_ms,
+            "run_calls": self._prefill_run_calls,
+            "run_avg_ms": _avg(self._prefill_run_total_ms, self._prefill_run_calls),
+            "run_max_ms": self._prefill_run_max_ms,
+            "forward_calls": self._prefill_forward_calls,
+            "forward_avg_ms": _avg(
+                self._prefill_forward_total_ms, self._prefill_forward_calls
+            ),
+            "forward_max_ms": self._prefill_forward_max_ms,
+            "copy_wait_calls": self._prefill_copy_wait_calls,
+            "copy_wait_avg_ms": _avg(
+                self._prefill_copy_wait_total_ms, self._prefill_copy_wait_calls
+            ),
+            "copy_wait_max_ms": self._prefill_copy_wait_max_ms,
+            "post_calls": self._prefill_post_calls,
+            "post_avg_ms": _avg(self._prefill_post_total_ms, self._prefill_post_calls),
+            "post_max_ms": self._prefill_post_max_ms,
+        }
+        self._prefill_pick_calls = 0
+        self._prefill_pick_total_ms = 0.0
+        self._prefill_pick_max_ms = 0.0
+        self._prefill_run_calls = 0
+        self._prefill_run_total_ms = 0.0
+        self._prefill_run_max_ms = 0.0
+        self._prefill_forward_calls = 0
+        self._prefill_forward_total_ms = 0.0
+        self._prefill_forward_max_ms = 0.0
+        self._prefill_copy_wait_calls = 0
+        self._prefill_copy_wait_total_ms = 0.0
+        self._prefill_copy_wait_max_ms = 0.0
+        self._prefill_post_calls = 0
+        self._prefill_post_total_ms = 0.0
+        self._prefill_post_max_ms = 0.0
+        return snapshot
 
     def report_prefill_stats(
         self: Scheduler,
@@ -789,6 +873,11 @@ class SchedulerMetricsMixin:
             if hasattr(tc, "consume_write_backup_replay_snapshot")
             else {}
         )
+        prefill_stage_perf = (
+            self.consume_prefill_stage_perf_snapshot()
+            if hasattr(self, "consume_prefill_stage_perf_snapshot")
+            else {}
+        )
         tree_churn = (
             tc.consume_tree_churn_snapshot()
             if hasattr(tc, "consume_tree_churn_snapshot")
@@ -833,6 +922,11 @@ class SchedulerMetricsMixin:
             "match_host_climb_calls=%s match_backup_climb_calls=%s "
             "match_multi_segment_calls=%s match_device_hit_calls=%s "
             "match_host_hit_calls=%s match_avg_path_fanout=%.2f match_max_path_fanout=%s "
+            "prefill_pick_calls=%s prefill_pick_avg_ms=%.3f prefill_pick_max_ms=%.3f "
+            "prefill_run_calls=%s prefill_run_avg_ms=%.3f prefill_run_max_ms=%.3f "
+            "prefill_forward_calls=%s prefill_forward_avg_ms=%.3f prefill_forward_max_ms=%.3f "
+            "prefill_copy_wait_calls=%s prefill_copy_wait_avg_ms=%.3f prefill_copy_wait_max_ms=%.3f "
+            "prefill_post_calls=%s prefill_post_avg_ms=%.3f prefill_post_max_ms=%.3f "
             "wb_barrier_hits=%s wb_replay_local=%s wb_replay_auth=%s wb_replay_miss=%s "
             "wb_pending=%s wb_commit_nodes=%s tree_nodes=%s tree_evicted=%s "
             "tree_backuped=%s tree_leaves=%s tree_max_depth=%s tree_max_fanout=%s "
@@ -885,6 +979,21 @@ class SchedulerMetricsMixin:
             match_perf.get("host_hit_calls", 0),
             match_perf.get("avg_path_fanout", 0.0),
             match_perf.get("max_path_fanout", 0),
+            prefill_stage_perf.get("pick_calls", 0),
+            prefill_stage_perf.get("pick_avg_ms", 0.0),
+            prefill_stage_perf.get("pick_max_ms", 0.0),
+            prefill_stage_perf.get("run_calls", 0),
+            prefill_stage_perf.get("run_avg_ms", 0.0),
+            prefill_stage_perf.get("run_max_ms", 0.0),
+            prefill_stage_perf.get("forward_calls", 0),
+            prefill_stage_perf.get("forward_avg_ms", 0.0),
+            prefill_stage_perf.get("forward_max_ms", 0.0),
+            prefill_stage_perf.get("copy_wait_calls", 0),
+            prefill_stage_perf.get("copy_wait_avg_ms", 0.0),
+            prefill_stage_perf.get("copy_wait_max_ms", 0.0),
+            prefill_stage_perf.get("post_calls", 0),
+            prefill_stage_perf.get("post_avg_ms", 0.0),
+            prefill_stage_perf.get("post_max_ms", 0.0),
             barrier_hits_delta,
             replay_perf.get("apply_local_ack", 0),
             replay_perf.get("apply_authoritative", 0),
