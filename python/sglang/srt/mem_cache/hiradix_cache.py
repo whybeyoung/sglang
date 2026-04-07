@@ -250,6 +250,39 @@ def _decode_pp_host_tree_transport(events) -> List[PPHostTreeEvent]:
     return [_decode_pp_host_tree_wire_event(event) for event in (events or ())]
 
 
+def _estimate_pp_write_backup_event_bytes(event: PPHostTreeEvent) -> int:
+    if event.kind != "WRITE_BACKUP_COMMITTED":
+        return 0
+
+    total = 1 + 8 + 4
+    total += len((event.rid or "").encode("utf-8"))
+    for idx in range(len(event.node_key_lens)):
+        total += 8
+        total += 4
+
+        last_hash = event.node_last_hashes[idx]
+        total += 4 + (len(last_hash.encode("utf-8")) if last_hash is not None else 0)
+
+        extra_key = event.node_extra_keys[idx]
+        total += 4 + (len(extra_key.encode("utf-8")) if extra_key is not None else 0)
+
+        if idx < len(event.node_parent_key_lens):
+            total += 4
+            parent_last_hash = event.node_parent_last_hashes[idx]
+            total += 4 + (
+                len(parent_last_hash.encode("utf-8"))
+                if parent_last_hash is not None
+                else 0
+            )
+            parent_extra_key = event.node_parent_extra_keys[idx]
+            total += 4 + (
+                len(parent_extra_key.encode("utf-8"))
+                if parent_extra_key is not None
+                else 0
+            )
+    return total
+
+
 class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
@@ -417,6 +450,11 @@ class HiRadixCache(RadixCache):
         self._tree_delete_regular_leaf = 0
         self._tree_delete_host_leaf = 0
         self._write_backup_commit_nodes = 0
+        self._write_backup_event_count = 0
+        self._write_backup_event_total_nodes = 0
+        self._write_backup_event_max_nodes = 0
+        self._write_backup_event_estimated_bytes = 0
+        self._write_backup_event_max_estimated_bytes = 0
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -542,12 +580,27 @@ class HiRadixCache(RadixCache):
         self._match_perf_max_path_fanout = 0
         return snapshot
 
-    def consume_write_backup_replay_snapshot(self) -> dict[str, int]:
+    def consume_write_backup_replay_snapshot(self) -> dict[str, int | float]:
         snapshot = {
             "apply_local_ack": self._write_backup_replay_apply_local_ack,
             "apply_authoritative": self._write_backup_replay_apply_authoritative,
             "miss": self._write_backup_replay_miss,
             "commit_nodes": self._write_backup_commit_nodes,
+            "event_count": self._write_backup_event_count,
+            "event_avg_nodes": (
+                self._write_backup_event_total_nodes / self._write_backup_event_count
+                if self._write_backup_event_count
+                else 0.0
+            ),
+            "event_max_nodes": self._write_backup_event_max_nodes,
+            "event_est_bytes": self._write_backup_event_estimated_bytes,
+            "event_avg_est_bytes": (
+                self._write_backup_event_estimated_bytes
+                / self._write_backup_event_count
+                if self._write_backup_event_count
+                else 0.0
+            ),
+            "event_max_est_bytes": self._write_backup_event_max_estimated_bytes,
             "pending_wb_events": sum(
                 1
                 for event in self.pp_pending_host_tree_events
@@ -558,6 +611,11 @@ class HiRadixCache(RadixCache):
         self._write_backup_replay_apply_authoritative = 0
         self._write_backup_replay_miss = 0
         self._write_backup_commit_nodes = 0
+        self._write_backup_event_count = 0
+        self._write_backup_event_total_nodes = 0
+        self._write_backup_event_max_nodes = 0
+        self._write_backup_event_estimated_bytes = 0
+        self._write_backup_event_max_estimated_bytes = 0
         return snapshot
 
     def get_tree_shape_snapshot(self) -> dict[str, int]:
@@ -1661,36 +1719,46 @@ class HiRadixCache(RadixCache):
                 self.write_backup_storage(backuped_node)
         self._write_backup_commit_nodes += len(committed_nodes)
         if emit_event:
-            self._append_pp_host_tree_event(
-                PPHostTreeEvent(
-                    seq=self._next_pp_host_tree_seq(),
-                    kind="WRITE_BACKUP_COMMITTED",
-                    node_ids=[node.id for node in committed_nodes],
-                    node_key_lens=[len(node.key) for node in committed_nodes],
-                    node_last_hashes=[
-                        node.get_last_hash_value() for node in committed_nodes
-                    ],
-                    node_extra_keys=[node.key.extra_key for node in committed_nodes],
-                    node_parent_key_lens=[
-                        len(node.parent.key)
-                        if node.parent is not None and node.parent.key is not None
-                        else 0
-                        for node in committed_nodes
-                    ],
-                    node_parent_last_hashes=[
-                        node.parent.get_last_hash_value()
-                        if node.parent is not None
-                        else None
-                        for node in committed_nodes
-                    ],
-                    node_parent_extra_keys=[
-                        node.parent.key.extra_key
-                        if node.parent is not None and node.parent.key is not None
-                        else None
-                        for node in committed_nodes
-                    ],
-                )
+            event = PPHostTreeEvent(
+                seq=self._next_pp_host_tree_seq(),
+                kind="WRITE_BACKUP_COMMITTED",
+                node_ids=[node.id for node in committed_nodes],
+                node_key_lens=[len(node.key) for node in committed_nodes],
+                node_last_hashes=[
+                    node.get_last_hash_value() for node in committed_nodes
+                ],
+                node_extra_keys=[node.key.extra_key for node in committed_nodes],
+                node_parent_key_lens=[
+                    len(node.parent.key)
+                    if node.parent is not None and node.parent.key is not None
+                    else 0
+                    for node in committed_nodes
+                ],
+                node_parent_last_hashes=[
+                    node.parent.get_last_hash_value()
+                    if node.parent is not None
+                    else None
+                    for node in committed_nodes
+                ],
+                node_parent_extra_keys=[
+                    node.parent.key.extra_key
+                    if node.parent is not None and node.parent.key is not None
+                    else None
+                    for node in committed_nodes
+                ],
             )
+            committed_count = len(committed_nodes)
+            estimated_bytes = _estimate_pp_write_backup_event_bytes(event)
+            self._write_backup_event_count += 1
+            self._write_backup_event_total_nodes += committed_count
+            self._write_backup_event_max_nodes = max(
+                self._write_backup_event_max_nodes, committed_count
+            )
+            self._write_backup_event_estimated_bytes += estimated_bytes
+            self._write_backup_event_max_estimated_bytes = max(
+                self._write_backup_event_max_estimated_bytes, estimated_bytes
+            )
+            self._append_pp_host_tree_event(event)
 
     def _try_replay_write_backup_event(self, event: PPHostTreeEvent) -> bool:
         miss_recorded = False

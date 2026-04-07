@@ -928,7 +928,9 @@ class SchedulerMetricsMixin:
             "prefill_copy_wait_calls=%s prefill_copy_wait_avg_ms=%.3f prefill_copy_wait_max_ms=%.3f "
             "prefill_post_calls=%s prefill_post_avg_ms=%.3f prefill_post_max_ms=%.3f "
             "wb_barrier_hits=%s wb_replay_local=%s wb_replay_auth=%s wb_replay_miss=%s "
-            "wb_pending=%s wb_commit_nodes=%s tree_nodes=%s tree_evicted=%s "
+            "wb_pending=%s wb_commit_nodes=%s wb_event_count=%s wb_event_avg_nodes=%.2f "
+            "wb_event_max_nodes=%s wb_event_est_bytes=%s wb_event_avg_est_bytes=%.2f "
+            "wb_event_max_est_bytes=%s tree_nodes=%s tree_evicted=%s "
             "tree_backuped=%s tree_leaves=%s tree_max_depth=%s tree_max_fanout=%s "
             "tree_allocated_id=%s tree_alloc_delta=%s alloc_match_split=%s "
             "alloc_insert_split=%s alloc_host_insert_split=%s alloc_device_leaf=%s "
@@ -1000,6 +1002,12 @@ class SchedulerMetricsMixin:
             replay_perf.get("miss", 0),
             replay_perf.get("pending_wb_events", 0),
             replay_perf.get("commit_nodes", 0),
+            replay_perf.get("event_count", 0),
+            replay_perf.get("event_avg_nodes", 0.0),
+            replay_perf.get("event_max_nodes", 0),
+            replay_perf.get("event_est_bytes", 0),
+            replay_perf.get("event_avg_est_bytes", 0.0),
+            replay_perf.get("event_max_est_bytes", 0),
             tree_shape.get("nodes", -1),
             tree_shape.get("evicted_nodes", -1),
             tree_shape.get("backuped_nodes", -1),
