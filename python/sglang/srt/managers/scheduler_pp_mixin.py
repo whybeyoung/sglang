@@ -118,10 +118,10 @@ class SchedulerPPMixin:
             and len(payload) == 3
             and payload[0] == _PP_REQ_PAYLOAD_V1
         ):
-            return payload[1], list(payload[2] or [])
+            return payload[1], payload[2] or ()
         if isinstance(payload, dict) and "recv_reqs" in payload:
-            return payload["recv_reqs"], list(payload.get("hicache_host_tree_events", []))
-        return payload, []
+            return payload["recv_reqs"], payload.get("hicache_host_tree_events") or ()
+        return payload, ()
 
     def _pp_prefill_safe_len(self: Scheduler, value) -> int:
         if value is None:
@@ -342,34 +342,34 @@ class SchedulerPPMixin:
             _PP_RELEASE_PAYLOAD_V1,
             list(release_rids or []),
             launch_ack_mb_id,
-            list(launch_ack_rids or []),
+            tuple(launch_ack_rids or ()),
             launch_ack_barrier_rid,
         )
 
     def _pp_unpack_release_payload(
         self: Scheduler, payload
-    ) -> Tuple[Optional[List[str]], Optional[int], List[str], Optional[str]]:
+    ) -> Tuple[Optional[List[str]], Optional[int], tuple[str, ...], Optional[str]]:
         if payload is None:
-            return None, None, [], None
+            return None, None, (), None
         if (
             isinstance(payload, tuple)
             and len(payload) == 5
             and payload[0] == _PP_RELEASE_PAYLOAD_V1
         ):
-            return payload[1], payload[2], list(payload[3] or []), payload[4]
+            return payload[1], payload[2], tuple(payload[3] or ()), payload[4]
         if isinstance(payload, dict):
             release_rids = payload.get("release_rids")
             ack_payload = payload.get("launch_frontier_ack") or {}
             ack_mb_id = ack_payload.get("mb_id")
-            ack_rids = list(ack_payload.get("rids") or [])
+            ack_rids = tuple(ack_payload.get("rids") or ())
             ack_barrier_rid = ack_payload.get("barrier_rid")
             return release_rids, ack_mb_id, ack_rids, ack_barrier_rid
-        return payload, None, [], None
+        return payload, None, (), None
 
     def _pp_record_launch_frontier_ack(
         self: Scheduler,
         ack_mb_id: Optional[int],
-        ack_rids: List[str],
+        ack_rids,
         ack_barrier_rid: Optional[str] = None,
     ) -> None:
         if ack_mb_id is None or (not ack_rids and ack_barrier_rid is None):
@@ -378,8 +378,9 @@ class SchedulerPPMixin:
         # This keeps the semantics "PP0 may lead by at most one microbatch"
         # instead of trying to retroactively constrain the microbatch that is
         # already in flight when the downstream ack arrives.
+        ack_rids = tuple(ack_rids or ())
         self.pp_pending_launch_frontier_ack_by_mb[ack_mb_id] = {
-            "rids": list(ack_rids),
+            "rids": ack_rids,
             "barrier_rid": ack_barrier_rid,
         }
         if self._pp_prefill_diag_enabled():
@@ -402,7 +403,7 @@ class SchedulerPPMixin:
         if ack is None:
             return None
         return {
-            "rids": list(ack.get("rids") or []),
+            "rids": ack.get("rids") or (),
             "barrier_rid": ack.get("barrier_rid"),
         }
 

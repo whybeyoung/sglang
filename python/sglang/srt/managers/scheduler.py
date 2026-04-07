@@ -1446,7 +1446,7 @@ class Scheduler(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        pp_hicache_host_tree_events: List[dict] = []
+        pp_hicache_host_tree_events: List[object] = []
 
         if self.recv_skipper is not None:
             last_forward_mode = (
@@ -1563,15 +1563,30 @@ class Scheduler(
                 recv_reqs = recv_payload
 
         if self.pp_rank > 0:
-            self.pp_hicache_host_tree_events = list(pp_hicache_host_tree_events or [])
             if (
                 self.enable_hicache_storage
                 and self.tree_cache is not None
-                and hasattr(self.tree_cache, "stage_pp_incoming_prefetch_skip_events")
+                and hasattr(self.tree_cache, "prepare_pp_incoming_host_tree_events")
             ):
-                self.tree_cache.stage_pp_incoming_prefetch_skip_events(
-                    self.pp_hicache_host_tree_events
+                self.pp_hicache_host_tree_events = (
+                    self.tree_cache.prepare_pp_incoming_host_tree_events(
+                        pp_hicache_host_tree_events
+                    )
                 )
+            else:
+                self.pp_hicache_host_tree_events = list(
+                    pp_hicache_host_tree_events or []
+                )
+                if (
+                    self.enable_hicache_storage
+                    and self.tree_cache is not None
+                    and hasattr(
+                        self.tree_cache, "stage_pp_incoming_prefetch_skip_events"
+                    )
+                ):
+                    self.tree_cache.stage_pp_incoming_prefetch_skip_events(
+                        self.pp_hicache_host_tree_events
+                    )
         else:
             self.pp_hicache_host_tree_events = []
 
@@ -2547,7 +2562,7 @@ class Scheduler(
                 getattr(self, "pp_current_prefill_mb_id", None)
             )
             if launch_ack is not None:
-                launch_ack_rids = list(launch_ack.get("rids") or [])
+                launch_ack_rids = launch_ack.get("rids") or ()
                 launch_ack_barrier_rid = launch_ack.get("barrier_rid")
             if frontier_diag and launch_ack is not None:
                 logger.warning(

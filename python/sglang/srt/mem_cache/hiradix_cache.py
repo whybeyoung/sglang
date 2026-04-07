@@ -1085,8 +1085,8 @@ class HiRadixCache(RadixCache):
         return self.pp_host_tree_event_seq
 
     def consume_pp_host_tree_events(self) -> List[dict[str, Any]]:
-        events = list(self.pp_outgoing_host_tree_events)
-        self.pp_outgoing_host_tree_events.clear()
+        events = self.pp_outgoing_host_tree_events
+        self.pp_outgoing_host_tree_events = []
         if events and self._hicache_verbose_enabled():
             logger.warning(
                 "[HiCachePPEvent][consume] pp=%s cp=%s count=%s events=%s",
@@ -1106,6 +1106,39 @@ class HiRadixCache(RadixCache):
                 ],
             )
         return events
+
+    def prepare_pp_incoming_host_tree_events(
+        self, events: List[dict[str, Any]]
+    ) -> List[PPHostTreeEvent]:
+        if not self._pp_downstream_sync_enabled() or not events:
+            return []
+
+        prepared_events: List[PPHostTreeEvent] = []
+        staged_rids = []
+        for event in events:
+            decoded = _decode_pp_host_tree_wire_event(event)
+            prepared_events.append(decoded)
+            if decoded.kind != "PREFETCH_SKIP":
+                continue
+            req_id = decoded.rid
+            if req_id is None:
+                continue
+            req_id = str(req_id)
+            if req_id in self.pp_staged_prefetch_skip_req_ids:
+                continue
+            self.pp_staged_prefetch_skip_req_ids.add(req_id)
+            staged_rids.append(req_id)
+
+        if staged_rids and self._hicache_verbose_enabled():
+            logger.warning(
+                "[HiCachePPEvent][stage_prefetch_skip] pp=%s cp=%s count=%s rids=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                len(staged_rids),
+                staged_rids[:8],
+            )
+
+        return prepared_events
 
     def enqueue_pp_host_tree_events(self, events: List[dict[str, Any]]) -> None:
         if not self._pp_downstream_sync_enabled() or not events:
@@ -1141,31 +1174,8 @@ class HiRadixCache(RadixCache):
     def stage_pp_incoming_prefetch_skip_events(
         self, events: List[dict[str, Any]]
     ) -> None:
-        if not self._pp_downstream_sync_enabled() or not events:
-            return
-
-        staged_rids = []
-        for event in events:
-            decoded = _decode_pp_host_tree_wire_event(event)
-            if decoded.kind != "PREFETCH_SKIP":
-                continue
-            req_id = decoded.rid
-            if req_id is None:
-                continue
-            req_id = str(req_id)
-            if req_id in self.pp_staged_prefetch_skip_req_ids:
-                continue
-            self.pp_staged_prefetch_skip_req_ids.add(req_id)
-            staged_rids.append(req_id)
-
-        if staged_rids and self._hicache_verbose_enabled():
-            logger.warning(
-                "[HiCachePPEvent][stage_prefetch_skip] pp=%s cp=%s count=%s rids=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                len(staged_rids),
-                staged_rids[:8],
-            )
+        # Backward-compatible wrapper for older callers.
+        self.prepare_pp_incoming_host_tree_events(events)
 
     def poll_follow_rank_prefetch_issue_action(
         self,
