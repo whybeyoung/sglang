@@ -727,7 +727,7 @@ class HiRadixCache(RadixCache):
         return self.enable_storage and self.pp_size > 1 and self.pp_rank > 0
 
     def _pp_write_backup_replay_enabled(self) -> bool:
-        return os.getenv("SGLANG_ENABLE_PP_WRITE_BACKUP_REPLAY", "0") == "1"
+        return os.getenv("SGLANG_ENABLE_PP_WRITE_BACKUP_REPLAY", "1") == "1"
 
     def _pp_should_skip_large_shallow_prefetch(
         self, last_host_node: TreeNode, prefetch_length: int
@@ -907,6 +907,47 @@ class HiRadixCache(RadixCache):
             return False
         event = self._peek_pp_host_tree_event()
         return event is not None and event.kind == "WRITE_BACKUP_COMMITTED"
+
+    def _write_backup_event_affects_node_path(
+        self, event: PPHostTreeEvent, last_node: Optional[TreeNode]
+    ) -> bool:
+        if event.kind != "WRITE_BACKUP_COMMITTED" or last_node is None:
+            return False
+
+        path_meta = set()
+        walk_node = last_node
+        while walk_node is not None and walk_node is not self.root_node:
+            path_meta.add(
+                (
+                    len(walk_node.key) if walk_node.key is not None else 0,
+                    walk_node.get_last_hash_value(),
+                    walk_node.key.extra_key if walk_node.key is not None else None,
+                )
+            )
+            walk_node = walk_node.parent
+
+        for idx, key_len in enumerate(event.node_key_lens):
+            node_meta = (
+                key_len,
+                event.node_last_hashes[idx],
+                event.node_extra_keys[idx],
+            )
+            if node_meta in path_meta:
+                return True
+        return False
+
+    def has_pending_pp_write_backup_event_for_req(self, req) -> bool:
+        if not self._pp_write_backup_replay_enabled():
+            return False
+        event = self._peek_pp_host_tree_event()
+        if event is None or event.kind != "WRITE_BACKUP_COMMITTED":
+            return False
+
+        last_node = getattr(req, "last_node", None)
+        if self._write_backup_event_affects_node_path(event, last_node):
+            return True
+        last_host_node = getattr(req, "last_host_node", None)
+        return self._write_backup_event_affects_node_path(event, last_host_node)
 
     def consume_pp_retry_prefetch_req(self, req_id: str) -> bool:
         if req_id not in self.pp_retry_prefetch_req_ids:

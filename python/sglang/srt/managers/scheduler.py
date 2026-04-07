@@ -2732,31 +2732,32 @@ class Scheduler(
                     req.rid
                 )
 
-                # Host-tree write-back commits affect downstream HiCache match
-                # results. On PP follow ranks, do not form a new batch until
-                # queued WRITE_BACKUP_COMMITTED events have replayed; otherwise
-                # the same waiting frontier can see different prefix lengths.
                 if (
                     self.pp_group is not None
                     and not self.pp_group.is_first_rank
                     and hasattr(self.tree_cache, "replay_pp_host_tree_events")
                 ):
                     self.tree_cache.replay_pp_host_tree_events()
-                    if hasattr(
-                        self.tree_cache, "has_pending_pp_write_backup_event"
-                    ) and self.tree_cache.has_pending_pp_write_backup_event():
-                        if frontier_diag:
-                            logger.warning(
-                                "[PPFrontierDiag][write_backup_barrier] pp=%s cp=%s tp=%s rid=%s waiting=%s",
-                                self.pp_rank,
-                                self.attn_cp_rank,
-                                self.attn_tp_rank,
-                                req.rid,
-                                [x.rid for x in self.waiting_queue[:8]],
-                            )
-                        break
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.pp_group is not None
+                and not self.pp_group.is_first_rank
+                and hasattr(self.tree_cache, "has_pending_pp_write_backup_event_for_req")
+                and self.tree_cache.has_pending_pp_write_backup_event_for_req(req)
+            ):
+                if frontier_diag:
+                    logger.warning(
+                        "[PPFrontierDiag][write_backup_barrier] pp=%s cp=%s tp=%s rid=%s last_device=%s last_host=%s waiting=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        self.attn_tp_rank,
+                        req.rid,
+                        req.last_node.id if req.last_node is not None else None,
+                        req.last_host_node.id if req.last_host_node is not None else None,
+                        [x.rid for x in self.waiting_queue[:8]],
+                    )
+                break
             if frontier_diag:
                 logger.warning(
                     "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=waiting_head_ready prefix=%s host_hit=%s storage_hit=%s",
