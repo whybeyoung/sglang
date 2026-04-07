@@ -244,6 +244,19 @@ class HiRadixCache(RadixCache):
         self._match_perf_total_backup_climb = 0
         self._match_perf_max_backup_climb = 0
         self._match_perf_total_value_segments = 0
+        self._match_perf_total_key_len = 0
+        self._match_perf_total_aligned_len = 0
+        self._match_perf_total_device_hit = 0
+        self._match_perf_total_host_hit = 0
+        self._match_perf_root_only_calls = 0
+        self._match_perf_split_calls = 0
+        self._match_perf_host_climb_calls = 0
+        self._match_perf_backup_climb_calls = 0
+        self._match_perf_multi_segment_calls = 0
+        self._match_perf_device_hit_calls = 0
+        self._match_perf_host_hit_calls = 0
+        self._match_perf_total_path_fanout = 0
+        self._match_perf_max_path_fanout = 0
         self._write_backup_replay_apply_local_ack = 0
         self._write_backup_replay_apply_authoritative = 0
         self._write_backup_replay_miss = 0
@@ -320,6 +333,39 @@ class HiRadixCache(RadixCache):
                 if self._match_perf_calls
                 else 0.0
             ),
+            "avg_key_len": (
+                self._match_perf_total_key_len / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "avg_aligned_len": (
+                self._match_perf_total_aligned_len / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "avg_device_hit": (
+                self._match_perf_total_device_hit / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "avg_host_hit": (
+                self._match_perf_total_host_hit / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "root_only_calls": self._match_perf_root_only_calls,
+            "split_calls": self._match_perf_split_calls,
+            "host_climb_calls": self._match_perf_host_climb_calls,
+            "backup_climb_calls": self._match_perf_backup_climb_calls,
+            "multi_segment_calls": self._match_perf_multi_segment_calls,
+            "device_hit_calls": self._match_perf_device_hit_calls,
+            "host_hit_calls": self._match_perf_host_hit_calls,
+            "avg_path_fanout": (
+                self._match_perf_total_path_fanout / self._match_perf_calls
+                if self._match_perf_calls
+                else 0.0
+            ),
+            "max_path_fanout": self._match_perf_max_path_fanout,
         }
         self._match_perf_calls = 0
         self._match_perf_total_ms = 0.0
@@ -333,6 +379,19 @@ class HiRadixCache(RadixCache):
         self._match_perf_total_backup_climb = 0
         self._match_perf_max_backup_climb = 0
         self._match_perf_total_value_segments = 0
+        self._match_perf_total_key_len = 0
+        self._match_perf_total_aligned_len = 0
+        self._match_perf_total_device_hit = 0
+        self._match_perf_total_host_hit = 0
+        self._match_perf_root_only_calls = 0
+        self._match_perf_split_calls = 0
+        self._match_perf_host_climb_calls = 0
+        self._match_perf_backup_climb_calls = 0
+        self._match_perf_multi_segment_calls = 0
+        self._match_perf_device_hit_calls = 0
+        self._match_perf_host_hit_calls = 0
+        self._match_perf_total_path_fanout = 0
+        self._match_perf_max_path_fanout = 0
         return snapshot
 
     def consume_write_backup_replay_snapshot(self) -> dict[str, int]:
@@ -2581,7 +2640,7 @@ class HiRadixCache(RadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, last_node, walk_steps, split_count = self._match_prefix_helper(
+        value, last_node, walk_steps, split_count, path_fanout_sum, path_max_fanout = self._match_prefix_helper(
             self.root_node, key
         )
         value_segments = len(value)
@@ -2621,6 +2680,28 @@ class HiRadixCache(RadixCache):
             self._match_perf_max_backup_climb, backup_climb_steps
         )
         self._match_perf_total_value_segments += value_segments
+        self._match_perf_total_key_len += len(params.key)
+        self._match_perf_total_aligned_len += page_aligned_len
+        self._match_perf_total_device_hit += len(value)
+        self._match_perf_total_host_hit += host_hit_length
+        self._match_perf_total_path_fanout += path_fanout_sum
+        self._match_perf_max_path_fanout = max(
+            self._match_perf_max_path_fanout, path_max_fanout
+        )
+        if walk_steps == 0:
+            self._match_perf_root_only_calls += 1
+        if split_count > 0:
+            self._match_perf_split_calls += 1
+        if host_climb_steps > 0:
+            self._match_perf_host_climb_calls += 1
+        if backup_climb_steps > 0:
+            self._match_perf_backup_climb_calls += 1
+        if value_segments > 1:
+            self._match_perf_multi_segment_calls += 1
+        if len(value) > 0:
+            self._match_perf_device_hit_calls += 1
+        if host_hit_length > 0:
+            self._match_perf_host_hit_calls += 1
 
         if (
             os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1"
@@ -2930,8 +3011,13 @@ class HiRadixCache(RadixCache):
         value = []
         walk_steps = 0
         split_count = 0
+        path_fanout_sum = 0
+        path_max_fanout = 0
 
         while len(key) > 0 and child_key in node.children.keys():
+            current_fanout = len(node.children)
+            path_fanout_sum += current_fanout
+            path_max_fanout = max(path_max_fanout, current_fanout)
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             walk_steps += 1
@@ -2953,7 +3039,7 @@ class HiRadixCache(RadixCache):
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
-        return value, node, walk_steps, split_count
+        return value, node, walk_steps, split_count, path_fanout_sum, path_max_fanout
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child

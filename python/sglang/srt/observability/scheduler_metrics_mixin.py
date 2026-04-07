@@ -828,6 +828,11 @@ class SchedulerMetricsMixin:
             "host_release_q=%s match_calls=%s match_avg_ms=%.3f match_max_ms=%.3f "
             "match_avg_walk=%.2f match_max_walk=%s match_avg_splits=%.2f "
             "match_avg_host_climb=%.2f match_avg_backup_climb=%.2f match_avg_segments=%.2f "
+            "match_avg_key_len=%.2f match_avg_aligned_len=%.2f match_avg_device_hit=%.2f "
+            "match_avg_host_hit=%.2f match_root_only_calls=%s match_split_calls=%s "
+            "match_host_climb_calls=%s match_backup_climb_calls=%s "
+            "match_multi_segment_calls=%s match_device_hit_calls=%s "
+            "match_host_hit_calls=%s match_avg_path_fanout=%.2f match_max_path_fanout=%s "
             "wb_barrier_hits=%s wb_replay_local=%s wb_replay_auth=%s wb_replay_miss=%s "
             "wb_pending=%s wb_commit_nodes=%s tree_nodes=%s tree_evicted=%s "
             "tree_backuped=%s tree_leaves=%s tree_max_depth=%s tree_max_fanout=%s "
@@ -867,6 +872,19 @@ class SchedulerMetricsMixin:
             match_perf.get("avg_host_climb", 0.0),
             match_perf.get("avg_backup_climb", 0.0),
             match_perf.get("avg_segments", 0.0),
+            match_perf.get("avg_key_len", 0.0),
+            match_perf.get("avg_aligned_len", 0.0),
+            match_perf.get("avg_device_hit", 0.0),
+            match_perf.get("avg_host_hit", 0.0),
+            match_perf.get("root_only_calls", 0),
+            match_perf.get("split_calls", 0),
+            match_perf.get("host_climb_calls", 0),
+            match_perf.get("backup_climb_calls", 0),
+            match_perf.get("multi_segment_calls", 0),
+            match_perf.get("device_hit_calls", 0),
+            match_perf.get("host_hit_calls", 0),
+            match_perf.get("avg_path_fanout", 0.0),
+            match_perf.get("max_path_fanout", 0),
             barrier_hits_delta,
             replay_perf.get("apply_local_ack", 0),
             replay_perf.get("apply_authoritative", 0),
