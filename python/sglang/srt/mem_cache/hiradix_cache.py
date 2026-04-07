@@ -63,6 +63,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_PP_EVENT_WRITE_BACKUP_COMMITTED = 0
+_PP_EVENT_PREFETCH_SKIP = 1
+_PP_EVENT_REVOKE = 2
+_PP_EVENT_PREFETCH_FINALIZE = 3
+
+_PP_EVENT_KIND_TO_CODE = {
+    "WRITE_BACKUP_COMMITTED": _PP_EVENT_WRITE_BACKUP_COMMITTED,
+    "PREFETCH_SKIP": _PP_EVENT_PREFETCH_SKIP,
+    "REVOKE": _PP_EVENT_REVOKE,
+    "PREFETCH_FINALIZE": _PP_EVENT_PREFETCH_FINALIZE,
+}
+_PP_EVENT_CODE_TO_KIND = {value: key for key, value in _PP_EVENT_KIND_TO_CODE.items()}
+
 
 class _HiCacheDebugFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -100,6 +113,74 @@ class PPHostTreeEvent:
     node_parent_key_lens: List[int] = field(default_factory=list)
     node_parent_last_hashes: List[Optional[str]] = field(default_factory=list)
     node_parent_extra_keys: List[Optional[str]] = field(default_factory=list)
+
+
+def _encode_pp_host_tree_wire_event(event: PPHostTreeEvent):
+    kind_code = _PP_EVENT_KIND_TO_CODE[event.kind]
+    if kind_code == _PP_EVENT_WRITE_BACKUP_COMMITTED:
+        return (
+            kind_code,
+            event.seq,
+            event.rid,
+            event.loaded_from_storage,
+            tuple(event.node_ids),
+            tuple(event.node_key_lens),
+            tuple(event.node_last_hashes),
+            tuple(event.node_extra_keys),
+            tuple(event.node_parent_key_lens),
+            tuple(event.node_parent_last_hashes),
+            tuple(event.node_parent_extra_keys),
+        )
+    return (
+        kind_code,
+        event.seq,
+        event.rid,
+        event.loaded_from_storage,
+    )
+
+
+def _decode_pp_host_tree_wire_event(event) -> PPHostTreeEvent:
+    if isinstance(event, PPHostTreeEvent):
+        return event
+    if isinstance(event, tuple):
+        kind = _PP_EVENT_CODE_TO_KIND[int(event[0])]
+        if int(event[0]) == _PP_EVENT_WRITE_BACKUP_COMMITTED:
+            return PPHostTreeEvent(
+                seq=int(event[1]),
+                kind=kind,
+                rid=event[2],
+                loaded_from_storage=int(event[3]),
+                node_ids=[int(v) for v in event[4]],
+                node_key_lens=[int(v) for v in event[5]],
+                node_last_hashes=list(event[6]),
+                node_extra_keys=list(event[7]),
+                node_parent_key_lens=[int(v) for v in event[8]],
+                node_parent_last_hashes=list(event[9]),
+                node_parent_extra_keys=list(event[10]),
+            )
+        return PPHostTreeEvent(
+            seq=int(event[1]),
+            kind=kind,
+            rid=event[2],
+            loaded_from_storage=int(event[3]),
+        )
+    if isinstance(event, dict):
+        return PPHostTreeEvent(
+            seq=int(event.get("seq", 0)),
+            kind=str(event["kind"]),
+            rid=event.get("rid"),
+            loaded_from_storage=int(event.get("loaded_from_storage", 0)),
+            node_ids=[int(v) for v in event.get("node_ids", [])],
+            node_key_lens=[int(v) for v in event.get("node_key_lens", [])],
+            node_last_hashes=list(event.get("node_last_hashes", [])),
+            node_extra_keys=list(event.get("node_extra_keys", [])),
+            node_parent_key_lens=[
+                int(v) for v in event.get("node_parent_key_lens", [])
+            ],
+            node_parent_last_hashes=list(event.get("node_parent_last_hashes", [])),
+            node_parent_extra_keys=list(event.get("node_parent_extra_keys", [])),
+        )
+    raise TypeError(f"Unsupported PP host tree event wire type: {type(event)!r}")
 
 
 class HiRadixCache(RadixCache):
@@ -993,21 +1074,7 @@ class HiRadixCache(RadixCache):
             event.loaded_from_storage,
             len(self.pp_outgoing_host_tree_events),
         )
-        self.pp_outgoing_host_tree_events.append(
-            {
-                "seq": event.seq,
-                "kind": event.kind,
-                "rid": event.rid,
-                "loaded_from_storage": event.loaded_from_storage,
-                "node_ids": list(event.node_ids),
-                "node_key_lens": list(event.node_key_lens),
-                "node_last_hashes": list(event.node_last_hashes),
-                "node_extra_keys": list(event.node_extra_keys),
-                "node_parent_key_lens": list(event.node_parent_key_lens),
-                "node_parent_last_hashes": list(event.node_parent_last_hashes),
-                "node_parent_extra_keys": list(event.node_parent_extra_keys),
-            }
-        )
+        self.pp_outgoing_host_tree_events.append(_encode_pp_host_tree_wire_event(event))
 
     def _next_pp_host_tree_seq(self) -> int:
         self.pp_host_tree_event_seq += 1
@@ -1024,12 +1091,14 @@ class HiRadixCache(RadixCache):
                 len(events),
                 [
                     (
-                        int(event.get("seq", 0)),
-                        str(event.get("kind")),
-                        event.get("rid"),
-                        int(event.get("loaded_from_storage", 0)),
+                        decoded.seq,
+                        decoded.kind,
+                        decoded.rid,
+                        decoded.loaded_from_storage,
                     )
-                    for event in events[:8]
+                    for decoded in [
+                        _decode_pp_host_tree_wire_event(event) for event in events[:8]
+                    ]
                 ],
             )
         return events
@@ -1045,41 +1114,24 @@ class HiRadixCache(RadixCache):
             len(self.pp_pending_host_tree_events),
             [
                 (
-                    int(event.get("seq", 0)),
-                    str(event.get("kind")),
-                    event.get("rid"),
-                    int(event.get("loaded_from_storage", 0)),
+                    decoded.seq,
+                    decoded.kind,
+                    decoded.rid,
+                    decoded.loaded_from_storage,
                 )
-                for event in events[:8]
+                for decoded in [
+                    _decode_pp_host_tree_wire_event(event) for event in events[:8]
+                ]
             ],
         )
         for event in events:
+            decoded = _decode_pp_host_tree_wire_event(event)
             if (
-                str(event.get("kind")) == "WRITE_BACKUP_COMMITTED"
+                decoded.kind == "WRITE_BACKUP_COMMITTED"
                 and not self._pp_write_backup_replay_enabled()
             ):
                 continue
-            self.pp_pending_host_tree_events.append(
-                PPHostTreeEvent(
-                    seq=int(event.get("seq", 0)),
-                    kind=str(event["kind"]),
-                    rid=event.get("rid"),
-                    loaded_from_storage=int(event.get("loaded_from_storage", 0)),
-                    node_ids=[int(v) for v in event.get("node_ids", [])],
-                    node_key_lens=[int(v) for v in event.get("node_key_lens", [])],
-                    node_last_hashes=list(event.get("node_last_hashes", [])),
-                    node_extra_keys=list(event.get("node_extra_keys", [])),
-                    node_parent_key_lens=[
-                        int(v) for v in event.get("node_parent_key_lens", [])
-                    ],
-                    node_parent_last_hashes=list(
-                        event.get("node_parent_last_hashes", [])
-                    ),
-                    node_parent_extra_keys=list(
-                        event.get("node_parent_extra_keys", [])
-                    ),
-                )
-            )
+            self.pp_pending_host_tree_events.append(decoded)
 
     def stage_pp_incoming_prefetch_skip_events(
         self, events: List[dict[str, Any]]
@@ -1089,9 +1141,10 @@ class HiRadixCache(RadixCache):
 
         staged_rids = []
         for event in events:
-            if str(event.get("kind")) != "PREFETCH_SKIP":
+            decoded = _decode_pp_host_tree_wire_event(event)
+            if decoded.kind != "PREFETCH_SKIP":
                 continue
-            req_id = event.get("rid")
+            req_id = decoded.rid
             if req_id is None:
                 continue
             req_id = str(req_id)

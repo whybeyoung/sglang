@@ -1498,15 +1498,13 @@ class Scheduler(
             if (
                 self.attn_tp_rank == 0
                 and self.attn_cp_rank == 0
-                and isinstance(recv_reqs, dict)
-                and "recv_reqs" in recv_reqs
             ):
-                pp_hicache_host_tree_events = list(
-                    recv_reqs.get("hicache_host_tree_events", [])
-                )
-                recv_reqs = recv_reqs["recv_reqs"]
-            elif self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                pp_hicache_host_tree_events = []
+                if hasattr(self, "_pp_unpack_req_payload"):
+                    recv_reqs, pp_hicache_host_tree_events = (
+                        self._pp_unpack_req_payload(recv_reqs)
+                    )
+                else:
+                    pp_hicache_host_tree_events = []
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:

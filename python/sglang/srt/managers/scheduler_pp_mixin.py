@@ -34,6 +34,9 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 
 logger = logging.getLogger(__name__)
 
+_PP_REQ_PAYLOAD_V1 = "__pp_req_payload_v1__"
+_PP_RELEASE_PAYLOAD_V1 = "__pp_release_payload_v1__"
+
 
 class _PPPrefillDebugFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -96,6 +99,30 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_pack_req_payload(
+        self: Scheduler, recv_reqs, hicache_host_tree_events: List[object]
+    ):
+        if not hicache_host_tree_events:
+            return recv_reqs
+        return (
+            _PP_REQ_PAYLOAD_V1,
+            recv_reqs,
+            hicache_host_tree_events,
+        )
+
+    def _pp_unpack_req_payload(
+        self: Scheduler, payload
+    ) -> Tuple[object, List[object]]:
+        if (
+            isinstance(payload, tuple)
+            and len(payload) == 3
+            and payload[0] == _PP_REQ_PAYLOAD_V1
+        ):
+            return payload[1], list(payload[2] or [])
+        if isinstance(payload, dict) and "recv_reqs" in payload:
+            return payload["recv_reqs"], list(payload.get("hicache_host_tree_events", []))
+        return payload, []
+
     def _pp_prefill_safe_len(self: Scheduler, value) -> int:
         if value is None:
             return 0
@@ -311,20 +338,25 @@ class SchedulerPPMixin:
             )
         ):
             return release_rids
-        return {
-            "release_rids": list(release_rids or []),
-            "launch_frontier_ack": {
-                "mb_id": launch_ack_mb_id,
-                "rids": list(launch_ack_rids or []),
-                "barrier_rid": launch_ack_barrier_rid,
-            },
-        }
+        return (
+            _PP_RELEASE_PAYLOAD_V1,
+            list(release_rids or []),
+            launch_ack_mb_id,
+            list(launch_ack_rids or []),
+            launch_ack_barrier_rid,
+        )
 
     def _pp_unpack_release_payload(
         self: Scheduler, payload
     ) -> Tuple[Optional[List[str]], Optional[int], List[str], Optional[str]]:
         if payload is None:
             return None, None, [], None
+        if (
+            isinstance(payload, tuple)
+            and len(payload) == 5
+            and payload[0] == _PP_RELEASE_PAYLOAD_V1
+        ):
+            return payload[1], payload[2], list(payload[3] or []), payload[4]
         if isinstance(payload, dict):
             release_rids = payload.get("release_rids")
             ack_payload = payload.get("launch_frontier_ack") or {}
@@ -466,12 +498,7 @@ class SchedulerPPMixin:
             and hasattr(self.tree_cache, "consume_pp_host_tree_events")
         ):
             events = self.tree_cache.consume_pp_host_tree_events()
-        if not events:
-            return recv_reqs
-        return {
-            "recv_reqs": recv_reqs,
-            "hicache_host_tree_events": events,
-        }
+        return self._pp_pack_req_payload(recv_reqs, events)
 
     def _pp_apply_hicache_sync_before_batch(self: Scheduler) -> None:
         if (
@@ -518,8 +545,6 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self._pp_activate_launch_frontier_ack(mb_id)
-                self.pp_current_prefill_mb_id = mb_id
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
