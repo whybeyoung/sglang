@@ -789,6 +789,13 @@ class SchedulerMetricsMixin:
             if hasattr(tc, "consume_write_backup_replay_snapshot")
             else {}
         )
+        tree_churn = (
+            tc.consume_tree_churn_snapshot()
+            if hasattr(tc, "consume_tree_churn_snapshot")
+            and getattr(self, "attn_tp_rank", 0) == 0
+            and getattr(self, "attn_cp_rank", 0) == 0
+            else {}
+        )
         tree_shape = (
             tc.get_tree_shape_snapshot()
             if hasattr(tc, "get_tree_shape_snapshot")
@@ -822,8 +829,11 @@ class SchedulerMetricsMixin:
             "match_avg_walk=%.2f match_max_walk=%s match_avg_splits=%.2f "
             "match_avg_host_climb=%.2f match_avg_backup_climb=%.2f match_avg_segments=%.2f "
             "wb_barrier_hits=%s wb_replay_local=%s wb_replay_auth=%s wb_replay_miss=%s "
-            "wb_pending=%s tree_nodes=%s tree_evicted=%s tree_backuped=%s tree_leaves=%s "
-            "tree_max_depth=%s tree_max_fanout=%s tree_allocated_id=%s",
+            "wb_pending=%s wb_commit_nodes=%s tree_nodes=%s tree_evicted=%s "
+            "tree_backuped=%s tree_leaves=%s tree_max_depth=%s tree_max_fanout=%s "
+            "tree_allocated_id=%s tree_alloc_delta=%s alloc_match_split=%s "
+            "alloc_insert_split=%s alloc_host_insert_split=%s alloc_device_leaf=%s "
+            "alloc_host_leaf=%s delete_regular_leaf=%s delete_host_leaf=%s",
             getattr(self, "pp_rank", None),
             getattr(self, "attn_cp_rank", None),
             getattr(self, "attn_tp_rank", None),
@@ -862,6 +872,7 @@ class SchedulerMetricsMixin:
             replay_perf.get("apply_authoritative", 0),
             replay_perf.get("miss", 0),
             replay_perf.get("pending_wb_events", 0),
+            replay_perf.get("commit_nodes", 0),
             tree_shape.get("nodes", -1),
             tree_shape.get("evicted_nodes", -1),
             tree_shape.get("backuped_nodes", -1),
@@ -869,6 +880,14 @@ class SchedulerMetricsMixin:
             tree_shape.get("max_depth", -1),
             tree_shape.get("max_fanout", -1),
             tree_shape.get("allocated_node_id", -1),
+            tree_churn.get("allocated_delta", -1),
+            tree_churn.get("alloc_match_split", -1),
+            tree_churn.get("alloc_insert_split", -1),
+            tree_churn.get("alloc_host_insert_split", -1),
+            tree_churn.get("alloc_device_leaf", -1),
+            tree_churn.get("alloc_host_leaf", -1),
+            tree_churn.get("delete_regular_leaf", -1),
+            tree_churn.get("delete_host_leaf", -1),
         )
 
     def _emit_kv_metrics(self: Scheduler):

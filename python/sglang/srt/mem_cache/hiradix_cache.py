@@ -247,6 +247,15 @@ class HiRadixCache(RadixCache):
         self._write_backup_replay_apply_local_ack = 0
         self._write_backup_replay_apply_authoritative = 0
         self._write_backup_replay_miss = 0
+        self._tree_counter_last_snapshot = 0
+        self._tree_alloc_match_split = 0
+        self._tree_alloc_insert_split = 0
+        self._tree_alloc_host_insert_split = 0
+        self._tree_alloc_device_leaf = 0
+        self._tree_alloc_host_leaf = 0
+        self._tree_delete_regular_leaf = 0
+        self._tree_delete_host_leaf = 0
+        self._write_backup_commit_nodes = 0
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -331,6 +340,7 @@ class HiRadixCache(RadixCache):
             "apply_local_ack": self._write_backup_replay_apply_local_ack,
             "apply_authoritative": self._write_backup_replay_apply_authoritative,
             "miss": self._write_backup_replay_miss,
+            "commit_nodes": self._write_backup_commit_nodes,
             "pending_wb_events": sum(
                 1
                 for event in self.pp_pending_host_tree_events
@@ -340,6 +350,7 @@ class HiRadixCache(RadixCache):
         self._write_backup_replay_apply_local_ack = 0
         self._write_backup_replay_apply_authoritative = 0
         self._write_backup_replay_miss = 0
+        self._write_backup_commit_nodes = 0
         return snapshot
 
     def get_tree_shape_snapshot(self) -> dict[str, int]:
@@ -373,6 +384,28 @@ class HiRadixCache(RadixCache):
             "max_fanout": max_fanout,
             "allocated_node_id": max(0, TreeNode.counter - 1),
         }
+
+    def consume_tree_churn_snapshot(self) -> dict[str, int]:
+        current_counter = max(0, TreeNode.counter - 1)
+        snapshot = {
+            "allocated_delta": max(0, current_counter - self._tree_counter_last_snapshot),
+            "alloc_match_split": self._tree_alloc_match_split,
+            "alloc_insert_split": self._tree_alloc_insert_split,
+            "alloc_host_insert_split": self._tree_alloc_host_insert_split,
+            "alloc_device_leaf": self._tree_alloc_device_leaf,
+            "alloc_host_leaf": self._tree_alloc_host_leaf,
+            "delete_regular_leaf": self._tree_delete_regular_leaf,
+            "delete_host_leaf": self._tree_delete_host_leaf,
+        }
+        self._tree_counter_last_snapshot = current_counter
+        self._tree_alloc_match_split = 0
+        self._tree_alloc_insert_split = 0
+        self._tree_alloc_host_insert_split = 0
+        self._tree_alloc_device_leaf = 0
+        self._tree_alloc_host_leaf = 0
+        self._tree_delete_regular_leaf = 0
+        self._tree_delete_host_leaf = 0
+        return snapshot
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -840,6 +873,16 @@ class HiRadixCache(RadixCache):
         self.pp_retry_prefetch_req_ids.clear()
         self.pp_authoritative_revoked_req_ids.clear()
         self.pp_soft_skipped_req_ids.clear()
+        self.pp_staged_prefetch_skip_req_ids.clear()
+        self._tree_counter_last_snapshot = 0
+        self._tree_alloc_match_split = 0
+        self._tree_alloc_insert_split = 0
+        self._tree_alloc_host_insert_split = 0
+        self._tree_alloc_device_leaf = 0
+        self._tree_alloc_host_leaf = 0
+        self._tree_delete_regular_leaf = 0
+        self._tree_delete_host_leaf = 0
+        self._write_backup_commit_nodes = 0
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
@@ -1411,6 +1454,7 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(backuped_node)
             if self.enable_storage:
                 self.write_backup_storage(backuped_node)
+        self._write_backup_commit_nodes += len(committed_nodes)
         if emit_event:
             self._append_pp_host_tree_event(
                 PPHostTreeEvent(
@@ -2158,6 +2202,7 @@ class HiRadixCache(RadixCache):
         self._record_remove_event(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
+        self._tree_delete_regular_leaf += 1
         self._delete_leaf(node)
         return num_evicted
 
@@ -2188,6 +2233,7 @@ class HiRadixCache(RadixCache):
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
             assert v == x, f"parent does not have child key, {key}"
+            self._tree_delete_host_leaf += 1
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
             self._update_host_leaf_status(x.parent)
@@ -2835,6 +2881,7 @@ class HiRadixCache(RadixCache):
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
+                self._tree_alloc_host_insert_split += 1
                 node = new_node
 
             if len(key):
@@ -2842,6 +2889,7 @@ class HiRadixCache(RadixCache):
 
         if len(key):
             new_node = TreeNode(priority=node.priority)
+            self._tree_alloc_host_leaf += 1
             new_node.parent = node
             new_node.key = key
             new_node.value = None
@@ -2890,6 +2938,7 @@ class HiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                self._tree_alloc_match_split += 1
                 split_count += 1
                 if not new_node.evicted:
                     value.append(new_node.value)
@@ -2996,6 +3045,7 @@ class HiRadixCache(RadixCache):
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
+                self._tree_alloc_insert_split += 1
                 # shared-prefix node should also reflect max priority
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
@@ -3018,6 +3068,7 @@ class HiRadixCache(RadixCache):
 
         if len(key):
             new_node = TreeNode(priority=priority)
+            self._tree_alloc_device_leaf += 1
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
