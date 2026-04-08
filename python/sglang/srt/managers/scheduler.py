@@ -2506,6 +2506,8 @@ class Scheduler(
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if hasattr(self, "_record_prefill_pick_reason"):
+                self._record_prefill_pick_reason("early_full_or_empty")
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -2521,6 +2523,8 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
+            if hasattr(self, "_record_prefill_pick_reason"):
+                self._record_prefill_pick_reason("chunked_capacity_block")
             return None
 
         # Get priority queue
@@ -2530,6 +2534,8 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
+            if hasattr(self, "_record_prefill_pick_reason"):
+                self._record_prefill_pick_reason("test_retract_block")
             return None
 
         # Determine chunked_prefill_size for this batch
@@ -2614,6 +2620,8 @@ class Scheduler(
                         ],
                         req.rid,
                     )
+                if hasattr(self, "_record_prefill_pick_reason"):
+                    self._record_prefill_pick_reason("locally_revoked_break")
                 break
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
@@ -2645,6 +2653,8 @@ class Scheduler(
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
+                    if hasattr(self, "_record_prefill_pick_reason"):
+                        self._record_prefill_pick_reason("running_full_break")
                     break
 
             if (
@@ -2680,6 +2690,8 @@ class Scheduler(
                     )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if hasattr(self, "_record_prefill_pick_reason"):
+                        self._record_prefill_pick_reason("prefetch_break")
                     break
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
@@ -2714,6 +2726,8 @@ class Scheduler(
                         req.last_host_node.id if req.last_host_node is not None else None,
                         [x.rid for x in self.waiting_queue[:8]],
                     )
+                if hasattr(self, "_record_prefill_pick_reason"):
+                    self._record_prefill_pick_reason("write_backup_break")
                 break
             if frontier_diag:
                 logger.warning(
@@ -2779,6 +2793,10 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
+                    if hasattr(self, "_record_prefill_pick_reason"):
+                        self._record_prefill_pick_reason("add_no_token_break")
+                elif hasattr(self, "_record_prefill_pick_reason"):
+                    self._record_prefill_pick_reason("add_other_break")
                 # revert matched mamba idx to avoid memory leak, if req is not added
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added and req.mamba_pool_idx is not None:
@@ -2791,6 +2809,8 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if hasattr(self, "_record_prefill_pick_reason"):
+                self._record_prefill_pick_reason("empty_result")
             return None
 
         if frontier_diag and (can_run_list or adder.preempt_list):

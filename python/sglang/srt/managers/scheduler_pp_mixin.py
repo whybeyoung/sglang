@@ -655,7 +655,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_comm_work(self.send_proxy_work, kind="proxy")
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -679,7 +679,7 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(self.send_req_work, kind="req")
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             self._pp_build_req_payload(recv_reqs),
@@ -892,7 +892,9 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
+                self._pp_commit_comm_work(
+                    send_consensus_bootstrapped_work, kind="consensus_bootstrap"
+                )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
@@ -901,7 +903,7 @@ class SchedulerPPMixin:
                         bootstrapped_rids,
                     )
                 )
-                self._pp_commit_comm_work(send_release_work)
+                self._pp_commit_comm_work(send_release_work, kind="release")
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs,
@@ -1123,7 +1125,7 @@ class SchedulerPPMixin:
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(self.send_req_work, kind="req")
 
                 # reaching consensus through PP ranks
                 retract_rids = self._pp_pd_get_retract_ids(mb_id)
@@ -1136,7 +1138,7 @@ class SchedulerPPMixin:
 
                 transferred_rids = self._pp_pd_get_decode_transferred_ids()
                 tmbs[mb_id] = transferred_rids
-                self._pp_commit_comm_work(send_transfer_work)
+                self._pp_commit_comm_work(send_transfer_work, kind="transfer")
 
                 # get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
@@ -1158,7 +1160,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_comm_work(self.send_proxy_work, kind="proxy")
 
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
@@ -1224,7 +1226,7 @@ class SchedulerPPMixin:
                     next_release_rids = self.process_decode_transfer_queue(
                         next_release_rids
                     )
-                self._pp_commit_comm_work(send_release_work)
+                self._pp_commit_comm_work(send_release_work, kind="release")
 
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -1979,7 +1981,7 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         next_mb_id: int,
     ) -> Tuple[PPProxyTensors, GenerationBatchResult, torch.cuda.Event]:
-        self._pp_commit_comm_work(work=self.send_output_work)
+        self._pp_commit_comm_work(work=self.send_output_work, kind="output")
         (
             next_pp_outputs,
             next_batch_result,

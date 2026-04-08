@@ -145,6 +145,28 @@ class SchedulerMetricsMixin:
         self._pp_comm_wait_transfer_calls = 0
         self._pp_comm_wait_transfer_total_ms = 0.0
         self._pp_comm_wait_transfer_max_ms = 0.0
+        self._pp_comm_wait_output_calls = 0
+        self._pp_comm_wait_output_total_ms = 0.0
+        self._pp_comm_wait_output_max_ms = 0.0
+        self._pp_comm_wait_proxy_calls = 0
+        self._pp_comm_wait_proxy_total_ms = 0.0
+        self._pp_comm_wait_proxy_max_ms = 0.0
+        self._pp_comm_wait_consensus_bootstrap_calls = 0
+        self._pp_comm_wait_consensus_bootstrap_total_ms = 0.0
+        self._pp_comm_wait_consensus_bootstrap_max_ms = 0.0
+        self._pp_comm_wait_release_calls = 0
+        self._pp_comm_wait_release_total_ms = 0.0
+        self._pp_comm_wait_release_max_ms = 0.0
+        self._prefill_pick_early_full_or_empty_count = 0
+        self._prefill_pick_chunked_capacity_block_count = 0
+        self._prefill_pick_test_retract_block_count = 0
+        self._prefill_pick_locally_revoked_break_count = 0
+        self._prefill_pick_running_full_break_count = 0
+        self._prefill_pick_prefetch_break_count = 0
+        self._prefill_pick_write_backup_break_count = 0
+        self._prefill_pick_add_no_token_break_count = 0
+        self._prefill_pick_add_other_break_count = 0
+        self._prefill_pick_empty_result_count = 0
         self._pp_frontier_ack_recv_count = 0
         self._pp_frontier_ack_activate_count = 0
         self._pp_frontier_ack_consume_count = 0
@@ -452,6 +474,52 @@ class SchedulerMetricsMixin:
             self._pp_comm_wait_transfer_max_ms = max(
                 self._pp_comm_wait_transfer_max_ms, elapsed_ms
             )
+        elif kind == "output":
+            self._pp_comm_wait_output_calls += 1
+            self._pp_comm_wait_output_total_ms += elapsed_ms
+            self._pp_comm_wait_output_max_ms = max(
+                self._pp_comm_wait_output_max_ms, elapsed_ms
+            )
+        elif kind == "proxy":
+            self._pp_comm_wait_proxy_calls += 1
+            self._pp_comm_wait_proxy_total_ms += elapsed_ms
+            self._pp_comm_wait_proxy_max_ms = max(
+                self._pp_comm_wait_proxy_max_ms, elapsed_ms
+            )
+        elif kind == "consensus_bootstrap":
+            self._pp_comm_wait_consensus_bootstrap_calls += 1
+            self._pp_comm_wait_consensus_bootstrap_total_ms += elapsed_ms
+            self._pp_comm_wait_consensus_bootstrap_max_ms = max(
+                self._pp_comm_wait_consensus_bootstrap_max_ms, elapsed_ms
+            )
+        elif kind == "release":
+            self._pp_comm_wait_release_calls += 1
+            self._pp_comm_wait_release_total_ms += elapsed_ms
+            self._pp_comm_wait_release_max_ms = max(
+                self._pp_comm_wait_release_max_ms, elapsed_ms
+            )
+
+    def _record_prefill_pick_reason(self: Scheduler, reason: str):
+        if reason == "early_full_or_empty":
+            self._prefill_pick_early_full_or_empty_count += 1
+        elif reason == "chunked_capacity_block":
+            self._prefill_pick_chunked_capacity_block_count += 1
+        elif reason == "test_retract_block":
+            self._prefill_pick_test_retract_block_count += 1
+        elif reason == "locally_revoked_break":
+            self._prefill_pick_locally_revoked_break_count += 1
+        elif reason == "running_full_break":
+            self._prefill_pick_running_full_break_count += 1
+        elif reason == "prefetch_break":
+            self._prefill_pick_prefetch_break_count += 1
+        elif reason == "write_backup_break":
+            self._prefill_pick_write_backup_break_count += 1
+        elif reason == "add_no_token_break":
+            self._prefill_pick_add_no_token_break_count += 1
+        elif reason == "add_other_break":
+            self._prefill_pick_add_other_break_count += 1
+        elif reason == "empty_result":
+            self._prefill_pick_empty_result_count += 1
 
     def _record_pp_frontier_ack_recv(self: Scheduler):
         self._pp_frontier_ack_recv_count += 1
@@ -486,6 +554,16 @@ class SchedulerMetricsMixin:
             "pick_calls": self._prefill_pick_calls,
             "pick_avg_ms": _avg(self._prefill_pick_total_ms, self._prefill_pick_calls),
             "pick_max_ms": self._prefill_pick_max_ms,
+            "pick_early_full_or_empty": self._prefill_pick_early_full_or_empty_count,
+            "pick_chunked_capacity_block": self._prefill_pick_chunked_capacity_block_count,
+            "pick_test_retract_block": self._prefill_pick_test_retract_block_count,
+            "pick_locally_revoked_break": self._prefill_pick_locally_revoked_break_count,
+            "pick_running_full_break": self._prefill_pick_running_full_break_count,
+            "pick_prefetch_break": self._prefill_pick_prefetch_break_count,
+            "pick_write_backup_break": self._prefill_pick_write_backup_break_count,
+            "pick_add_no_token_break": self._prefill_pick_add_no_token_break_count,
+            "pick_add_other_break": self._prefill_pick_add_other_break_count,
+            "pick_empty_result": self._prefill_pick_empty_result_count,
             "run_calls": self._prefill_run_calls,
             "run_avg_ms": _avg(self._prefill_run_total_ms, self._prefill_run_calls),
             "run_max_ms": self._prefill_run_max_ms,
@@ -506,6 +584,16 @@ class SchedulerMetricsMixin:
         self._prefill_pick_calls = 0
         self._prefill_pick_total_ms = 0.0
         self._prefill_pick_max_ms = 0.0
+        self._prefill_pick_early_full_or_empty_count = 0
+        self._prefill_pick_chunked_capacity_block_count = 0
+        self._prefill_pick_test_retract_block_count = 0
+        self._prefill_pick_locally_revoked_break_count = 0
+        self._prefill_pick_running_full_break_count = 0
+        self._prefill_pick_prefetch_break_count = 0
+        self._prefill_pick_write_backup_break_count = 0
+        self._prefill_pick_add_no_token_break_count = 0
+        self._prefill_pick_add_other_break_count = 0
+        self._prefill_pick_empty_result_count = 0
         self._prefill_run_calls = 0
         self._prefill_run_total_ms = 0.0
         self._prefill_run_max_ms = 0.0
@@ -561,6 +649,27 @@ class SchedulerMetricsMixin:
                 self._pp_comm_wait_transfer_calls,
             ),
             "wait_transfer_max_ms": self._pp_comm_wait_transfer_max_ms,
+            "wait_output_calls": self._pp_comm_wait_output_calls,
+            "wait_output_avg_ms": _avg(
+                self._pp_comm_wait_output_total_ms, self._pp_comm_wait_output_calls
+            ),
+            "wait_output_max_ms": self._pp_comm_wait_output_max_ms,
+            "wait_proxy_calls": self._pp_comm_wait_proxy_calls,
+            "wait_proxy_avg_ms": _avg(
+                self._pp_comm_wait_proxy_total_ms, self._pp_comm_wait_proxy_calls
+            ),
+            "wait_proxy_max_ms": self._pp_comm_wait_proxy_max_ms,
+            "wait_consensus_bootstrap_calls": self._pp_comm_wait_consensus_bootstrap_calls,
+            "wait_consensus_bootstrap_avg_ms": _avg(
+                self._pp_comm_wait_consensus_bootstrap_total_ms,
+                self._pp_comm_wait_consensus_bootstrap_calls,
+            ),
+            "wait_consensus_bootstrap_max_ms": self._pp_comm_wait_consensus_bootstrap_max_ms,
+            "wait_release_calls": self._pp_comm_wait_release_calls,
+            "wait_release_avg_ms": _avg(
+                self._pp_comm_wait_release_total_ms, self._pp_comm_wait_release_calls
+            ),
+            "wait_release_max_ms": self._pp_comm_wait_release_max_ms,
         }
         self._pp_comm_send_calls = 0
         self._pp_comm_send_total_ms = 0.0
@@ -586,6 +695,18 @@ class SchedulerMetricsMixin:
         self._pp_comm_wait_transfer_calls = 0
         self._pp_comm_wait_transfer_total_ms = 0.0
         self._pp_comm_wait_transfer_max_ms = 0.0
+        self._pp_comm_wait_output_calls = 0
+        self._pp_comm_wait_output_total_ms = 0.0
+        self._pp_comm_wait_output_max_ms = 0.0
+        self._pp_comm_wait_proxy_calls = 0
+        self._pp_comm_wait_proxy_total_ms = 0.0
+        self._pp_comm_wait_proxy_max_ms = 0.0
+        self._pp_comm_wait_consensus_bootstrap_calls = 0
+        self._pp_comm_wait_consensus_bootstrap_total_ms = 0.0
+        self._pp_comm_wait_consensus_bootstrap_max_ms = 0.0
+        self._pp_comm_wait_release_calls = 0
+        self._pp_comm_wait_release_total_ms = 0.0
+        self._pp_comm_wait_release_max_ms = 0.0
         return snapshot
 
     def consume_pp_frontier_ack_snapshot(self: Scheduler) -> dict[str, int]:
@@ -1140,6 +1261,15 @@ class SchedulerMetricsMixin:
             "pp_wait_req_calls=%s pp_wait_req_avg_ms=%.3f pp_wait_req_max_ms=%.3f "
             "pp_wait_bootstrap_calls=%s pp_wait_bootstrap_avg_ms=%.3f pp_wait_bootstrap_max_ms=%.3f "
             "pp_wait_transfer_calls=%s pp_wait_transfer_avg_ms=%.3f pp_wait_transfer_max_ms=%.3f "
+            "pp_wait_output_calls=%s pp_wait_output_avg_ms=%.3f pp_wait_output_max_ms=%.3f "
+            "pp_wait_proxy_calls=%s pp_wait_proxy_avg_ms=%.3f pp_wait_proxy_max_ms=%.3f "
+            "pp_wait_consensus_bootstrap_calls=%s pp_wait_consensus_bootstrap_avg_ms=%.3f "
+            "pp_wait_consensus_bootstrap_max_ms=%.3f "
+            "pp_wait_release_calls=%s pp_wait_release_avg_ms=%.3f pp_wait_release_max_ms=%.3f "
+            "pick_early_full_or_empty=%s pick_chunked_capacity_block=%s pick_test_retract_block=%s "
+            "pick_locally_revoked_break=%s pick_running_full_break=%s pick_prefetch_break=%s "
+            "pick_write_backup_break=%s pick_add_no_token_break=%s pick_add_other_break=%s "
+            "pick_empty_result=%s "
             "ack_recv=%s ack_activate=%s ack_consume=%s ack_consume_miss=%s "
             "ack_pending_same_mb_miss=%s ack_chunked_mismatch=%s "
             "ack_waiting_mismatch=%s ack_exhausted=%s ack_pending_slots=%s ack_active_slots=%s "
@@ -1236,6 +1366,28 @@ class SchedulerMetricsMixin:
             pp_comm_perf.get("wait_transfer_calls", 0),
             pp_comm_perf.get("wait_transfer_avg_ms", 0.0),
             pp_comm_perf.get("wait_transfer_max_ms", 0.0),
+            pp_comm_perf.get("wait_output_calls", 0),
+            pp_comm_perf.get("wait_output_avg_ms", 0.0),
+            pp_comm_perf.get("wait_output_max_ms", 0.0),
+            pp_comm_perf.get("wait_proxy_calls", 0),
+            pp_comm_perf.get("wait_proxy_avg_ms", 0.0),
+            pp_comm_perf.get("wait_proxy_max_ms", 0.0),
+            pp_comm_perf.get("wait_consensus_bootstrap_calls", 0),
+            pp_comm_perf.get("wait_consensus_bootstrap_avg_ms", 0.0),
+            pp_comm_perf.get("wait_consensus_bootstrap_max_ms", 0.0),
+            pp_comm_perf.get("wait_release_calls", 0),
+            pp_comm_perf.get("wait_release_avg_ms", 0.0),
+            pp_comm_perf.get("wait_release_max_ms", 0.0),
+            prefill_stage_perf.get("pick_early_full_or_empty", 0),
+            prefill_stage_perf.get("pick_chunked_capacity_block", 0),
+            prefill_stage_perf.get("pick_test_retract_block", 0),
+            prefill_stage_perf.get("pick_locally_revoked_break", 0),
+            prefill_stage_perf.get("pick_running_full_break", 0),
+            prefill_stage_perf.get("pick_prefetch_break", 0),
+            prefill_stage_perf.get("pick_write_backup_break", 0),
+            prefill_stage_perf.get("pick_add_no_token_break", 0),
+            prefill_stage_perf.get("pick_add_other_break", 0),
+            prefill_stage_perf.get("pick_empty_result", 0),
             pp_frontier_ack.get("recv", 0),
             pp_frontier_ack.get("activate", 0),
             pp_frontier_ack.get("consume", 0),
