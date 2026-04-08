@@ -1446,25 +1446,26 @@ class HiRadixCache(RadixCache):
                 if req_id not in self.pp_locally_revoked_req_ids:
                     self.pp_locally_revoked_req_ids.add(req_id)
                     self.pp_locally_revoked_req_queue.append(req_id)
-        logger.warning(
-            "[HiCachePrefetchCleanup] rid=%s zero_hit=%s mark_local_revoke=%s had_ongoing=%s ongoing_after=%s loaded_tokens_before=%s loaded_tokens_after=%s zero_hit_marked=%s",
-            req_id,
-            zero_hit,
-            mark_local_revoke,
-            had_ongoing,
-            req_id in self.ongoing_prefetch,
-            loaded_tokens_before,
-            self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
-            req_id in self.zero_hit_prefetch_req_ids,
-        )
-        logger.warning(
-            "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_cleanup zero_hit=%s",
-            self.pp_rank,
-            self.attn_cp_rank,
-            _safe_attn_tp_rank(self),
-            req_id,
-            zero_hit,
-        )
+        if self._hicache_verbose_enabled():
+            logger.warning(
+                "[HiCachePrefetchCleanup] rid=%s zero_hit=%s mark_local_revoke=%s had_ongoing=%s ongoing_after=%s loaded_tokens_before=%s loaded_tokens_after=%s zero_hit_marked=%s",
+                req_id,
+                zero_hit,
+                mark_local_revoke,
+                had_ongoing,
+                req_id in self.ongoing_prefetch,
+                loaded_tokens_before,
+                self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
+                req_id in self.zero_hit_prefetch_req_ids,
+            )
+            logger.warning(
+                "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_cleanup zero_hit=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                _safe_attn_tp_rank(self),
+                req_id,
+                zero_hit,
+            )
 
     def peek_pp_locally_revoked_req(self) -> Optional[str]:
         while self.pp_locally_revoked_req_queue:
@@ -1545,7 +1546,7 @@ class HiRadixCache(RadixCache):
                 if purged_queue > 0 and hasattr(revoke_queue, "not_full"):
                     revoke_queue.not_full.notify_all()
 
-        if purged_deferred or purged_queue:
+        if (purged_deferred or purged_queue) and self._hicache_verbose_enabled():
             logger.warning(
                 "[HiCachePPReplay][revoke_purge_local_residue] rid=%s purged_deferred=%s purged_queue=%s",
                 req_id,
@@ -1562,10 +1563,11 @@ class HiRadixCache(RadixCache):
         self.clear_follow_rank_prefetch_issue_pending(req_id)
         self.pp_soft_skipped_req_ids.add(req_id)
         if req_id in self.ongoing_prefetch:
-            logger.warning(
-                "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=cleanup_ongoing_soft",
-                req_id,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=cleanup_ongoing_soft",
+                    req_id,
+                )
             self._drain_single_revoke_req(
                 req_id,
                 zero_hit=True,
@@ -1573,10 +1575,11 @@ class HiRadixCache(RadixCache):
             )
             return True
         self.zero_hit_prefetch_req_ids.add(req_id)
-        logger.warning(
-            "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=mark_zero_hit_soft",
-            req_id,
-        )
+        if self._hicache_verbose_enabled():
+            logger.warning(
+                "[HiCachePPReplay][prefetch_skip_apply] rid=%s action=mark_zero_hit_soft",
+                req_id,
+            )
         return True
 
     def _try_replay_revoke_event(self, event: PPHostTreeEvent) -> bool:
@@ -1589,12 +1592,13 @@ class HiRadixCache(RadixCache):
         # req can leave the request stuck in wait_complete while the upstream
         # rank has already bypassed/revoked the prefetch.
         if req_id in self.ongoing_prefetch:
-            logger.warning(
-                "[HiCachePPReplay][revoke_apply] rid=%s source=upstream ongoing_before=%s loaded_tokens=%s",
-                req_id,
-                True,
-                self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePPReplay][revoke_apply] rid=%s source=upstream ongoing_before=%s loaded_tokens=%s",
+                    req_id,
+                    True,
+                    self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
+                )
             self.pp_authoritative_revoked_req_ids.add(req_id)
             self._purge_matching_local_revoke_residue(req_id)
             self._drain_single_revoke_req(
@@ -1620,23 +1624,25 @@ class HiRadixCache(RadixCache):
                     self.pp_deferred_revoke_req_ids.append(
                         (deferred_req_id, deferred_zero_hit)
                     )
-                logger.warning(
-                    "[HiCachePPReplay][revoke_apply] rid=%s source=deferred_queue zero_hit=%s skipped_unrelated=%s",
-                    req_id,
-                    matched_zero_hit,
-                    skipped,
-                )
+                if self._hicache_verbose_enabled():
+                    logger.warning(
+                        "[HiCachePPReplay][revoke_apply] rid=%s source=deferred_queue zero_hit=%s skipped_unrelated=%s",
+                        req_id,
+                        matched_zero_hit,
+                        skipped,
+                    )
                 self._drain_single_revoke_req(req_id, zero_hit=matched_zero_hit)
                 self.discard_pp_locally_revoked_req(req_id)
                 return True
 
             deferred_head = deferred_req_ids[0]
-            logger.warning(
-                "[HiCachePPReplay][revoke_wait] rid=%s reason=deferred_head_mismatch deferred_head=%s deferred_pending=%s",
-                req_id,
-                deferred_head,
-                deferred_req_ids[:4],
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePPReplay][revoke_wait] rid=%s reason=deferred_head_mismatch deferred_head=%s deferred_pending=%s",
+                    req_id,
+                    deferred_head,
+                    deferred_req_ids[:4],
+                )
 
         scanned_unrelated = []
         while True:
@@ -1651,22 +1657,24 @@ class HiRadixCache(RadixCache):
                 # idempotent no-op so it does not become a permanent PP queue
                 # head blocker.
                 if req_id not in self.ongoing_prefetch:
-                    logger.warning(
-                        "[HiCachePPReplay][revoke_apply] rid=%s source=noop_quiescent scanned_unrelated=%s",
-                        req_id,
-                        [rid for rid, _ in scanned_unrelated[:4]],
-                    )
+                    if self._hicache_verbose_enabled():
+                        logger.warning(
+                            "[HiCachePPReplay][revoke_apply] rid=%s source=noop_quiescent scanned_unrelated=%s",
+                            req_id,
+                            [rid for rid, _ in scanned_unrelated[:4]],
+                        )
                     self._purge_matching_local_revoke_residue(req_id)
                     self.discard_pp_locally_revoked_req(req_id)
                     self.zero_hit_prefetch_req_ids.add(req_id)
                     self.pp_authoritative_revoked_req_ids.add(req_id)
                     return True
-                logger.warning(
-                    "[HiCachePPReplay][revoke_wait] rid=%s reason=no_local_revoke_queue ongoing=%s scanned_unrelated=%s",
-                    req_id,
-                    req_id in self.ongoing_prefetch,
-                    [rid for rid, _ in scanned_unrelated[:4]],
-                )
+                if self._hicache_verbose_enabled():
+                    logger.warning(
+                        "[HiCachePPReplay][revoke_wait] rid=%s reason=no_local_revoke_queue ongoing=%s scanned_unrelated=%s",
+                        req_id,
+                        req_id in self.ongoing_prefetch,
+                        [rid for rid, _ in scanned_unrelated[:4]],
+                    )
                 return False
             queued_req_id, queued_zero_hit = (
                 queued_item if isinstance(queued_item, tuple) else (queued_item, False)
@@ -1680,12 +1688,13 @@ class HiRadixCache(RadixCache):
                 self.pp_deferred_revoke_req_ids.append(
                     (unrelated_req_id, unrelated_zero_hit)
                 )
-            logger.warning(
-                "[HiCachePPReplay][revoke_apply] rid=%s source=local_revoke_queue zero_hit=%s skipped_unrelated=%s",
-                queued_req_id,
-                queued_zero_hit,
-                len(scanned_unrelated),
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePPReplay][revoke_apply] rid=%s source=local_revoke_queue zero_hit=%s skipped_unrelated=%s",
+                    queued_req_id,
+                    queued_zero_hit,
+                    len(scanned_unrelated),
+                )
             self._drain_single_revoke_req(queued_req_id, zero_hit=queued_zero_hit)
             self.discard_pp_locally_revoked_req(queued_req_id)
             return True
@@ -2059,11 +2068,12 @@ class HiRadixCache(RadixCache):
                     self.cache_controller.prefetch_tokens_occupied = 0
                 self.prefetch_loaded_tokens_by_reqid[req_id] = 0
                 self.zero_hit_prefetch_req_ids.discard(req_id)
-                logger.warning(
-                    "[HiCachePPReplay][finalize_empty_apply] rid=%s upstream_loaded=%s",
-                    req_id,
-                    event.loaded_from_storage,
-                )
+                if self._hicache_verbose_enabled():
+                    logger.warning(
+                        "[HiCachePPReplay][finalize_empty_apply] rid=%s upstream_loaded=%s",
+                        req_id,
+                        event.loaded_from_storage,
+                    )
                 return True
             return False
         loaded_from_storage = self._finalize_prefetch_progress(
@@ -3034,12 +3044,13 @@ class HiRadixCache(RadixCache):
             # This request already proved to have no storage benefit on this pass.
             # Skip re-entering the expensive prefetch -> revoke lifecycle and
             # let it go straight through normal recompute.
-            logger.warning(
-                "[HiCachePrefetchDecision] rid=%s action=skip reason=zero_hit_marked tokens=%s threshold=%s",
-                req_id,
-                len(new_input_tokens),
-                self.prefetch_threshold,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePrefetchDecision] rid=%s action=skip reason=zero_hit_marked tokens=%s threshold=%s",
+                    req_id,
+                    len(new_input_tokens),
+                    self.prefetch_threshold,
+                )
             return
 
         new_input_tokens = (
@@ -3053,22 +3064,24 @@ class HiRadixCache(RadixCache):
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
         if not self.enable_storage:
-            logger.warning(
-                "[HiCachePrefetchDecision] rid=%s action=skip reason=storage_disabled tokens=%s aligned_tokens=%s threshold=%s",
-                req_id,
-                len(new_input_tokens),
-                prefetch_length,
-                self.prefetch_threshold,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePrefetchDecision] rid=%s action=skip reason=storage_disabled tokens=%s aligned_tokens=%s threshold=%s",
+                    req_id,
+                    len(new_input_tokens),
+                    prefetch_length,
+                    self.prefetch_threshold,
+                )
             return
         if prefetch_length < self.prefetch_threshold:
-            logger.warning(
-                "[HiCachePrefetchDecision] rid=%s action=skip reason=below_threshold tokens=%s aligned_tokens=%s threshold=%s",
-                req_id,
-                len(new_input_tokens),
-                prefetch_length,
-                self.prefetch_threshold,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePrefetchDecision] rid=%s action=skip reason=below_threshold tokens=%s aligned_tokens=%s threshold=%s",
+                    req_id,
+                    len(new_input_tokens),
+                    prefetch_length,
+                    self.prefetch_threshold,
+                )
             if self._pp_downstream_sync_enabled():
                 self._append_pp_host_tree_event(
                     PPHostTreeEvent(
@@ -3081,16 +3094,17 @@ class HiRadixCache(RadixCache):
         if self._pp_should_skip_large_shallow_prefetch(
             last_host_node, prefetch_length
         ):
-            logger.warning(
-                "[HiCachePrefetchDecision] rid=%s action=skip reason=pp_first_rank_defer_large_shallow "
-                "tokens=%s aligned_tokens=%s anchor_node=%s anchor_key_len=%s threshold=%s",
-                req_id,
-                len(new_input_tokens),
-                prefetch_length,
-                last_host_node.id if last_host_node is not None else None,
-                len(last_host_node.key) if last_host_node is not None and last_host_node.key is not None else 0,
-                self.prefetch_threshold,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePrefetchDecision] rid=%s action=skip reason=pp_first_rank_defer_large_shallow "
+                    "tokens=%s aligned_tokens=%s anchor_node=%s anchor_key_len=%s threshold=%s",
+                    req_id,
+                    len(new_input_tokens),
+                    prefetch_length,
+                    last_host_node.id if last_host_node is not None else None,
+                    len(last_host_node.key) if last_host_node is not None and last_host_node.key is not None else 0,
+                    self.prefetch_threshold,
+                )
             self._append_pp_host_tree_event(
                 PPHostTreeEvent(
                     seq=self._next_pp_host_tree_seq(),
@@ -3100,14 +3114,15 @@ class HiRadixCache(RadixCache):
             )
             return
         if self.cache_controller.prefetch_rate_limited():
-            logger.warning(
-                "[HiCachePrefetchDecision] rid=%s action=skip reason=rate_limited tokens=%s aligned_tokens=%s threshold=%s occupied=%s",
-                req_id,
-                len(new_input_tokens),
-                prefetch_length,
-                self.prefetch_threshold,
-                self.cache_controller.prefetch_tokens_occupied,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePrefetchDecision] rid=%s action=skip reason=rate_limited tokens=%s aligned_tokens=%s threshold=%s occupied=%s",
+                    req_id,
+                    len(new_input_tokens),
+                    prefetch_length,
+                    self.prefetch_threshold,
+                    self.cache_controller.prefetch_tokens_occupied,
+                )
             return
 
         last_host_node.protect_host()
@@ -3118,13 +3133,14 @@ class HiRadixCache(RadixCache):
         if host_indices is None:
             last_host_node.release_host()
             # no sufficient host memory for prefetch
-            logger.warning(
-                "[HiCachePrefetchDecision] rid=%s action=skip reason=host_alloc_failed aligned_tokens=%s threshold=%s occupied=%s",
-                req_id,
-                prefetch_length,
-                self.prefetch_threshold,
-                self.cache_controller.prefetch_tokens_occupied,
-            )
+            if self._hicache_verbose_enabled():
+                logger.warning(
+                    "[HiCachePrefetchDecision] rid=%s action=skip reason=host_alloc_failed aligned_tokens=%s threshold=%s occupied=%s",
+                    req_id,
+                    prefetch_length,
+                    self.prefetch_threshold,
+                    self.cache_controller.prefetch_tokens_occupied,
+                )
             return
         operation = self.cache_controller.prefetch(
             req_id,
@@ -3151,16 +3167,17 @@ class HiRadixCache(RadixCache):
                 last_hash,
                 0 if prefix_keys is None else len(prefix_keys),
             )
-        logger.warning(
-            "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_issue token_count=%s last_hash=%s prefix_keys=%s",
-            self.pp_rank,
-            self.attn_cp_rank,
-            _safe_attn_tp_rank(self),
-            req_id,
-            len(new_input_tokens),
-            last_hash,
-            0 if prefix_keys is None else len(prefix_keys),
-        )
+        if self._hicache_verbose_enabled():
+            logger.warning(
+                "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_issue token_count=%s last_hash=%s prefix_keys=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                _safe_attn_tp_rank(self),
+                req_id,
+                len(new_input_tokens),
+                last_hash,
+                0 if prefix_keys is None else len(prefix_keys),
+            )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
@@ -3168,13 +3185,14 @@ class HiRadixCache(RadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
-        logger.warning(
-            "[HiCachePrefetchDecision] rid=%s action=issue aligned_tokens=%s threshold=%s occupied=%s",
-            req_id,
-            len(new_input_tokens),
-            self.prefetch_threshold,
-            self.cache_controller.prefetch_tokens_occupied,
-        )
+        if self._hicache_verbose_enabled():
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=issue aligned_tokens=%s threshold=%s occupied=%s",
+                req_id,
+                len(new_input_tokens),
+                self.prefetch_threshold,
+                self.cache_controller.prefetch_tokens_occupied,
+            )
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value, req_id: str | None = None
