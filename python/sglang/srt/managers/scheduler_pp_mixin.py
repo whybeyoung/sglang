@@ -877,7 +877,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_comm_work(self.send_proxy_work, kind="proxy")
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,

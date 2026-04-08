@@ -166,6 +166,18 @@ class SchedulerMetricsMixin:
         self._prefill_pick_write_backup_break_count = 0
         self._prefill_pick_add_no_token_break_count = 0
         self._prefill_pick_add_other_break_count = 0
+        self._prefill_pick_add_other_prefill_delayer_count = 0
+        self._prefill_pick_add_other_cp_batch_limit_count = 0
+        self._prefill_pick_add_other_prefill_max_requests_count = 0
+        self._prefill_pick_add_other_real_input_budget_count = 0
+        self._prefill_pick_add_other_input_budget_count = 0
+        self._prefill_pick_add_other_dllm_budget_count = 0
+        self._prefill_pick_add_other_chunk_budget_count = 0
+        self._prefill_pick_add_other_chunk_align_budget_count = 0
+        self._prefill_pick_add_other_budget_input_exhausted_count = 0
+        self._prefill_pick_add_other_budget_chunk_exhausted_count = 0
+        self._prefill_pick_add_other_budget_dllm_exhausted_count = 0
+        self._prefill_pick_add_other_unknown_count = 0
         self._prefill_pick_empty_result_count = 0
         self._pp_frontier_ack_recv_count = 0
         self._pp_frontier_ack_activate_count = 0
@@ -521,6 +533,34 @@ class SchedulerMetricsMixin:
         elif reason == "empty_result":
             self._prefill_pick_empty_result_count += 1
 
+    def _record_prefill_add_other_reason(
+        self: Scheduler, reason: Optional[str]
+    ):
+        if reason == "prefill_delayer":
+            self._prefill_pick_add_other_prefill_delayer_count += 1
+        elif reason == "cp_batch_limit":
+            self._prefill_pick_add_other_cp_batch_limit_count += 1
+        elif reason == "prefill_max_requests":
+            self._prefill_pick_add_other_prefill_max_requests_count += 1
+        elif reason == "real_input_budget":
+            self._prefill_pick_add_other_real_input_budget_count += 1
+        elif reason == "input_budget":
+            self._prefill_pick_add_other_input_budget_count += 1
+        elif reason == "dllm_budget":
+            self._prefill_pick_add_other_dllm_budget_count += 1
+        elif reason == "chunk_budget":
+            self._prefill_pick_add_other_chunk_budget_count += 1
+        elif reason == "chunk_align_budget":
+            self._prefill_pick_add_other_chunk_align_budget_count += 1
+        elif reason == "budget_input_exhausted":
+            self._prefill_pick_add_other_budget_input_exhausted_count += 1
+        elif reason == "budget_chunk_exhausted":
+            self._prefill_pick_add_other_budget_chunk_exhausted_count += 1
+        elif reason == "budget_dllm_exhausted":
+            self._prefill_pick_add_other_budget_dllm_exhausted_count += 1
+        else:
+            self._prefill_pick_add_other_unknown_count += 1
+
     def _record_pp_frontier_ack_recv(self: Scheduler):
         self._pp_frontier_ack_recv_count += 1
 
@@ -563,6 +603,18 @@ class SchedulerMetricsMixin:
             "pick_write_backup_break": self._prefill_pick_write_backup_break_count,
             "pick_add_no_token_break": self._prefill_pick_add_no_token_break_count,
             "pick_add_other_break": self._prefill_pick_add_other_break_count,
+            "pick_add_other_prefill_delayer": self._prefill_pick_add_other_prefill_delayer_count,
+            "pick_add_other_cp_batch_limit": self._prefill_pick_add_other_cp_batch_limit_count,
+            "pick_add_other_prefill_max_requests": self._prefill_pick_add_other_prefill_max_requests_count,
+            "pick_add_other_real_input_budget": self._prefill_pick_add_other_real_input_budget_count,
+            "pick_add_other_input_budget": self._prefill_pick_add_other_input_budget_count,
+            "pick_add_other_dllm_budget": self._prefill_pick_add_other_dllm_budget_count,
+            "pick_add_other_chunk_budget": self._prefill_pick_add_other_chunk_budget_count,
+            "pick_add_other_chunk_align_budget": self._prefill_pick_add_other_chunk_align_budget_count,
+            "pick_add_other_budget_input_exhausted": self._prefill_pick_add_other_budget_input_exhausted_count,
+            "pick_add_other_budget_chunk_exhausted": self._prefill_pick_add_other_budget_chunk_exhausted_count,
+            "pick_add_other_budget_dllm_exhausted": self._prefill_pick_add_other_budget_dllm_exhausted_count,
+            "pick_add_other_unknown": self._prefill_pick_add_other_unknown_count,
             "pick_empty_result": self._prefill_pick_empty_result_count,
             "run_calls": self._prefill_run_calls,
             "run_avg_ms": _avg(self._prefill_run_total_ms, self._prefill_run_calls),
@@ -593,6 +645,18 @@ class SchedulerMetricsMixin:
         self._prefill_pick_write_backup_break_count = 0
         self._prefill_pick_add_no_token_break_count = 0
         self._prefill_pick_add_other_break_count = 0
+        self._prefill_pick_add_other_prefill_delayer_count = 0
+        self._prefill_pick_add_other_cp_batch_limit_count = 0
+        self._prefill_pick_add_other_prefill_max_requests_count = 0
+        self._prefill_pick_add_other_real_input_budget_count = 0
+        self._prefill_pick_add_other_input_budget_count = 0
+        self._prefill_pick_add_other_dllm_budget_count = 0
+        self._prefill_pick_add_other_chunk_budget_count = 0
+        self._prefill_pick_add_other_chunk_align_budget_count = 0
+        self._prefill_pick_add_other_budget_input_exhausted_count = 0
+        self._prefill_pick_add_other_budget_chunk_exhausted_count = 0
+        self._prefill_pick_add_other_budget_dllm_exhausted_count = 0
+        self._prefill_pick_add_other_unknown_count = 0
         self._prefill_pick_empty_result_count = 0
         self._prefill_run_calls = 0
         self._prefill_run_total_ms = 0.0
@@ -1269,6 +1333,12 @@ class SchedulerMetricsMixin:
             "pick_early_full_or_empty=%s pick_chunked_capacity_block=%s pick_test_retract_block=%s "
             "pick_locally_revoked_break=%s pick_running_full_break=%s pick_prefetch_break=%s "
             "pick_write_backup_break=%s pick_add_no_token_break=%s pick_add_other_break=%s "
+            "pick_add_other_prefill_delayer=%s pick_add_other_cp_batch_limit=%s "
+            "pick_add_other_prefill_max_requests=%s pick_add_other_real_input_budget=%s "
+            "pick_add_other_input_budget=%s pick_add_other_dllm_budget=%s "
+            "pick_add_other_chunk_budget=%s pick_add_other_chunk_align_budget=%s "
+            "pick_add_other_budget_input_exhausted=%s pick_add_other_budget_chunk_exhausted=%s "
+            "pick_add_other_budget_dllm_exhausted=%s pick_add_other_unknown=%s "
             "pick_empty_result=%s "
             "ack_recv=%s ack_activate=%s ack_consume=%s ack_consume_miss=%s "
             "ack_pending_same_mb_miss=%s ack_chunked_mismatch=%s "
@@ -1387,6 +1457,18 @@ class SchedulerMetricsMixin:
             prefill_stage_perf.get("pick_write_backup_break", 0),
             prefill_stage_perf.get("pick_add_no_token_break", 0),
             prefill_stage_perf.get("pick_add_other_break", 0),
+            prefill_stage_perf.get("pick_add_other_prefill_delayer", 0),
+            prefill_stage_perf.get("pick_add_other_cp_batch_limit", 0),
+            prefill_stage_perf.get("pick_add_other_prefill_max_requests", 0),
+            prefill_stage_perf.get("pick_add_other_real_input_budget", 0),
+            prefill_stage_perf.get("pick_add_other_input_budget", 0),
+            prefill_stage_perf.get("pick_add_other_dllm_budget", 0),
+            prefill_stage_perf.get("pick_add_other_chunk_budget", 0),
+            prefill_stage_perf.get("pick_add_other_chunk_align_budget", 0),
+            prefill_stage_perf.get("pick_add_other_budget_input_exhausted", 0),
+            prefill_stage_perf.get("pick_add_other_budget_chunk_exhausted", 0),
+            prefill_stage_perf.get("pick_add_other_budget_dllm_exhausted", 0),
+            prefill_stage_perf.get("pick_add_other_unknown", 0),
             prefill_stage_perf.get("pick_empty_result", 0),
             pp_frontier_ack.get("recv", 0),
             pp_frontier_ack.get("activate", 0),

@@ -437,6 +437,11 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        self.last_add_req_other_reason: Optional[str] = None
+
+    def _return_other(self, reason: str):
+        self.last_add_req_other_reason = reason
+        return AddReqResult.OTHER
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -504,14 +509,14 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
-            return AddReqResult.OTHER
+            return self._return_other("budget_input_exhausted")
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._return_other("budget_dllm_exhausted")
         else:
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._return_other("budget_chunk_exhausted")
 
         return AddReqResult.CONTINUE
 
@@ -639,6 +644,7 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
+        self.last_add_req_other_reason = None
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
@@ -696,7 +702,7 @@ class PrefillAdder:
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._return_other("dllm_budget")
 
             self._add_dllm_req(req, 0)
         elif (
@@ -712,7 +718,7 @@ class PrefillAdder:
             )
         else:
             if self.rem_chunk_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._return_other("chunk_budget")
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
@@ -728,6 +734,7 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        self.last_add_req_other_reason = None
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -736,17 +743,17 @@ class PrefillAdder:
                 max_running_requests=self.max_running_requests,
             )
         ):
-            return AddReqResult.OTHER
+            return self._return_other("prefill_delayer")
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (
             self.nsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
         ) and len(self.can_run_list) >= 1:
-            return AddReqResult.OTHER
+            return self._return_other("cp_batch_limit")
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
-            return AddReqResult.OTHER
+            return self._return_other("prefill_max_requests")
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
@@ -765,7 +772,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-            return AddReqResult.OTHER
+            return self._return_other("real_input_budget")
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
@@ -788,11 +795,11 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-                return AddReqResult.OTHER
+                return self._return_other("input_budget")
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
+                    return self._return_other("dllm_budget")
 
                 assert (
                     truncation_align_size is None
@@ -818,14 +825,14 @@ class PrefillAdder:
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return self._return_other("chunk_budget")
 
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
+                        return self._return_other("chunk_align_budget")
                     else:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size

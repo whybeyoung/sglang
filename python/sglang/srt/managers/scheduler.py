@@ -2765,12 +2765,13 @@ class Scheduler(
                 res != AddReqResult.CONTINUE or len(adder.can_run_list) > 0
             ):
                 logger.warning(
-                    "[PPFrontierDiag][adder] pp=%s cp=%s tp=%s rid=%s result=%s can_run=%s",
+                    "[PPFrontierDiag][adder] pp=%s cp=%s tp=%s rid=%s result=%s other_reason=%s can_run=%s",
                     self.pp_rank,
                     self.attn_cp_rank,
                     self.attn_tp_rank,
                     req.rid,
                     getattr(res, "name", str(res)),
+                    getattr(adder, "last_add_req_other_reason", None),
                     [x.rid for x in adder.can_run_list[:8]],
                 )
             if frontier_diag and res == AddReqResult.CONTINUE:
@@ -2795,8 +2796,13 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                     if hasattr(self, "_record_prefill_pick_reason"):
                         self._record_prefill_pick_reason("add_no_token_break")
-                elif hasattr(self, "_record_prefill_pick_reason"):
-                    self._record_prefill_pick_reason("add_other_break")
+                else:
+                    if hasattr(self, "_record_prefill_pick_reason"):
+                        self._record_prefill_pick_reason("add_other_break")
+                    if hasattr(self, "_record_prefill_add_other_reason"):
+                        self._record_prefill_add_other_reason(
+                            getattr(adder, "last_add_req_other_reason", None)
+                        )
                 # revert matched mamba idx to avoid memory leak, if req is not added
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added and req.mamba_pool_idx is not None:
