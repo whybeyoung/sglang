@@ -2559,69 +2559,10 @@ class Scheduler(
         )
 
         frontier_diag = os.getenv("SGLANG_DEBUG_PP_PREFILL_DIAG", "0") == "1"
-        launch_ack_rids = None
-        launch_ack_barrier_rid = None
-        launch_ack_idx = 0
-        if (
-            self.pp_size > 1
-            and self.pp_group is not None
-            and self.pp_group.is_first_rank
-            and hasattr(self, "_pp_consume_launch_frontier_ack")
-        ):
-            current_prefill_mb_id = getattr(self, "pp_current_prefill_mb_id", None)
-            launch_ack = self._pp_consume_launch_frontier_ack(
-                current_prefill_mb_id
-            )
-            if launch_ack is None and hasattr(self, "_record_pp_frontier_ack_consume_miss"):
-                pending_same_mb = False
-                pending_ack_by_mb = getattr(
-                    self, "pp_pending_launch_frontier_ack_by_mb", None
-                )
-                if (
-                    current_prefill_mb_id is not None
-                    and pending_ack_by_mb is not None
-                    and current_prefill_mb_id in pending_ack_by_mb
-                ):
-                    pending_same_mb = True
-                self._record_pp_frontier_ack_consume_miss(
-                    pending_same_mb=pending_same_mb
-                )
-            if launch_ack is not None:
-                launch_ack_rids = launch_ack.get("rids") or ()
-                launch_ack_barrier_rid = launch_ack.get("barrier_rid")
-            if frontier_diag and launch_ack is not None:
-                logger.warning(
-                    "[PPFrontierDiag][launch_ack] pp=%s cp=%s tp=%s mb=%s ack=%s barrier=%s",
-                    self.pp_rank,
-                    self.attn_cp_rank,
-                    self.attn_tp_rank,
-                    getattr(self, "pp_current_prefill_mb_id", None),
-                    launch_ack_rids[:8],
-                    launch_ack_barrier_rid,
-                )
 
         if self.chunked_req is not None:
-            if launch_ack_rids is not None:
-                expected_rid = launch_ack_rids[0] if launch_ack_rids else None
-                if expected_rid != self.chunked_req.rid:
-                    if hasattr(self, "_record_pp_frontier_ack_chunked_mismatch"):
-                        self._record_pp_frontier_ack_chunked_mismatch()
-                    if frontier_diag:
-                        logger.warning(
-                            "[PPFrontierDiag][launch_ack_barrier] pp=%s cp=%s tp=%s reason=chunked_req rid=%s expected=%s ack=%s barrier=%s",
-                            self.pp_rank,
-                            self.attn_cp_rank,
-                            self.attn_tp_rank,
-                            self.chunked_req.rid,
-                            expected_rid,
-                            launch_ack_rids[:8],
-                            launch_ack_barrier_rid,
-                        )
-                    return None
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            if launch_ack_rids is not None and launch_ack_rids:
-                launch_ack_idx = 1
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2653,38 +2594,6 @@ class Scheduler(
                 follow_rank_revoked_head = self.tree_cache.peek_pp_locally_revoked_req()
 
         for req in self.waiting_queue:
-            if launch_ack_rids is not None:
-                if launch_ack_idx >= len(launch_ack_rids):
-                    if hasattr(self, "_record_pp_frontier_ack_exhausted"):
-                        self._record_pp_frontier_ack_exhausted()
-                    if frontier_diag:
-                        logger.warning(
-                            "[PPFrontierDiag][launch_ack_barrier] pp=%s cp=%s tp=%s reason=ack_exhausted rid=%s ack=%s barrier=%s",
-                            self.pp_rank,
-                            self.attn_cp_rank,
-                            self.attn_tp_rank,
-                            req.rid,
-                            launch_ack_rids[:8],
-                            launch_ack_barrier_rid,
-                        )
-                    break
-                expected_rid = launch_ack_rids[launch_ack_idx]
-                if req.rid != expected_rid:
-                    if hasattr(self, "_record_pp_frontier_ack_waiting_mismatch"):
-                        self._record_pp_frontier_ack_waiting_mismatch()
-                    if frontier_diag:
-                        logger.warning(
-                            "[PPFrontierDiag][launch_ack_barrier] pp=%s cp=%s tp=%s reason=waiting_rid_mismatch rid=%s expected=%s ack=%s barrier=%s waiting=%s",
-                            self.pp_rank,
-                            self.attn_cp_rank,
-                            self.attn_tp_rank,
-                            req.rid,
-                            expected_rid,
-                            launch_ack_rids[:8],
-                            launch_ack_barrier_rid,
-                            [x.rid for x in self.waiting_queue[:8]],
-                        )
-                    break
             if follow_rank_revoked_head is not None and req.rid == follow_rank_revoked_head:
                 if frontier_diag:
                     logger.warning(
@@ -2858,9 +2767,6 @@ class Scheduler(
                     self.attn_tp_rank,
                     req.rid,
                 )
-            if res == AddReqResult.CONTINUE and launch_ack_rids is not None:
-                launch_ack_idx += 1
-
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 

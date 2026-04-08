@@ -833,31 +833,6 @@ class SchedulerPPMixin:
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
-                launch_frontier_ack_rids = []
-                launch_frontier_ack_barrier_rid = None
-                if self.pp_group.is_last_rank:
-                    launch_frontier_ack_rids = self._pp_prefill_batch_rids(batch)
-                    if (
-                        self.enable_hicache_storage
-                        and hasattr(self.tree_cache, "peek_pp_locally_revoked_req")
-                        and self.waiting_queue
-                    ):
-                        revoked_head_rid = self.tree_cache.peek_pp_locally_revoked_req()
-                        if revoked_head_rid == self.waiting_queue[0].rid:
-                            launch_frontier_ack_barrier_rid = revoked_head_rid
-                    if (
-                        (batch is not None or launch_frontier_ack_barrier_rid is not None)
-                        and prefill_diag_enabled
-                    ):
-                        logger.warning(
-                            "[PPPrefillDiag][launch_frontier_ack_emit] pp=%s cp=%s tp=%s mb=%s ack=%s barrier=%s",
-                            self.pp_rank,
-                            self.attn_cp_rank,
-                            self.attn_tp_rank,
-                            mb_id,
-                            launch_frontier_ack_rids[:8],
-                            launch_frontier_ack_barrier_rid,
-                        )
                 if prefill_diag_enabled and (batch or self.waiting_queue):
                     self._pp_prefill_diag_log(
                         "batch_pick",
@@ -933,9 +908,6 @@ class SchedulerPPMixin:
                         next_first_rank_mb_id,
                         release_rids,
                         transferred_rids,
-                        launch_ack_mb_id=mb_id if self.pp_group.is_last_rank else None,
-                        launch_ack_rids=launch_frontier_ack_rids,
-                        launch_ack_barrier_rid=launch_frontier_ack_barrier_rid,
                     )
                 )
 
@@ -1033,22 +1005,14 @@ class SchedulerPPMixin:
                     bmbs[next_mb_id] = None
                 if tmbs[next_mb_id] is not None:
                     next_release_payload = self._pp_recv_pyobj_from_prev_stage()
-                    next_release_rids, ack_mb_id, ack_rids, ack_barrier_rid = (
+                    next_release_rids, _ack_mb_id, _ack_rids, _ack_barrier_rid = (
                         self._pp_unpack_release_payload(next_release_payload)
                     )
-                    self._pp_record_launch_frontier_ack(
-                        ack_mb_id, ack_rids, ack_barrier_rid
-                    )
-                    if prefill_diag_enabled and (
-                        next_release_rids or ack_rids or ack_barrier_rid is not None
-                    ):
+                    if prefill_diag_enabled and next_release_rids:
                         self._pp_prefill_diag_log(
                             "release_recv",
                             mb=next_mb_id,
                             release=self._pp_prefill_diag_rids(next_release_rids),
-                            launch_ack_mb=ack_mb_id,
-                            launch_ack=ack_rids[:8],
-                            launch_ack_barrier=ack_barrier_rid,
                         )
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
