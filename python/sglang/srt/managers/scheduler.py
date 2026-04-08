@@ -2587,6 +2587,18 @@ class Scheduler(
                 [req.rid for req in self.running_batch.reqs[:8]],
             )
 
+        if (
+            self.enable_hicache_storage
+            and self.pp_group is not None
+            and not self.pp_group.is_first_rank
+            and hasattr(self.tree_cache, "replay_pp_host_tree_events")
+        ):
+            # Drain globally progressable PP host-tree events once before walking the
+            # waiting queue. Request-scoped replay is still handled inside
+            # check_prefetch_progress() for ongoing prefetches; this avoids paying the
+            # same replay loop for every waiting request.
+            self.tree_cache.replay_pp_host_tree_events()
+
         follow_rank_revoked_head = None
         follow_rank_revoked_rids = set()
         if (
@@ -2697,13 +2709,6 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
-
-                if (
-                    self.pp_group is not None
-                    and not self.pp_group.is_first_rank
-                    and hasattr(self.tree_cache, "replay_pp_host_tree_events")
-                ):
-                    self.tree_cache.replay_pp_host_tree_events()
 
             req.init_next_round_input(self.tree_cache)
             if (
