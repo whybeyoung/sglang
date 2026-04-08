@@ -898,9 +898,6 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(
-                    send_consensus_bootstrapped_work, kind="consensus_bootstrap"
-                )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
@@ -909,7 +906,6 @@ class SchedulerPPMixin:
                         bootstrapped_rids,
                     )
                 )
-                self._pp_commit_comm_work(send_release_work, kind="release")
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs,
@@ -1011,6 +1007,9 @@ class SchedulerPPMixin:
                             )
                     # Consume this microbatch's bootstrap consensus exactly once.
                     bmbs[next_mb_id] = None
+                self._pp_commit_comm_work(
+                    send_consensus_bootstrapped_work, kind="consensus_bootstrap"
+                )
                 if tmbs[next_mb_id] is not None:
                     next_release_payload = self._pp_recv_pyobj_from_prev_stage()
                     next_release_rids, _ack_mb_id, _ack_rids, _ack_barrier_rid = (
@@ -1022,6 +1021,7 @@ class SchedulerPPMixin:
                             mb=next_mb_id,
                             release=self._pp_prefill_diag_rids(next_release_rids),
                         )
+                self._pp_commit_comm_work(send_release_work, kind="release")
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
