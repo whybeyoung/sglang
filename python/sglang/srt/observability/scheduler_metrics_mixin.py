@@ -136,6 +136,15 @@ class SchedulerMetricsMixin:
         self._pp_comm_wait_calls = 0
         self._pp_comm_wait_total_ms = 0.0
         self._pp_comm_wait_max_ms = 0.0
+        self._pp_comm_wait_req_calls = 0
+        self._pp_comm_wait_req_total_ms = 0.0
+        self._pp_comm_wait_req_max_ms = 0.0
+        self._pp_comm_wait_bootstrap_calls = 0
+        self._pp_comm_wait_bootstrap_total_ms = 0.0
+        self._pp_comm_wait_bootstrap_max_ms = 0.0
+        self._pp_comm_wait_transfer_calls = 0
+        self._pp_comm_wait_transfer_total_ms = 0.0
+        self._pp_comm_wait_transfer_max_ms = 0.0
         self._pp_frontier_ack_recv_count = 0
         self._pp_frontier_ack_activate_count = 0
         self._pp_frontier_ack_consume_count = 0
@@ -419,10 +428,30 @@ class SchedulerMetricsMixin:
             self._pp_comm_cp_bcast_max_ms, elapsed_ms
         )
 
-    def _record_pp_comm_wait_timing(self: Scheduler, elapsed_ms: float):
+    def _record_pp_comm_wait_timing(
+        self: Scheduler, elapsed_ms: float, kind: Optional[str] = None
+    ):
         self._pp_comm_wait_calls += 1
         self._pp_comm_wait_total_ms += elapsed_ms
         self._pp_comm_wait_max_ms = max(self._pp_comm_wait_max_ms, elapsed_ms)
+        if kind == "req":
+            self._pp_comm_wait_req_calls += 1
+            self._pp_comm_wait_req_total_ms += elapsed_ms
+            self._pp_comm_wait_req_max_ms = max(
+                self._pp_comm_wait_req_max_ms, elapsed_ms
+            )
+        elif kind == "bootstrap":
+            self._pp_comm_wait_bootstrap_calls += 1
+            self._pp_comm_wait_bootstrap_total_ms += elapsed_ms
+            self._pp_comm_wait_bootstrap_max_ms = max(
+                self._pp_comm_wait_bootstrap_max_ms, elapsed_ms
+            )
+        elif kind == "transfer":
+            self._pp_comm_wait_transfer_calls += 1
+            self._pp_comm_wait_transfer_total_ms += elapsed_ms
+            self._pp_comm_wait_transfer_max_ms = max(
+                self._pp_comm_wait_transfer_max_ms, elapsed_ms
+            )
 
     def _record_pp_frontier_ack_recv(self: Scheduler):
         self._pp_frontier_ack_recv_count += 1
@@ -515,6 +544,23 @@ class SchedulerMetricsMixin:
             "wait_calls": self._pp_comm_wait_calls,
             "wait_avg_ms": _avg(self._pp_comm_wait_total_ms, self._pp_comm_wait_calls),
             "wait_max_ms": self._pp_comm_wait_max_ms,
+            "wait_req_calls": self._pp_comm_wait_req_calls,
+            "wait_req_avg_ms": _avg(
+                self._pp_comm_wait_req_total_ms, self._pp_comm_wait_req_calls
+            ),
+            "wait_req_max_ms": self._pp_comm_wait_req_max_ms,
+            "wait_bootstrap_calls": self._pp_comm_wait_bootstrap_calls,
+            "wait_bootstrap_avg_ms": _avg(
+                self._pp_comm_wait_bootstrap_total_ms,
+                self._pp_comm_wait_bootstrap_calls,
+            ),
+            "wait_bootstrap_max_ms": self._pp_comm_wait_bootstrap_max_ms,
+            "wait_transfer_calls": self._pp_comm_wait_transfer_calls,
+            "wait_transfer_avg_ms": _avg(
+                self._pp_comm_wait_transfer_total_ms,
+                self._pp_comm_wait_transfer_calls,
+            ),
+            "wait_transfer_max_ms": self._pp_comm_wait_transfer_max_ms,
         }
         self._pp_comm_send_calls = 0
         self._pp_comm_send_total_ms = 0.0
@@ -531,6 +577,15 @@ class SchedulerMetricsMixin:
         self._pp_comm_wait_calls = 0
         self._pp_comm_wait_total_ms = 0.0
         self._pp_comm_wait_max_ms = 0.0
+        self._pp_comm_wait_req_calls = 0
+        self._pp_comm_wait_req_total_ms = 0.0
+        self._pp_comm_wait_req_max_ms = 0.0
+        self._pp_comm_wait_bootstrap_calls = 0
+        self._pp_comm_wait_bootstrap_total_ms = 0.0
+        self._pp_comm_wait_bootstrap_max_ms = 0.0
+        self._pp_comm_wait_transfer_calls = 0
+        self._pp_comm_wait_transfer_total_ms = 0.0
+        self._pp_comm_wait_transfer_max_ms = 0.0
         return snapshot
 
     def consume_pp_frontier_ack_snapshot(self: Scheduler) -> dict[str, int]:
@@ -1082,6 +1137,9 @@ class SchedulerMetricsMixin:
             "pp_tp_bcast_calls=%s pp_tp_bcast_avg_ms=%.3f pp_tp_bcast_max_ms=%.3f "
             "pp_cp_bcast_calls=%s pp_cp_bcast_avg_ms=%.3f pp_cp_bcast_max_ms=%.3f "
             "pp_wait_calls=%s pp_wait_avg_ms=%.3f pp_wait_max_ms=%.3f "
+            "pp_wait_req_calls=%s pp_wait_req_avg_ms=%.3f pp_wait_req_max_ms=%.3f "
+            "pp_wait_bootstrap_calls=%s pp_wait_bootstrap_avg_ms=%.3f pp_wait_bootstrap_max_ms=%.3f "
+            "pp_wait_transfer_calls=%s pp_wait_transfer_avg_ms=%.3f pp_wait_transfer_max_ms=%.3f "
             "ack_recv=%s ack_activate=%s ack_consume=%s ack_consume_miss=%s "
             "ack_pending_same_mb_miss=%s ack_chunked_mismatch=%s "
             "ack_waiting_mismatch=%s ack_exhausted=%s ack_pending_slots=%s ack_active_slots=%s "
@@ -1169,6 +1227,15 @@ class SchedulerMetricsMixin:
             pp_comm_perf.get("wait_calls", 0),
             pp_comm_perf.get("wait_avg_ms", 0.0),
             pp_comm_perf.get("wait_max_ms", 0.0),
+            pp_comm_perf.get("wait_req_calls", 0),
+            pp_comm_perf.get("wait_req_avg_ms", 0.0),
+            pp_comm_perf.get("wait_req_max_ms", 0.0),
+            pp_comm_perf.get("wait_bootstrap_calls", 0),
+            pp_comm_perf.get("wait_bootstrap_avg_ms", 0.0),
+            pp_comm_perf.get("wait_bootstrap_max_ms", 0.0),
+            pp_comm_perf.get("wait_transfer_calls", 0),
+            pp_comm_perf.get("wait_transfer_avg_ms", 0.0),
+            pp_comm_perf.get("wait_transfer_max_ms", 0.0),
             pp_frontier_ack.get("recv", 0),
             pp_frontier_ack.get("activate", 0),
             pp_frontier_ack.get("consume", 0),

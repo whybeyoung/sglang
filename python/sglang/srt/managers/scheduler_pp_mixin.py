@@ -1054,15 +1054,17 @@ class SchedulerPPMixin:
                     # Consume this microbatch's release consensus exactly once.
                     tmbs[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(self.send_req_work, kind="req")
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         self._pp_build_req_payload(recv_reqs), async_send=True
                     )
-                    self._pp_commit_comm_work(send_bootstrapped_work)
+                    self._pp_commit_comm_work(
+                        send_bootstrapped_work, kind="bootstrap"
+                    )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
-                    self._pp_commit_comm_work(send_transfer_work)
+                    self._pp_commit_comm_work(send_transfer_work, kind="transfer")
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -1961,14 +1963,16 @@ class SchedulerPPMixin:
                 )
         return send_release_work, release_rids
 
-    def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
+    def _pp_commit_comm_work(
+        self: Scheduler, work: List[P2PWork], kind: Optional[str] = None
+    ) -> None:
         start = time.perf_counter()
         for p2p_work in work:
             p2p_work.work.wait()
         work.clear()
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         if elapsed_ms > 0 and hasattr(self, "_record_pp_comm_wait_timing"):
-            self._record_pp_comm_wait_timing(elapsed_ms)
+            self._record_pp_comm_wait_timing(elapsed_ms, kind=kind)
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
