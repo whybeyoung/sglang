@@ -771,6 +771,8 @@ class SchedulerPPMixin:
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
                 self._pp_apply_hicache_sync_before_batch()
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work, kind="req")
                 if prefill_diag_enabled:
                     recv_diag = self._pp_prefill_diag_rids(recv_reqs)
                     waiting_diag = self._pp_prefill_diag_rids(self.waiting_queue)
@@ -812,6 +814,9 @@ class SchedulerPPMixin:
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids(mb_id)
                 bmbs[mb_id] = bootstrapped_rids
+                self._pp_commit_comm_work(
+                    send_bootstrapped_work, kind="bootstrap"
+                )
                 if prefill_diag_enabled and (bootstrapped_rids[0] or bootstrapped_rids[1]):
                     self._pp_prefill_diag_log(
                         "bootstrap_poll",
@@ -820,6 +825,7 @@ class SchedulerPPMixin:
                         boot_bad=self._pp_prefill_diag_rids(bootstrapped_rids[1]),
                     )
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                self._pp_commit_comm_work(send_transfer_work, kind="transfer")
                 tmbs[mb_id] = transferred_rids
                 if prefill_diag_enabled and transferred_rids:
                     self._pp_prefill_diag_log(
@@ -1056,17 +1062,12 @@ class SchedulerPPMixin:
                     # Consume this microbatch's release consensus exactly once.
                     tmbs[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work, kind="req")
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         self._pp_build_req_payload(recv_reqs), async_send=True
-                    )
-                    self._pp_commit_comm_work(
-                        send_bootstrapped_work, kind="bootstrap"
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
-                    self._pp_commit_comm_work(send_transfer_work, kind="transfer")
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
