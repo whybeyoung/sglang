@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -140,19 +140,19 @@ class KVArgsRegisterInfo:
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_state_data_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
+            dst_state_data_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
             dst_state_item_lens=(
-                list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
+                list(struct.unpack(f"{len(msg[10]) // 4}I", msg[10]))
                 if len(msg) > 10 and len(msg[10]) > 0
                 else []
             ),
             dst_state_dim_per_tensor=(
-                list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
+                list(struct.unpack(f"{len(msg[11]) // 4}I", msg[11]))
                 if len(msg) > 11 and len(msg[11]) > 0
                 else []
             ),
@@ -186,6 +186,7 @@ class AuxDataCodec:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    FAILURE_EXPIRE_SECONDS = 60  # 冷却期秒数
 
     def __init__(
         self,
@@ -203,6 +204,9 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            self.session_fail_time: Dict[str, float] = (
+                {}
+            )  # 记录 session 进入冷却期的时间
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -425,8 +429,7 @@ class MooncakeKVManager(CommonKVManager):
         )
         if ret == -1:
             logger.warning(
-                f"[Staging][tp{_tp}] Falling back to per-token slice path "
-                f"(room={kv_chunk.room})"
+                f"[Staging][tp{_tp}] Falling back to per-token slice path (room={kv_chunk.room})"
             )
             ret = self.send_kvcache_slice(
                 req.mooncake_session_id,
@@ -1181,19 +1184,41 @@ class MooncakeKVManager(CommonKVManager):
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
-                                self.record_failure(
-                                    kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                fail_time = self.session_fail_time.get(
+                                    req.mooncake_session_id, 0
                                 )
-                                self.update_status(kv_chunk.room, KVPoll.Failed)
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    KVPoll.Failed,
-                                    prefill_unique_rank,
-                                )
-                                break
+                                if (
+                                    time.time() - fail_time
+                                    > self.FAILURE_EXPIRE_SECONDS
+                                ):
+                                    # 冷却期过期，清理状态并允许重试
+                                    self.failed_sessions.discard(
+                                        req.mooncake_session_id
+                                    )
+                                    self.session_failures.pop(
+                                        req.mooncake_session_id, None
+                                    )
+                                    self.session_fail_time.pop(
+                                        req.mooncake_session_id, None
+                                    )
+                                    logger.info(
+                                        f"Session {req.mooncake_session_id} cooldown expired, allowing retry"
+                                    )
+                                else:
+                                    # 仍在冷却期，跳过
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Session {req.mooncake_session_id} in cooldown period",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
@@ -1266,11 +1291,22 @@ class MooncakeKVManager(CommonKVManager):
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
+                                if self.session_failures[req.mooncake_session_id] == 1:
+                                    # 首次失败，尝试重新注册 buffer（mooncake 可能已重启）
+                                    logger.warning(
+                                        f"Session {req.mooncake_session_id} first failure, re-registering buffers"
+                                    )
+                                    self.register_buffer_to_engine()
+                                elif (
+                                    self.session_failures[req.mooncake_session_id] >= 2
+                                ):
+                                    # 重试后仍失败，进入冷却期
                                     self.failed_sessions.add(req.mooncake_session_id)
+                                    self.session_fail_time[req.mooncake_session_id] = (
+                                        time.time()
+                                    )
                                     logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
+                                        f"Session {req.mooncake_session_id} entering cooldown period"
                                     )
                             self.record_failure(
                                 kv_chunk.room,
@@ -1632,7 +1668,6 @@ class MooncakeKVManager(CommonKVManager):
 
 
 class MooncakeKVSender(CommonKVSender):
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
