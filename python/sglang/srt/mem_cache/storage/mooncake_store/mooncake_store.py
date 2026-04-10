@@ -415,17 +415,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Use CP0 as the shared storage key owner.
             self.mla_cp_writer_rank = 0
             self.is_mla_cp_mode = self.is_mla_backend and self.enable_cp
-            if self.enable_pp or self.enable_cp:
-                self.mha_suffix = (
-                    f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
-                )
-                if self.is_mla_cp_mode:
-                    self.mla_suffix = f"{self.pp_rank}_cp_{self.mla_cp_writer_rank}"
-                else:
-                    self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
+            self.pp_suffix = f"pp_size_{self.pp_size}_pp_rank_{self.pp_rank}"
+            self.mha_suffix = f"{self.local_rank}_{self.pp_suffix}_{self.attn_cp_rank}"
+            if self.is_mla_cp_mode:
+                self.mla_suffix = f"{self.pp_suffix}_cp_{self.mla_cp_writer_rank}"
             else:
-                self.mha_suffix = f"{self.local_rank}"
-                self.mla_suffix = ""
+                self.mla_suffix = f"{self.pp_suffix}_{self.attn_cp_rank}"
 
             self.storage_config = storage_config
             self.split_factor = 0
@@ -435,13 +430,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
-                if self.enable_pp or self.enable_cp:
-                    self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}_{self.attn_cp_rank}"
-                        for rank in target_ranks
-                    ]
-                else:
-                    self.mha_suffix = [f"{rank}" for rank in target_ranks]
+                self.mha_suffix = [
+                    f"{rank}_{self.pp_suffix}_{self.attn_cp_rank}"
+                    for rank in target_ranks
+                ]
 
             self.registered_pools = {}
 
