@@ -2640,6 +2640,24 @@ class Scheduler(
                             [x.rid for x in self.waiting_queue[:8]],
                         )
                     break
+            # Skip requests deferred due to zero_hit pending upstream confirmation.
+            # Both PP0 and PP1 defer for 1 cycle to avoid picking with
+            # mismatched prefix lengths (PP0 may have storage hit while PP1 zero_hit).
+            if (
+                self.enable_hicache_storage
+                and self.pp_size > 1
+                and hasattr(self.tree_cache, "pp_zero_hit_deferred_req_ids")
+                and req.rid in self.tree_cache.pp_zero_hit_deferred_req_ids
+            ):
+                if frontier_diag:
+                    logger.warning(
+                        "[PPFrontierDiag][zero_hit_deferred] pp=%s cp=%s tp=%s rid=%s",
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        self.attn_tp_rank,
+                        req.rid,
+                    )
+                break
             if follow_rank_revoked_head is not None and req.rid == follow_rank_revoked_head:
                 if frontier_diag:
                     logger.warning(

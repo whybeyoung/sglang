@@ -231,6 +231,8 @@ class HiRadixCache(RadixCache):
         self.pp_authoritative_revoked_req_ids: set[str] = set()
         self.pp_soft_skipped_req_ids: set[str] = set()
         self.pp_staged_prefetch_skip_req_ids: set[str] = set()
+        self.pp_zero_hit_deferred_req_ids: set[str] = set()
+        self.pp_zero_hit_pending_promote_req_ids: set[str] = set()
         self._in_pp_host_tree_replay = False
 
         # Detach storage backend automatically on process shutdown
@@ -574,13 +576,28 @@ class HiRadixCache(RadixCache):
 
         def _drain_revoke():
             if self._pp_downstream_sync_enabled():
+                # Phase 1: Promote deferred zero_hit reqs from PREVIOUS cycle.
+                # If upstream REVOKE arrived (processed below), the req will be
+                # cleared from pending_promote before it reaches hard barrier.
+                # If upstream didn't REVOKE (it had a hit), promote to barrier.
+                for rid in list(self.pp_zero_hit_pending_promote_req_ids):
+                    if rid not in self.pp_locally_revoked_req_ids:
+                        self.pp_locally_revoked_req_ids.add(rid)
+                        self.pp_locally_revoked_req_queue.append(rid)
+                        logger.warning(
+                            "[HiCachePPZeroHitDeferred][promote] pp=%s rid=%s",
+                            self.pp_rank, rid,
+                        )
+                self.pp_zero_hit_pending_promote_req_ids.clear()
+                # Move current deferred → pending_promote for next cycle.
+                if self.pp_zero_hit_deferred_req_ids:
+                    self.pp_zero_hit_pending_promote_req_ids = set(
+                        self.pp_zero_hit_deferred_req_ids
+                    )
+                    self.pp_zero_hit_deferred_req_ids.clear()
+
                 for item in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                     req_id, zero_hit = _normalize_revoke_item(item)
-                    # Local zero-hit revokes must take effect immediately on this
-                    # rank; otherwise the request can remain stuck in
-                    # ongoing_prefetch while we wait for an upstream REVOKE that
-                    # may never exist (for example when upstream skipped
-                    # prefetching entirely).
                     self._drain_single_revoke_req(req_id, zero_hit=zero_hit)
                     self._append_pp_host_tree_event(
                         PPHostTreeEvent(
@@ -595,6 +612,11 @@ class HiRadixCache(RadixCache):
                         break
                     self.pp_pending_host_tree_events.popleft()
                 return
+
+            # PP0 path: clear deferred zero_hit after 1 cycle (both had zero_hit,
+            # safe to pick with compute-only prefix).
+            if self.pp_size > 1 and self.pp_rank == 0:
+                self.pp_zero_hit_deferred_req_ids.clear()
 
             for item in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 req_id, zero_hit = _normalize_revoke_item(item)
@@ -724,6 +746,8 @@ class HiRadixCache(RadixCache):
         self.pp_retry_prefetch_req_ids.clear()
         self.pp_authoritative_revoked_req_ids.clear()
         self.pp_soft_skipped_req_ids.clear()
+        self.pp_zero_hit_deferred_req_ids.clear()
+        self.pp_zero_hit_pending_promote_req_ids.clear()
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
@@ -1020,20 +1044,21 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         if zero_hit:
             self.zero_hit_prefetch_req_ids.add(req_id)
-            # Do NOT mark pp_locally_revoked_req_ids for zero_hit revokes.
-            # Zero-hit means storage has no data for this prefix — both PP
-            # ranks will observe the same empty result, so there is no host
-            # tree divergence.  Marking a hard local_revoke barrier would
-            # block batch_pick on PP1 while PP0 (first rank) proceeds
-            # normally, leading to a NCCL deadlock because PP0 sends proxy
-            # tensors that PP1 never receives (batch=None).
-            #
-            # When upstream truly has a hit (genuine divergence), the
-            # upstream rank does NOT revoke — it finalises instead — so a
-            # local_revoke from the downstream zero_hit path would be left
-            # without a matching upstream REVOKE event.  The existing
-            # write-back-replay / retry-prefetch mechanisms already handle
-            # tree convergence in that case.
+            if mark_local_revoke and self._pp_downstream_sync_enabled():
+                # Defer local_revoke for 1 cycle instead of marking immediately.
+                # PP1 doesn't know PP0's prefetch result yet:
+                #  - If PP0 also zero_hit → upstream REVOKE arrives next cycle
+                #    → clear deferred → both pick with same prefix → safe.
+                #  - If PP0 had a hit → no upstream REVOKE → promote to hard
+                #    pp_locally_revoked_req_ids barrier → block batch_pick.
+                # Marking immediately would deadlock when both sides zero_hit
+                # (PP0 picks, PP1 blocks, NCCL hang).
+                if req_id not in self.pp_locally_revoked_req_ids:
+                    self.pp_zero_hit_deferred_req_ids.add(req_id)
+            elif mark_local_revoke and self.pp_size > 1 and self.pp_rank == 0:
+                # PP0 (first rank): also defer zero_hit for 1 cycle so that
+                # when both sides have zero_hit, neither picks prematurely.
+                self.pp_zero_hit_deferred_req_ids.add(req_id)
         logger.warning(
             "[HiCachePrefetchCleanup] rid=%s zero_hit=%s mark_local_revoke=%s had_ongoing=%s ongoing_after=%s loaded_tokens_before=%s loaded_tokens_after=%s zero_hit_marked=%s",
             req_id,
@@ -1089,6 +1114,8 @@ class HiRadixCache(RadixCache):
         self.pp_authoritative_revoked_req_ids.discard(req_id)
         self.pp_soft_skipped_req_ids.discard(req_id)
         self.pp_staged_prefetch_skip_req_ids.discard(req_id)
+        self.pp_zero_hit_deferred_req_ids.discard(req_id)
+        self.pp_zero_hit_pending_promote_req_ids.discard(req_id)
         self.clear_follow_rank_prefetch_issue_pending(req_id)
         self.discard_pp_locally_revoked_req(req_id)
         self._purge_matching_local_revoke_residue(req_id)
@@ -1171,6 +1198,23 @@ class HiRadixCache(RadixCache):
         req_id = event.rid
         if req_id is None:
             return False
+
+        # Upstream REVOKE confirms both ranks revoked → clear deferred zero_hit
+        # so the request is NOT promoted to hard local_revoke barrier.
+        if req_id in self.pp_zero_hit_deferred_req_ids:
+            self.pp_zero_hit_deferred_req_ids.discard(req_id)
+            logger.warning(
+                "[HiCachePPZeroHitDeferred][upstream_revoke_clear] pp=%s rid=%s source=deferred",
+                self.pp_rank, req_id,
+            )
+        if req_id in self.pp_zero_hit_pending_promote_req_ids:
+            self.pp_zero_hit_pending_promote_req_ids.discard(req_id)
+            # Also undo if already promoted to hard barrier in this cycle
+            self.discard_pp_locally_revoked_req(req_id)
+            logger.warning(
+                "[HiCachePPZeroHitDeferred][upstream_revoke_clear] pp=%s rid=%s source=pending_promote",
+                self.pp_rank, req_id,
+            )
 
         # Treat upstream REVOKE as authoritative for downstream PP ranks.
         # Waiting for the local revoke queue to independently produce the same
