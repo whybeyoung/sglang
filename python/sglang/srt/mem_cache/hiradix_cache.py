@@ -1020,10 +1020,20 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
         if zero_hit:
             self.zero_hit_prefetch_req_ids.add(req_id)
-            if mark_local_revoke and self._pp_downstream_sync_enabled():
-                if req_id not in self.pp_locally_revoked_req_ids:
-                    self.pp_locally_revoked_req_ids.add(req_id)
-                    self.pp_locally_revoked_req_queue.append(req_id)
+            # Do NOT mark pp_locally_revoked_req_ids for zero_hit revokes.
+            # Zero-hit means storage has no data for this prefix — both PP
+            # ranks will observe the same empty result, so there is no host
+            # tree divergence.  Marking a hard local_revoke barrier would
+            # block batch_pick on PP1 while PP0 (first rank) proceeds
+            # normally, leading to a NCCL deadlock because PP0 sends proxy
+            # tensors that PP1 never receives (batch=None).
+            #
+            # When upstream truly has a hit (genuine divergence), the
+            # upstream rank does NOT revoke — it finalises instead — so a
+            # local_revoke from the downstream zero_hit path would be left
+            # without a matching upstream REVOKE event.  The existing
+            # write-back-replay / retry-prefetch mechanisms already handle
+            # tree convergence in that case.
         logger.warning(
             "[HiCachePrefetchCleanup] rid=%s zero_hit=%s mark_local_revoke=%s had_ongoing=%s ongoing_after=%s loaded_tokens_before=%s loaded_tokens_after=%s zero_hit_marked=%s",
             req_id,
