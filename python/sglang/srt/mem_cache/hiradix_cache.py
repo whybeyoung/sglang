@@ -1615,12 +1615,30 @@ class HiRadixCache(RadixCache):
         if req_id is None:
             return False
         if req_id not in self.ongoing_prefetch:
+            # Upstream (PP0) finalized this prefetch, but the local rank already
+            # revoked its own prefetch (e.g. zero_hit or below threshold).
+            #
+            # OLD behaviour: re-issue via pp_retry_prefetch_req_ids → deadlock
+            # because the new async IO blocks batch_pick while PP0 already picked.
+            #
+            # NEW behaviour: accept the upstream decision authoritatively.
+            # Clear any local revoke barriers so the request can be picked
+            # normally. Set loaded tokens to 0 (this rank didn't actually load
+            # anything from storage) — the device-only prefix will be used.
+            # The host tree state difference is acceptable because PP ranks
+            # operate on different layers and the device prefix match is the
+            # source of truth for scheduling consistency.
             if event.loaded_from_storage > 0:
                 self.zero_hit_prefetch_req_ids.discard(req_id)
                 self.discard_pp_locally_revoked_req(req_id)
-                self.pp_retry_prefetch_req_ids.add(req_id)
+                self.pp_zero_hit_deferred_req_ids.discard(req_id)
+                self.pp_zero_hit_pending_promote_req_ids.discard(req_id)
+                # Do NOT re-issue. Just mark loaded tokens as 0 so
+                # pop_prefetch_loaded_tokens returns a valid (non-blocking) value.
+                self.prefetch_loaded_tokens_by_reqid[req_id] = 0
                 logger.warning(
-                    "[HiCachePPEvent][replay_mark_retry_prefetch] pp=%s cp=%s seq=%s rid=%s loaded=%s",
+                    "[HiCachePPEvent][replay_accept_upstream_finalize] pp=%s cp=%s seq=%s rid=%s upstream_loaded=%s "
+                    "action=accept_without_reissue",
                     self.pp_rank,
                     self.attn_cp_rank,
                     event.seq,
