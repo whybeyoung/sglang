@@ -1494,6 +1494,7 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
+        pp0_storage_hits = {}
         if self.pp_rank > 0:
             if (
                 self.attn_tp_rank == 0
@@ -1504,6 +1505,7 @@ class Scheduler(
                 pp_hicache_host_tree_events = list(
                     recv_reqs.get("hicache_host_tree_events", [])
                 )
+                pp0_storage_hits = recv_reqs.get("pp0_storage_hits", {})
                 recv_reqs = recv_reqs["recv_reqs"]
             elif self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 pp_hicache_host_tree_events = []
@@ -1515,6 +1517,7 @@ class Scheduler(
                 work_reqs = None
                 control_reqs = None
                 pp_hicache_host_tree_events = None
+                pp0_storage_hits = None
 
             if self.attn_tp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1530,6 +1533,12 @@ class Scheduler(
                         self.attn_tp_cpu_group,
                         src=self.attn_tp_group.ranks[0],
                     )
+                    pp0_storage_hits = broadcast_pyobj(
+                        pp0_storage_hits,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
 
             if self.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1541,6 +1550,12 @@ class Scheduler(
                 if self.pp_rank > 0:
                     pp_hicache_host_tree_events = broadcast_pyobj(
                         pp_hicache_host_tree_events,
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
+                    pp0_storage_hits = broadcast_pyobj(
+                        pp0_storage_hits,
                         self.attn_cp_group.rank,
                         self.attn_cp_cpu_group,
                         src=self.attn_cp_group.ranks[0],
@@ -1568,6 +1583,24 @@ class Scheduler(
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
                 )
+                pp0_storage_hits = broadcast_pyobj(
+                    pp0_storage_hits,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
+
+        if self.pp_rank > 0 and pp0_storage_hits:
+            if (
+                self.enable_hicache_storage
+                and self.tree_cache is not None
+                and hasattr(self.tree_cache, "cache_controller")
+                and self.tree_cache.cache_controller is not None
+            ):
+                ctrl = self.tree_cache.cache_controller
+                with ctrl._pp0_storage_hit_cond:
+                    ctrl.pp0_storage_hit_results.update(pp0_storage_hits)
+                    ctrl._pp0_storage_hit_cond.notify_all()
 
         if self.pp_rank > 0:
             self.pp_hicache_host_tree_events = list(pp_hicache_host_tree_events or [])

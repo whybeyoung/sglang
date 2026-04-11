@@ -466,12 +466,26 @@ class SchedulerPPMixin:
             and hasattr(self.tree_cache, "consume_pp_host_tree_events")
         ):
             events = self.tree_cache.consume_pp_host_tree_events()
-        if not events:
+        pp0_storage_hits = {}
+        if (
+            self.enable_hicache_storage
+            and self.tree_cache is not None
+            and hasattr(self.tree_cache, "cache_controller")
+            and self.tree_cache.cache_controller is not None
+        ):
+            ctrl = self.tree_cache.cache_controller
+            with ctrl._pp0_storage_hit_cond:
+                if ctrl.pp0_storage_hit_results:
+                    pp0_storage_hits = dict(ctrl.pp0_storage_hit_results)
+                    ctrl.pp0_storage_hit_results.clear()
+        if not events and not pp0_storage_hits:
             return recv_reqs
-        return {
-            "recv_reqs": recv_reqs,
-            "hicache_host_tree_events": events,
-        }
+        payload = {"recv_reqs": recv_reqs}
+        if events:
+            payload["hicache_host_tree_events"] = events
+        if pp0_storage_hits:
+            payload["pp0_storage_hits"] = pp0_storage_hits
+        return payload
 
     def _pp_apply_hicache_sync_before_batch(self: Scheduler) -> None:
         if (

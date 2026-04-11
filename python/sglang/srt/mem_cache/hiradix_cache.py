@@ -2660,6 +2660,14 @@ class HiRadixCache(RadixCache):
                 self.prefetch_threshold,
                 self.cache_controller.prefetch_tokens_occupied,
             )
+            if self._pp_downstream_sync_enabled():
+                self._append_pp_host_tree_event(
+                    PPHostTreeEvent(
+                        seq=self._next_pp_host_tree_seq(),
+                        kind="PREFETCH_SKIP",
+                        rid=req_id,
+                    )
+                )
             return
 
         last_host_node.protect_host()
@@ -2677,6 +2685,14 @@ class HiRadixCache(RadixCache):
                 self.prefetch_threshold,
                 self.cache_controller.prefetch_tokens_occupied,
             )
+            if self._pp_downstream_sync_enabled():
+                self._append_pp_host_tree_event(
+                    PPHostTreeEvent(
+                        seq=self._next_pp_host_tree_seq(),
+                        kind="PREFETCH_SKIP",
+                        rid=req_id,
+                    )
+                )
             return
         operation = self.cache_controller.prefetch(
             req_id,

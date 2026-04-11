@@ -398,6 +398,10 @@ class HiCacheController:
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
 
+        # PP0 → PP1 storage hit delegation.
+        self.pp0_storage_hit_results: dict[str, int] = {}
+        self._pp0_storage_hit_cond = threading.Condition()
+
         self.prefetch_thread.start()
         self.backup_thread.start()
 
@@ -654,6 +658,8 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+            with self._pp0_storage_hit_cond:
+                self.pp0_storage_hit_results.clear()
 
         self.stop_event.clear()
         self.storage_stop_event.clear()
@@ -953,6 +959,18 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _compute_hashes_for_hit_count(self, operation, hit_count: int) -> list[str]:
+        """Compute hash values locally up to hit_count tokens (no storage query)."""
+        last_hash = operation.last_hash
+        tokens_to_fetch = operation.token_ids
+        hash_value = []
+        for i in range(0, min(hit_count, len(tokens_to_fetch)), self.page_size):
+            last_hash = self.get_hash_str(
+                tokens_to_fetch[i : i + self.page_size], last_hash
+            )
+            hash_value.append(last_hash)
+        return hash_value
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -972,20 +990,51 @@ class HiCacheController:
                     operation.request_id,
                     len(operation.token_ids),
                 )
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
-                logger.warning(
-                    "[HiCachePrefetchThread][query_done] rid=%s storage_hit_count=%s hash_pages=%s",
-                    operation.request_id,
-                    storage_hit_count,
-                    len(hash_value),
-                )
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
-                )
-                self._all_reduce_prefetch_groups(
-                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
+                if self.pp_size > 1 and self.pp_rank > 0:
+                    # PP follow rank: wait for PP0's hit count instead of
+                    # querying L3 directly.
+                    wait_start = time.monotonic()
+                    with self._pp0_storage_hit_cond:
+                        while (
+                            operation.request_id not in self.pp0_storage_hit_results
+                            and not self.storage_stop_event.is_set()
+                        ):
+                            self._pp0_storage_hit_cond.wait(timeout=0.5)
+                    storage_hit_count = self.pp0_storage_hit_results.pop(
+                        operation.request_id, 0
+                    )
+                    hash_value = self._compute_hashes_for_hit_count(
+                        operation, storage_hit_count
+                    )
+                    logger.warning(
+                        "[HiCachePrefetchThread][pp_follow_hit] rid=%s pp0_hit_count=%s hash_pages=%s waited=%.3fs",
+                        operation.request_id,
+                        storage_hit_count,
+                        len(hash_value),
+                        time.monotonic() - wait_start,
+                    )
+                else:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    logger.warning(
+                        "[HiCachePrefetchThread][query_done] rid=%s storage_hit_count=%s hash_pages=%s",
+                        operation.request_id,
+                        storage_hit_count,
+                        len(hash_value),
+                    )
+
+                    storage_hit_count_tensor = torch.tensor(
+                        storage_hit_count, dtype=torch.int
+                    )
+                    self._all_reduce_prefetch_groups(
+                        storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                    )
+                    storage_hit_count = storage_hit_count_tensor.item()
+
+                    # Publish hit count for PP1
+                    if self.pp_size > 1 and self.pp_rank == 0:
+                        with self._pp0_storage_hit_cond:
+                            self.pp0_storage_hit_results[operation.request_id] = storage_hit_count
+                            self._pp0_storage_hit_cond.notify_all()
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
