@@ -399,7 +399,8 @@ class HiCacheController:
         self.host_mem_release_queue = Queue()
 
         # PP0 → PP1 storage hit delegation.
-        self.pp0_storage_hit_results: dict[str, int] = {}
+        # Value: (storage_hit_count, anchor_last_hash, pp0_token_ids_len)
+        self.pp0_storage_hit_results: dict[str, tuple[int, Optional[str], int]] = {}
         self._pp0_storage_hit_cond = threading.Condition()
 
         self.prefetch_thread.start()
@@ -1000,18 +1001,61 @@ class HiCacheController:
                             and not self.storage_stop_event.is_set()
                         ):
                             self._pp0_storage_hit_cond.wait(timeout=0.5)
-                    storage_hit_count = self.pp0_storage_hit_results.pop(
-                        operation.request_id, 0
+                    storage_hit_count, pp0_anchor_hash, pp0_token_len = (
+                        self.pp0_storage_hit_results.pop(
+                            operation.request_id, (0, None, 0)
+                        )
                     )
+                    # Align token_ids and anchor with PP0 to ensure
+                    # identical hash chains across PP ranks.
+                    # PP1 may have a longer token_ids (lower matched_len)
+                    # because its radix tree trails PP0.  Trim the front
+                    # so both ranks hash the same token range.
+                    local_token_len = len(operation.token_ids)
+                    token_offset = 0
+                    if pp0_anchor_hash is not None and pp0_token_len > 0:
+                        token_offset = local_token_len - pp0_token_len
+                        if token_offset > 0:
+                            # Release host slots for the skipped prefix tokens
+                            self.append_host_mem_release(
+                                operation.host_indices[:token_offset]
+                            )
+                            operation.host_indices = operation.host_indices[token_offset:]
+                            operation.token_ids = operation.token_ids[token_offset:]
+                        elif token_offset < 0:
+                            # PP1 matched more than PP0 (rare).  The local
+                            # hash chain would differ from PP0's, so we
+                            # cannot safely reuse pp0's hit_count.  Force
+                            # a revoke so both ranks stay consistent.
+                            logger.warning(
+                                "[HiCachePrefetchThread][pp_follow_negative_offset] "
+                                "rid=%s local_tokens=%s pp0_tokens=%s offset=%s — revoking",
+                                operation.request_id,
+                                local_token_len,
+                                pp0_token_len,
+                                token_offset,
+                            )
+                            token_offset = 0
+                            storage_hit_count = 0
+                        else:
+                            # token_offset == 0: lengths match, just adopt anchor
+                            pass
+                        if storage_hit_count > 0:
+                            operation.last_hash = pp0_anchor_hash
                     hash_value = self._compute_hashes_for_hit_count(
                         operation, storage_hit_count
                     )
                     logger.warning(
-                        "[HiCachePrefetchThread][pp_follow_hit] rid=%s pp0_hit_count=%s hash_pages=%s waited=%.3fs",
+                        "[HiCachePrefetchThread][pp_follow_hit] rid=%s pp0_hit_count=%s hash_pages=%s "
+                        "waited=%.3fs anchor_synced=%s token_offset=%s local_tokens=%s pp0_tokens=%s",
                         operation.request_id,
                         storage_hit_count,
                         len(hash_value),
                         time.monotonic() - wait_start,
+                        pp0_anchor_hash is not None,
+                        token_offset,
+                        local_token_len,
+                        pp0_token_len,
                     )
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
@@ -1030,10 +1074,14 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
-                    # Publish hit count for PP1
+                    # Publish hit count, anchor hash, and token_ids length for PP1
                     if self.pp_size > 1 and self.pp_rank == 0:
                         with self._pp0_storage_hit_cond:
-                            self.pp0_storage_hit_results[operation.request_id] = storage_hit_count
+                            self.pp0_storage_hit_results[operation.request_id] = (
+                                storage_hit_count,
+                                operation.last_hash,
+                                len(operation.token_ids),
+                            )
                             self._pp0_storage_hit_cond.notify_all()
 
                 if storage_hit_count < self.prefetch_threshold:
