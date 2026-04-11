@@ -45,6 +45,8 @@ class _PPPrefillDebugFilter(logging.Filter):
             return True
         return not (
             message.startswith("[PPReqPhase]")
+            or message.startswith("[PPPrefillDiag]")
+            or message.startswith("[PPPrefillProblem]")
             or message.startswith("[PP Dynamic Chunk]")
         )
 
