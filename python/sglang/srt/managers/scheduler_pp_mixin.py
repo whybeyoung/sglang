@@ -1454,6 +1454,18 @@ class SchedulerPPMixin:
             elif hasattr(self.tree_cache, "pp_locally_revoked_req_ids"):
                 for req in failed_reqs:
                     self.tree_cache.pp_locally_revoked_req_ids.discard(req.rid)
+            # Clear zero_hit deferred/pending_promote state for requests that
+            # passed bootstrap consensus.  Both PP ranks agreed to proceed, so
+            # the deferred→promote→locally_revoked barrier would be stale and
+            # can cause a batch-pick mismatch deadlock when both sides had
+            # zero_hit (PP0 clears deferred in 1 cycle while PP1 promotes in
+            # 2 cycles, causing PP0 to pick while PP1 blocks).
+            if good_reqs and hasattr(self.tree_cache, "pp_zero_hit_pending_promote_req_ids"):
+                for req in good_reqs:
+                    self.tree_cache.pp_zero_hit_pending_promote_req_ids.discard(req.rid)
+                    self.tree_cache.pp_zero_hit_deferred_req_ids.discard(req.rid)
+                    if hasattr(self.tree_cache, "discard_pp_locally_revoked_req"):
+                        self.tree_cache.discard_pp_locally_revoked_req(req.rid)
             self.waiting_queue.extend(good_reqs)
             if self._pp_prefill_diag_enabled() and (
                 good_consensus_bootstrapped_rids
