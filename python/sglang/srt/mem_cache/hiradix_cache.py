@@ -1519,7 +1519,8 @@ class HiRadixCache(RadixCache):
     def _finalize_prefetch_progress(
         self, req_id: str, operation: PrefetchOperation, emit_event: bool
     ) -> int:
-        last_host_node, token_ids, host_indices, _ = self.ongoing_prefetch[req_id]
+        orig_last_host_node, token_ids, host_indices, _ = self.ongoing_prefetch[req_id]
+        last_host_node = orig_last_host_node
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
@@ -1534,6 +1535,47 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
             min_completed_tokens = completed_tokens_tensor.item()
+
+        # The prefetch thread may have trimmed operation.token_ids and
+        # operation.host_indices when PP1 aligns its token range to PP0's
+        # anchor (pp_follow_hit path).  Detect the offset between the
+        # original ongoing_prefetch token_ids and the (possibly trimmed)
+        # operation token_ids, then walk the host tree forward so that
+        # _insert_helper_host starts from the correct anchor node.
+        orig_len = len(token_ids)
+        op_len = len(operation.token_ids)
+        token_offset = orig_len - op_len
+        if token_offset > 0:
+            # The prefetch thread trimmed token_offset tokens from the front
+            # of operation.token_ids/host_indices (PP1 → PP0 anchor alignment).
+            # Walk last_host_node forward through the trimmed prefix so that
+            # _insert_helper_host starts from the correct anchor node.
+            # Use a read-only walk to avoid splitting host tree nodes.
+            skipped_tokens = token_ids[:token_offset]
+            skipped_key = RadixKey(
+                token_ids=skipped_tokens,
+                extra_key=last_host_node.key.extra_key,
+            )
+            walk_node = last_host_node
+            walked = 0
+            remaining = skipped_key
+            while len(remaining) > 0:
+                child_key = self.get_child_key_fn(remaining)
+                if child_key not in walk_node.children:
+                    break
+                child = walk_node.children[child_key]
+                prefix_len = self.key_match_fn(child.key, remaining)
+                if prefix_len < len(child.key):
+                    break
+                walk_node = child
+                remaining = remaining[prefix_len:]
+                walked += prefix_len
+            last_host_node = walk_node
+            # Use the trimmed token_ids / host_indices from the operation.
+            # The trimmed front tokens (host slots) were already released
+            # by the prefetch thread via append_host_mem_release.
+            token_ids = list(operation.token_ids)
+            host_indices = operation.host_indices
 
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
@@ -1551,9 +1593,9 @@ class HiRadixCache(RadixCache):
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
-        last_host_node.release_host()
+        orig_last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.cache_controller.prefetch_tokens_occupied -= orig_len
         self.zero_hit_prefetch_req_ids.discard(req_id)
 
         loaded_from_storage = min_completed_tokens - matched_length
