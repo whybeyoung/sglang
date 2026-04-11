@@ -1495,6 +1495,7 @@ class Scheduler(
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         pp0_storage_hits = {}
+        pp_write_ack_count = 0
         if self.pp_rank > 0:
             if (
                 self.attn_tp_rank == 0
@@ -1506,9 +1507,11 @@ class Scheduler(
                     recv_reqs.get("hicache_host_tree_events", [])
                 )
                 pp0_storage_hits = recv_reqs.get("pp0_storage_hits", {})
+                pp_write_ack_count = recv_reqs.get("pp_write_ack_count", 0)
                 recv_reqs = recv_reqs["recv_reqs"]
             elif self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 pp_hicache_host_tree_events = []
+                pp_write_ack_count = 0
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
@@ -1518,6 +1521,7 @@ class Scheduler(
                 control_reqs = None
                 pp_hicache_host_tree_events = None
                 pp0_storage_hits = None
+                pp_write_ack_count = None
 
             if self.attn_tp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1539,6 +1543,16 @@ class Scheduler(
                         self.attn_tp_cpu_group,
                         src=self.attn_tp_group.ranks[0],
                     )
+                    pp_write_ack_count = broadcast_pyobj(
+                        [pp_write_ack_count],
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
+                    if isinstance(pp_write_ack_count, list) and pp_write_ack_count:
+                        pp_write_ack_count = pp_write_ack_count[0]
+                    else:
+                        pp_write_ack_count = 0
 
             if self.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1560,6 +1574,16 @@ class Scheduler(
                         self.attn_cp_cpu_group,
                         src=self.attn_cp_group.ranks[0],
                     )
+                    pp_write_ack_count = broadcast_pyobj(
+                        [pp_write_ack_count],
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
+                    if isinstance(pp_write_ack_count, list) and pp_write_ack_count:
+                        pp_write_ack_count = pp_write_ack_count[0]
+                    else:
+                        pp_write_ack_count = 0
 
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
@@ -1589,6 +1613,16 @@ class Scheduler(
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
                 )
+                pp_write_ack_count = broadcast_pyobj(
+                    [pp_write_ack_count],
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
+                if isinstance(pp_write_ack_count, list) and pp_write_ack_count:
+                    pp_write_ack_count = pp_write_ack_count[0]
+                else:
+                    pp_write_ack_count = 0
 
         if self.pp_rank > 0 and pp0_storage_hits:
             if (
@@ -1612,6 +1646,14 @@ class Scheduler(
                 self.tree_cache.stage_pp_incoming_prefetch_skip_events(
                     self.pp_hicache_host_tree_events
                 )
+            if (
+                pp_write_ack_count
+                and pp_write_ack_count > 0
+                and self.enable_hicache_storage
+                and self.tree_cache is not None
+                and hasattr(self.tree_cache, "set_pp_upstream_write_ack_count")
+            ):
+                self.tree_cache.set_pp_upstream_write_ack_count(pp_write_ack_count)
         else:
             self.pp_hicache_host_tree_events = []
 

@@ -478,13 +478,23 @@ class SchedulerPPMixin:
                 if ctrl.pp0_storage_hit_results:
                     pp0_storage_hits = dict(ctrl.pp0_storage_hit_results)
                     ctrl.pp0_storage_hit_results.clear()
-        if not events and not pp0_storage_hits:
+        write_ack_count = 0
+        if (
+            self.enable_hicache_storage
+            and self.tree_cache is not None
+            and hasattr(self.tree_cache, "get_pp_last_write_ack_consumed")
+        ):
+            write_ack_count = self.tree_cache.get_pp_last_write_ack_consumed()
+
+        if not events and not pp0_storage_hits and write_ack_count <= 0:
             return recv_reqs
         payload = {"recv_reqs": recv_reqs}
         if events:
             payload["hicache_host_tree_events"] = events
         if pp0_storage_hits:
             payload["pp0_storage_hits"] = pp0_storage_hits
+        if write_ack_count > 0:
+            payload["pp_write_ack_count"] = write_ack_count
         return payload
 
     def _pp_apply_hicache_sync_before_batch(self: Scheduler) -> None:

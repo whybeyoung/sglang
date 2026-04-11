@@ -234,6 +234,8 @@ class HiRadixCache(RadixCache):
         self.pp_zero_hit_deferred_req_ids: set[str] = set()
         self.pp_zero_hit_pending_promote_req_ids: set[str] = set()
         self._in_pp_host_tree_replay = False
+        self._pp_write_ack_budget_from_upstream: Optional[int] = None
+        self._pp_last_write_ack_consumed: int = 0
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -754,7 +756,22 @@ class HiRadixCache(RadixCache):
         return self.enable_storage and self.pp_size > 1 and self.pp_rank > 0
 
     def _pp_write_backup_replay_enabled(self) -> bool:
-        return os.getenv("SGLANG_ENABLE_PP_WRITE_BACKUP_REPLAY", "1") == "1"
+        return os.getenv("SGLANG_ENABLE_PP_WRITE_BACKUP_REPLAY", "0") == "1"
+
+    def _pp_write_backup_count_sync_enabled(self) -> bool:
+        return self.pp_size > 1 and not self._pp_write_backup_replay_enabled()
+
+    def set_pp_upstream_write_ack_count(self, count: int):
+        """Accumulate the number of write acks PP0 consumed this cycle."""
+        if self._pp_write_ack_budget_from_upstream is None:
+            self._pp_write_ack_budget_from_upstream = 0
+        self._pp_write_ack_budget_from_upstream += count
+
+    def get_pp_last_write_ack_consumed(self) -> int:
+        """Get and reset the number of write acks consumed in the last writing_check."""
+        count = self._pp_last_write_ack_consumed
+        self._pp_last_write_ack_consumed = 0
+        return count
 
     def _pp_should_skip_large_shallow_prefetch(
         self, last_host_node: TreeNode, prefetch_length: int
@@ -1953,10 +1970,28 @@ class HiRadixCache(RadixCache):
         self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
 
         finish_count = int(queue_size.item())
+        # PP-level sync: cap consumption by accumulated upstream budget
+        if (
+            self.pp_size > 1
+            and self.pp_rank > 0
+            and self._pp_write_ack_budget_from_upstream is not None
+        ):
+            finish_count = min(finish_count, self._pp_write_ack_budget_from_upstream)
+            self._pp_write_ack_budget_from_upstream -= finish_count
+            if self._pp_write_ack_budget_from_upstream <= 0:
+                self._pp_write_ack_budget_from_upstream = None
+
+        consumed_count = finish_count
+        emit_event = not self._pp_write_backup_count_sync_enabled()
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            self._consume_write_ack_group(finish_event, ack_list, emit_event=True)
+            self._consume_write_ack_group(
+                finish_event, ack_list, emit_event=emit_event
+            )
             finish_count -= 1
+
+        if self.pp_size > 1 and self.pp_rank == 0:
+            self._pp_last_write_ack_consumed = consumed_count
 
     def loading_check(self):
         finish_count = 0
