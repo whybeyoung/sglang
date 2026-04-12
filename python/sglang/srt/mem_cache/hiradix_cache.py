@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    get_hash_str,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -2180,11 +2181,59 @@ class HiRadixCache(RadixCache):
         self._delete_leaf(node)
         return num_evicted
 
+    def _pp_deterministic_evict_priority(self, node: TreeNode):
+        """Return a deterministic priority tuple based on node content, not timing.
+
+        In PP>1 mode, host eviction must select the same nodes on every
+        PP rank so the host trees stay in sync.  LRU / LFU priorities
+        depend on ``last_access_time`` / ``hit_count`` which can diverge
+        between PP ranks due to micro-timing and batch-pick differences.
+
+        Returns a tuple ``(main_hash, extra_key, key_len)`` that provides
+        a total, process-stable ordering.  ``main_hash`` is always a
+        SHA256-derived hex string (never Python ``hash()``).  ``extra_key``
+        disambiguates LoRA / cache-salt variants of the same token path.
+        ``key_len`` is a final tie-breaker.  With SHA256 as the primary
+        key, collision probability is astronomically low (~10^-77), making
+        it practically impossible for ``heapq`` to fall through to
+        ``TreeNode.__lt__`` (which uses non-deterministic ``last_access_time``).
+        """
+        # Primary key: SHA256 hex string from node's hash chain.
+        if node.hash_value and len(node.hash_value) > 0:
+            main = node.hash_value[-1]
+        else:
+            # Fallback: compute deterministic hash from token content.
+            parent_hash = None
+            if node.parent is not None:
+                parent_hash = node.parent.get_last_hash_value()
+            token_ids = node.key.token_ids if node.key is not None else []
+            main = get_hash_str(token_ids, prior_hash=parent_hash)
+
+        # Tie-breaker 1: extra_key (LoRA id / cache salt).
+        extra_key = (
+            ""
+            if node.key is None or node.key.extra_key is None
+            else str(node.key.extra_key)
+        )
+        # Tie-breaker 2: key length to further disambiguate.
+        key_len = len(node.key.token_ids) if node.key is not None else 0
+
+        return (main, extra_key, key_len)
+
     def evict_host(self, num_tokens: int):
         leaves = list(self.evictable_host_leaves)
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
+        if self.pp_size > 1:
+            # PP mode: use deterministic priority to ensure all PP ranks
+            # evict the same nodes, keeping host trees in sync.
+            eviction_heap = [
+                (self._pp_deterministic_evict_priority(node), node)
+                for node in leaves
+            ]
+        else:
+            eviction_heap = [
+                (self.eviction_strategy.get_priority(node), node)
+                for node in leaves
+            ]
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
@@ -2212,7 +2261,10 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                if self.pp_size > 1:
+                    new_priority = self._pp_deterministic_evict_priority(x.parent)
+                else:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
