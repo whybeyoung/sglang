@@ -2066,6 +2066,27 @@ class Scheduler(
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
+
+                # PP anchor-pinning: in PP>1 mode, if the host tree has
+                # nodes beyond the device boundary (host-only), pin the
+                # prefetch anchor back to the device boundary.  Host
+                # eviction is NOT synchronised across PP ranks, so
+                # host-only nodes may exist on one rank but not
+                # another.  Using them as anchor produces divergent
+                # hash-chains → divergent L3 results → shape-mismatch
+                # crash.  We keep req.last_host_node intact for
+                # load_back (schedule_policy), only override the
+                # anchor/tokens used for the L3 prefetch call below.
+                prefetch_anchor = last_host_node
+                if (
+                    self.pp_size > 1
+                    and req.host_hit_length > 0
+                    and last_host_node is not req.last_node
+                ):
+                    prefetch_anchor = req.last_node
+                    last_hash = prefetch_anchor.get_last_hash_value()
+                    anchor_depth = len(req.prefix_indices)
+                    new_input_tokens = req.fill_ids[anchor_depth:]
                 if os.getenv("SGLANG_DEBUG_PP_PREFETCH_TRACE", "0") == "1":
                     wait_age_ms = 0.0
                     bootstrap_age_ms = 0.0
@@ -2095,8 +2116,8 @@ class Scheduler(
                         req.host_hit_length,
                         matched_len,
                         len(new_input_tokens),
-                        last_host_node.id if last_host_node is not None else None,
-                        last_host_node.backuped if last_host_node is not None else None,
+                        prefetch_anchor.id if prefetch_anchor is not None else None,
+                        prefetch_anchor.backuped if prefetch_anchor is not None else None,
                         last_hash,
                         wait_age_ms,
                         bootstrap_age_ms,
@@ -2126,13 +2147,13 @@ class Scheduler(
                         return
 
                 prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
+                    prefetch_anchor.get_prefix_hash_values(prefetch_anchor.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
-                    last_host_node,
+                    prefetch_anchor,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
