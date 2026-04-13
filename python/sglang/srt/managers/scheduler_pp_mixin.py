@@ -555,14 +555,15 @@ class SchedulerPPMixin:
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
+                with torch.profiler.record_function("get_next_batch_to_run"):
+                    self._pp_apply_hicache_sync_before_batch()
+                    self.mbs[mb_id] = self.get_next_batch_to_run()
+                if not self.pp_group.is_last_rank:
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             self._pp_build_req_payload(recv_reqs),
                             async_send=True,
                         )
-                with torch.profiler.record_function("get_next_batch_to_run"):
-                    self._pp_apply_hicache_sync_before_batch()
-                    self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
