@@ -500,11 +500,11 @@ class SchedulerPPMixin:
         return payload
 
     def _pp_apply_hicache_sync_before_batch(self: Scheduler) -> None:
-        if (
-            self.pp_rank == 0
-            or not self.enable_hicache_storage
-            or self.tree_cache is None
-        ):
+        if not self.enable_hicache_storage or self.tree_cache is None:
+            return
+        if hasattr(self.tree_cache, "inc_logical_clock"):
+            self.tree_cache.inc_logical_clock()
+        if self.pp_rank == 0:
             return
         incoming_events = getattr(self, "pp_hicache_host_tree_events", None) or []
         if incoming_events and hasattr(self.tree_cache, "enqueue_pp_host_tree_events"):

@@ -31,7 +31,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
-    get_hash_str,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -755,6 +754,25 @@ class HiRadixCache(RadixCache):
 
     def _pp_downstream_sync_enabled(self) -> bool:
         return self.enable_storage and self.pp_size > 1 and self.pp_rank > 0
+
+    def get_access_time(self) -> float:
+        if self.pp_size > 1:
+            return float(self._logical_clock)
+        return time.monotonic()
+
+    def _evict_tie_breaker(self, node: TreeNode):
+        """Return a rank-stable tie-breaker for eviction heap ordering.
+
+        In PP>1 mode, node.id (from TreeNode.counter) can differ across
+        ranks because nodes are created independently.  Use the content
+        hash instead, which is identical for the same logical node on
+        every rank.  For PP==1, node.id is fine and cheaper.
+        """
+        if self.pp_size > 1:
+            if node.hash_value and len(node.hash_value) > 0:
+                return node.hash_value[-1]
+            return ""
+        return node.id
 
     def _pp_write_backup_replay_enabled(self) -> bool:
         return os.getenv("SGLANG_ENABLE_PP_WRITE_BACKUP_REPLAY", "0") == "1"
@@ -2120,7 +2138,7 @@ class HiRadixCache(RadixCache):
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node), self._evict_tie_breaker(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -2128,7 +2146,7 @@ class HiRadixCache(RadixCache):
         evicted_nodes = 0
         write_back_nodes = []
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _priority, _tb, x = heapq.heappop(eviction_heap)
 
             if x.lock_ref > 0:
                 continue
@@ -2152,7 +2170,7 @@ class HiRadixCache(RadixCache):
             else:
                 # all children are evicted or no children
                 new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                heapq.heappush(eviction_heap, (new_priority, self._evict_tie_breaker(x.parent), x.parent))
 
         if self.cache_controller.write_policy == "write_back":
             self.writing_check(write_back=True)
@@ -2193,65 +2211,18 @@ class HiRadixCache(RadixCache):
         self._delete_leaf(node)
         return num_evicted
 
-    def _pp_deterministic_evict_priority(self, node: TreeNode):
-        """Return a deterministic priority tuple based on node content, not timing.
-
-        In PP>1 mode, host eviction must select the same nodes on every
-        PP rank so the host trees stay in sync.  LRU / LFU priorities
-        depend on ``last_access_time`` / ``hit_count`` which can diverge
-        between PP ranks due to micro-timing and batch-pick differences.
-
-        Returns a tuple ``(main_hash, extra_key, key_len)`` that provides
-        a total, process-stable ordering.  ``main_hash`` is always a
-        SHA256-derived hex string (never Python ``hash()``).  ``extra_key``
-        disambiguates LoRA / cache-salt variants of the same token path.
-        ``key_len`` is a final tie-breaker.  With SHA256 as the primary
-        key, collision probability is astronomically low (~10^-77), making
-        it practically impossible for ``heapq`` to fall through to
-        ``TreeNode.__lt__`` (which uses non-deterministic ``last_access_time``).
-        """
-        # Primary key: SHA256 hex string from node's hash chain.
-        if node.hash_value and len(node.hash_value) > 0:
-            main = node.hash_value[-1]
-        else:
-            # Fallback: compute deterministic hash from token content.
-            parent_hash = None
-            if node.parent is not None:
-                parent_hash = node.parent.get_last_hash_value()
-            token_ids = node.key.token_ids if node.key is not None else []
-            main = get_hash_str(token_ids, prior_hash=parent_hash)
-
-        # Tie-breaker 1: extra_key (LoRA id / cache salt).
-        extra_key = (
-            ""
-            if node.key is None or node.key.extra_key is None
-            else str(node.key.extra_key)
-        )
-        # Tie-breaker 2: key length to further disambiguate.
-        key_len = len(node.key.token_ids) if node.key is not None else 0
-
-        return (main, extra_key, key_len)
-
     def evict_host(self, num_tokens: int):
         leaves = list(self.evictable_host_leaves)
-        if self.pp_size > 1:
-            # PP mode: use deterministic priority to ensure all PP ranks
-            # evict the same nodes, keeping host trees in sync.
-            eviction_heap = [
-                (self._pp_deterministic_evict_priority(node), node)
-                for node in leaves
-            ]
-        else:
-            eviction_heap = [
-                (self.eviction_strategy.get_priority(node), node)
-                for node in leaves
-            ]
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), self._evict_tie_breaker(node), node)
+            for node in leaves
+        ]
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
         evicted_nodes = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _priority, _tb, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
             # only evict the host value of evicted nodes
@@ -2274,7 +2245,7 @@ class HiRadixCache(RadixCache):
                 x.id,
                 len(x.key) if x.key is not None else 0,
                 tokens_freed,
-                _priority[:1] if isinstance(_priority, tuple) else _priority,
+                _priority,
             )
 
             key = self.get_child_key_fn(x.key)
@@ -2285,11 +2256,8 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
-                if self.pp_size > 1:
-                    new_priority = self._pp_deterministic_evict_priority(x.parent)
-                else:
-                    new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                new_priority = self.eviction_strategy.get_priority(x.parent)
+                heapq.heappush(eviction_heap, (new_priority, self._evict_tie_breaker(x.parent), x.parent))
         if evicted_nodes > 0:
             logger.warning(
                 "[HostEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s",
@@ -2543,10 +2511,23 @@ class HiRadixCache(RadixCache):
             if req_id in self.ongoing_prefetch:
                 _, _, _, op = self.ongoing_prefetch[req_id]
                 if op.host_indices is not None:
-                    logger.warning(
-                        "[HiCachePrefetchWaitBlocked] rid=%s reason=awaiting_pp0_finalize_event",
-                        req_id,
-                    )
+                    wait_age = time.monotonic() - op.start_time
+                    pending_head = self._peek_pp_host_tree_event()
+                    if wait_age > 5.0:
+                        logger.error(
+                            "[HiCachePrefetchWaitStuck] rid=%s age=%.3fs pending_head_kind=%s pending_head_rid=%s pending_len=%s",
+                            req_id,
+                            wait_age,
+                            pending_head.kind if pending_head else None,
+                            pending_head.rid if pending_head else None,
+                            len(self.pp_pending_host_tree_events),
+                        )
+                    else:
+                        logger.warning(
+                            "[HiCachePrefetchWaitBlocked] rid=%s age=%.3fs reason=awaiting_pp0_finalize_event",
+                            req_id,
+                            wait_age,
+                        )
                     return False
 
         # todo: more policies for prefetch progress such as timeout
@@ -2896,7 +2877,7 @@ class HiRadixCache(RadixCache):
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value, req_id: str | None = None
     ):
-        node.last_access_time = time.monotonic()
+        node.last_access_time = self.get_access_time()
         if len(key) == 0:
             return 0
 
@@ -2905,7 +2886,7 @@ class HiRadixCache(RadixCache):
         matched_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.monotonic()
+            node.last_access_time = self.get_access_time()
             prefix_len = self.key_match_fn(node.key, key)
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -2921,6 +2902,7 @@ class HiRadixCache(RadixCache):
 
         if len(key):
             new_node = TreeNode(priority=node.priority)
+            new_node.last_access_time = self.get_access_time()
             new_node.parent = node
             new_node.key = key
             new_node.value = None
@@ -2956,13 +2938,13 @@ class HiRadixCache(RadixCache):
         return matched_length
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
-        node.last_access_time = time.monotonic()
+        node.last_access_time = self.get_access_time()
         child_key = self.get_child_key_fn(key)
         value = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.monotonic()
+            child.last_access_time = self.get_access_time()
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -2984,6 +2966,7 @@ class HiRadixCache(RadixCache):
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode(priority=child.priority)
+        new_node.last_access_time = child.last_access_time
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -3051,7 +3034,7 @@ class HiRadixCache(RadixCache):
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.monotonic()
+            node.last_access_time = self.get_access_time()
             node.priority = max(node.priority, priority)
             prefix_len = self.key_match_fn(node.key, key)
 
@@ -3093,6 +3076,7 @@ class HiRadixCache(RadixCache):
 
         if len(key):
             new_node = TreeNode(priority=priority)
+            new_node.last_access_time = self.get_access_time()
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
