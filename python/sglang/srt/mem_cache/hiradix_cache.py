@@ -2528,6 +2528,24 @@ class HiRadixCache(RadixCache):
                     req_id,
                     event.rid,
                 )
+            else:
+                # No PP0 event has arrived yet.  PP1's finalize is
+                # event-driven: it must wait for PP0's PREFETCH_FINALIZE
+                # event to arrive (processed via replay_pp_host_tree_events
+                # → _try_replay_prefetch_finalize_event).  Finalizing
+                # independently would insert host-only nodes into the
+                # tree that PP0 hasn't inserted yet, causing prefix
+                # length divergence and shape-mismatch crashes.
+                # Return False to let batch_pick retry next cycle when
+                # PP0's event has arrived.
+                if req_id in self.ongoing_prefetch:
+                    _, _, _, op = self.ongoing_prefetch[req_id]
+                    if op.host_indices is not None and self.can_terminate_prefetch(op):
+                        logger.warning(
+                            "[HiCachePrefetchWaitBlocked] rid=%s reason=no_pp0_event_yet_prefetch_ready",
+                            req_id,
+                        )
+                        return False
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
