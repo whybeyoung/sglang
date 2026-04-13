@@ -592,11 +592,13 @@ class RadixCache(BasePrefixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        evicted_nodes = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
+            evicted_nodes += 1
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
@@ -605,6 +607,14 @@ class RadixCache(BasePrefixCache):
 
             self._record_remove_event(x)
 
+        if evicted_nodes > 0:
+            logger.warning(
+                "[GPUEvict][summary] requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s",
+                num_tokens,
+                num_evicted,
+                evicted_nodes,
+                len(leaves),
+            )
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 

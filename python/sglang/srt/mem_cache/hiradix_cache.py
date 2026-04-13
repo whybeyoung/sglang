@@ -2125,6 +2125,7 @@ class HiRadixCache(RadixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        evicted_nodes = 0
         write_back_nodes = []
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
@@ -2141,6 +2142,7 @@ class HiRadixCache(RadixCache):
                     num_evicted += self._evict_regular(x)
             else:
                 num_evicted += self._evict_backuped(x)
+            evicted_nodes += 1
 
             for child in x.parent.children.values():
                 if child in write_back_nodes:
@@ -2158,6 +2160,16 @@ class HiRadixCache(RadixCache):
                 assert node.backuped
                 self._evict_backuped(node)
 
+        if evicted_nodes > 0:
+            logger.warning(
+                "[GPUEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                num_tokens,
+                num_evicted,
+                evicted_nodes,
+                len(leaves),
+            )
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
@@ -2237,6 +2249,7 @@ class HiRadixCache(RadixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        evicted_nodes = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
@@ -2251,7 +2264,18 @@ class HiRadixCache(RadixCache):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit BlockRemoved so the router removes this block from its index.
             self._record_remove_event(x)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
+            tokens_freed = self.cache_controller.evict_host(x.host_value)
+            num_evicted += tokens_freed
+            evicted_nodes += 1
+            logger.warning(
+                "[HostEvict] pp=%s cp=%s node=%s key_len=%s tokens_freed=%s priority=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                x.id,
+                len(x.key) if x.key is not None else 0,
+                tokens_freed,
+                _priority[:1] if isinstance(_priority, tuple) else _priority,
+            )
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -2266,6 +2290,16 @@ class HiRadixCache(RadixCache):
                 else:
                     new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
+        if evicted_nodes > 0:
+            logger.warning(
+                "[HostEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                num_tokens,
+                num_evicted,
+                evicted_nodes,
+                len(leaves),
+            )
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
