@@ -755,6 +755,11 @@ class SchedulerPPMixin:
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
+                if not self.pp_group.is_last_rank:
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            self._pp_build_req_payload(recv_reqs), async_send=True
+                        )
                 launch_frontier_ack_rids = []
                 launch_frontier_ack_barrier_rid = None
                 if self.pp_group.is_last_rank:
@@ -1004,9 +1009,6 @@ class SchedulerPPMixin:
                     # Consume this microbatch's release consensus exactly once.
                     tmbs[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        self._pp_build_req_payload(recv_reqs), async_send=True
-                    )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
