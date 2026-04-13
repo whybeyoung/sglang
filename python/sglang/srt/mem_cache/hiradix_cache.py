@@ -2528,6 +2528,17 @@ class HiRadixCache(RadixCache):
                     req_id,
                     event.rid,
                 )
+                # Even though the head-of-queue event is unrelated, the
+                # current request must still wait for its own PP0 event
+                # before finalizing independently.
+                if req_id in self.ongoing_prefetch:
+                    _, _, _, op = self.ongoing_prefetch[req_id]
+                    if op.host_indices is not None and self.can_terminate_prefetch(op):
+                        logger.warning(
+                            "[HiCachePrefetchWaitBlocked] rid=%s reason=no_pp0_event_yet_prefetch_ready_behind_unrelated",
+                            req_id,
+                        )
+                        return False
             else:
                 # No PP0 event has arrived yet.  PP1's finalize is
                 # event-driven: it must wait for PP0's PREFETCH_FINALIZE
