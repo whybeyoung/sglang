@@ -24,13 +24,15 @@ In PP mode, each rank runs an independent scheduler with its own radix tree. The
 
 2. **Anchor divergence**: The L3 query uses a hash chain starting from an anchor node in the host tree. If PP0 has already inserted nodes from a previous prefetch (giving it `host_hit=896`), its anchor and token range differ from PP1's (which has `host_hit=0`). The two ranks compute **completely different hash chains** for the same request → fetch different (or wrong) data from storage.
 
-3. **Amplification cascade**: Once the host tree diverges (even by one node), all subsequent operations compound the difference — different eviction decisions, different write-through timing, different prefetch anchors for the next request — until a shape mismatch crash occurs.
+3. **Eviction divergence from wall-clock LRU**: Even after fixing async finalization (making PP1 event-driven), the eviction layer itself can diverge. LRU eviction uses `last_access_time = time.monotonic()`, which differs by microseconds between ranks → different victim node selection → different GPU→CPU demotion → different host memory pressure → different `evictable_host_leaves` candidate sets. In production (PP2 + NSA + disagg prefill), this caused: PP0 finalized a prefetch → inserted host node → immediately triggered `evict_host` (memory pressure) → evicted the node. PP1 replayed the same finalize event one cycle later → inserted the node → no eviction pressure → node remained. Result: PP0 `matched_host=0`, PP1 `matched_host=17664` → shape mismatch crash.
 
-In essence: **L1 and L2 operations are synchronous and deterministic within each cycle, but L3 prefetch is asynchronous and state-dependent. The async completion timing and state-dependent query parameters create a feedback loop where small divergences amplify into crashes.**
+4. **Amplification cascade**: Once the host tree diverges (even by one node), all subsequent operations compound the difference — different eviction decisions, different write-through timing, different prefetch anchors for the next request — until a shape mismatch crash occurs.
+
+In essence: **L1 and L2 operations are synchronous and deterministic within each cycle, but L3 prefetch is asynchronous and state-dependent. The async completion timing, state-dependent query parameters, and wall-clock-dependent eviction ordering create a feedback loop where small divergences amplify into crashes.**
 
 ## Solution Architecture
 
-We introduce **4 synchronization channels** between PP ranks to ensure L1/L2/L3 cache consistency and identical batch selection:
+We introduce **3 synchronization channels** between PP ranks to ensure L1/L2/L3 cache consistency:
 
 ```
  ┌───────────────────────────┐            ┌───────────────────────────┐
@@ -39,7 +41,7 @@ We introduce **4 synchronization channels** between PP ranks to ensure L1/L2/L3 
  │  Event Loop               │            │  Event Loop               │
  │  ├─ batch pick            │ ═A.event═> │  ├─ replay events (L2)    │
  │  ├─ writing_check         │ ─B.count─> │  ├─ budget-cap check (L1) │
- │  └─ prefetch issue        │            │  └─ ack-constrained pick  │
+ │  └─ prefetch issue        │            │  └─ prefetch issue        │
  │                           │            │                           │
  │  Prefetch Thread          │ ─C.hit───> │  Prefetch Thread          │
  │  └─ query L3, hash chain  │            │  └─ wait result, trim,   │
@@ -68,7 +70,6 @@ We introduce **4 synchronization channels** between PP ranks to ensure L1/L2/L3 
 | **A. Event Replay** | PP0 → PP1 | FIFO queue, per-request events (FINALIZE / REVOKE / SKIP) | L2 host tree structure consistency |
 | **B. Count Sync** | PP0 → PP1 | Scalar `write_ack_count` per cycle | L1 device tree eviction parity |
 | **C. Hit Delegation** | PP0 → PP1 | `(hit_count, anchor_hash, token_len)` via prefetch thread | L3 hash chain and data consistency |
-| **D. Frontier Ack** | PP1 → PP0 | Batch pick `rids` piggybacked on next cycle | Identical batch selection |
 
 ### Why Two Sync Strategies?
 
@@ -82,16 +83,17 @@ Write-back acks were originally emitted as `WRITE_BACKUP_COMMITTED` events in th
 
 > Base: `97adf8a2`. PR #20977 (CP support) already merged.
 
+- [ ] **Logical clock for PP-deterministic eviction** — Replace `time.monotonic()` with a logical batch-step counter for `last_access_time` in PP>1 mode, making both GPU (LRU) and host eviction fully deterministic across PP ranks. Addresses root cause #3 above.
 - [ ] Mooncake CP write control + PP storage key isolation (`_should_skip_local_write`, `pp_suffix`)
 - [ ] Hybrid cache (Mamba/DSA) enhancements (`hybrid_pool_assembler`, `batch_get_v2`/`batch_set_v2`)
 - [ ] Channel A: Host tree event replay infrastructure (`PPHostTreeEvent`, emit/enqueue/replay pipeline, payload V2)
 - [ ] Channel B: Write-back count sync (budget-capped `writing_check`, replaces FIFO event replay)
 - [ ] Channel C: L3 hit delegation + anchor alignment (PP0 publishes hit result, PP1 trims + walks anchor)
-- [ ] Channel D: Launch frontier ack (PP1→PP0 batch pick constraint)
 - [ ] Zero-hit deferred revoke (1-cycle defer to prevent PP deadlock on L3 zero-hit)
 - [ ] PP prefill diagnostics (ENV-gated, optional)
 - [ ] Independent fixes (FlashInfer PP warmup, HTTP 400 logging, router guard, HiCache monitoring, tool content normalization)
 
 ## Acknowledgments
 
-Special thanks to **Shangming Cai** and **Zhihao He (hzh)** for their guidance on the HiCache architecture, PP synchronization design, and code review throughout this effort.
+Special thanks to @ShangmingCai @hzh0425 for their guidance on the HiCache architecture, PP synchronization design, and code review throughout this effort.
+CC @merrymercy @hnyls2002 @xiezhq-hermann @Fridge003
