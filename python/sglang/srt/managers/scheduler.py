@@ -2940,6 +2940,23 @@ class Scheduler(
                     req.mamba_pool_idx = None
                 break
 
+        # Flush deferred prefetch finalizes: in PP>1 mode, PP0 defers
+        # host tree insertions until all requests' match_prefix calls are
+        # done, so that no request observes another's just-finalized nodes.
+        if (
+            self.enable_hicache_storage
+            and hasattr(self.tree_cache, "flush_deferred_finalizes")
+        ):
+            deferred_rids = self.tree_cache.flush_deferred_finalizes()
+            if deferred_rids:
+                rid_to_req = {r.rid: r for r in adder.can_run_list}
+                for rid in deferred_rids:
+                    req = rid_to_req.get(rid)
+                    if req is not None:
+                        req.storage_hit_length = (
+                            self.tree_cache.pop_prefetch_loaded_tokens(rid)
+                        )
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:

@@ -308,6 +308,17 @@ class PrefillBootstrapQueue:
                 break
             good_rids.append(req.rid)
 
+        if hasattr(self.scheduler.tree_cache, "flush_deferred_finalizes"):
+            deferred = self.scheduler.tree_cache.flush_deferred_finalizes()
+            if deferred:
+                for rid in deferred:
+                    for req in reqs_to_poll:
+                        if req.rid == rid:
+                            req.storage_hit_length = (
+                                self.scheduler.tree_cache.pop_prefetch_loaded_tokens(rid)
+                            )
+                            break
+
         if return_polls:
             return good_rids, bad_rids, list(polls)
         return good_rids, bad_rids
@@ -475,6 +486,17 @@ class PrefillBootstrapQueue:
             self._init_bootstrapped_req(req)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(queue_index)
+
+        if hasattr(self.scheduler.tree_cache, "flush_deferred_finalizes"):
+            deferred = self.scheduler.tree_cache.flush_deferred_finalizes()
+            if deferred:
+                for rid in deferred:
+                    for req in reqs_to_poll:
+                        if req.rid == rid:
+                            req.storage_hit_length = (
+                                self.scheduler.tree_cache.pop_prefetch_loaded_tokens(rid)
+                            )
+                            break
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

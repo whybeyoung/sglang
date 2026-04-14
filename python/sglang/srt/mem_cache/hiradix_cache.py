@@ -211,6 +211,10 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        # Deferred finalize list: in PP>1 mode, finalize is deferred until
+        # all requests in the current batch have completed match_prefix, so
+        # that no request sees another request's just-finalized host nodes.
+        self._deferred_finalize_rids: list[str] = []
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -750,6 +754,7 @@ class HiRadixCache(RadixCache):
         self.pp_soft_skipped_req_ids.clear()
         self.pp_zero_hit_deferred_req_ids.clear()
         self.pp_zero_hit_pending_promote_req_ids.clear()
+        self._deferred_finalize_rids.clear()
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
@@ -2557,17 +2562,57 @@ class HiRadixCache(RadixCache):
                 debug_state,
             )
             return False
-        self._finalize_prefetch_progress(req_id, operation, emit_event=True)
-        if self._pp_downstream_sync_enabled():
-            event = self._peek_pp_host_tree_event()
-            if (
-                event is not None
-                and event.kind == "PREFETCH_FINALIZE"
-                and event.rid == req_id
-            ):
-                self._pop_pp_host_tree_event()
+
+        # In PP>1 mode (first rank), defer the actual finalize so that all
+        # requests in the current scheduling batch see a consistent host tree
+        # snapshot during match_prefix.  The deferred finalizes are flushed
+        # after the batch loop via flush_deferred_finalizes().
+        if self.pp_size > 1 and self.pp_rank == 0:
+            if req_id not in self._deferred_finalize_rids:
+                self._deferred_finalize_rids.append(req_id)
+        else:
+            self._finalize_prefetch_progress(req_id, operation, emit_event=True)
+            if self._pp_downstream_sync_enabled():
+                event = self._peek_pp_host_tree_event()
+                if (
+                    event is not None
+                    and event.kind == "PREFETCH_FINALIZE"
+                    and event.rid == req_id
+                ):
+                    self._pop_pp_host_tree_event()
 
         return True
+
+    def flush_deferred_finalizes(self) -> list[str]:
+        """Execute all deferred prefetch finalizes.
+
+        Called by the scheduler after the batch scheduling loop completes
+        (i.e., after all requests' match_prefix calls are done).  This
+        ensures that within a single batch, no request's match_prefix
+        observes host tree nodes inserted by another request's finalize.
+
+        Returns the list of finalized request IDs so the caller can
+        update storage_hit_length for those requests.
+        """
+        if not self._deferred_finalize_rids:
+            return []
+        finalized_rids = []
+        for req_id in self._deferred_finalize_rids:
+            if req_id not in self.ongoing_prefetch:
+                continue
+            _, _, _, operation = self.ongoing_prefetch[req_id]
+            self._finalize_prefetch_progress(req_id, operation, emit_event=True)
+            finalized_rids.append(req_id)
+            if self._pp_downstream_sync_enabled():
+                event = self._peek_pp_host_tree_event()
+                if (
+                    event is not None
+                    and event.kind == "PREFETCH_FINALIZE"
+                    and event.rid == req_id
+                ):
+                    self._pop_pp_host_tree_event()
+        self._deferred_finalize_rids.clear()
+        return finalized_rids
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
