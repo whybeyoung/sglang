@@ -504,6 +504,12 @@ class SchedulerPPMixin:
             return
         if hasattr(self.tree_cache, "inc_logical_clock"):
             self.tree_cache.inc_logical_clock()
+        # Flush deferred prefetch evict+alloc operations.  These were deferred
+        # from prefetch_from_storage (which runs outside the batch loop at
+        # request-arrival time) so that evict_host executes after logical_clock
+        # sync, ensuring deterministic eviction order across PP ranks.
+        if hasattr(self.tree_cache, "flush_deferred_prefetch_evicts"):
+            self.tree_cache.flush_deferred_prefetch_evicts()
         if self.pp_rank == 0:
             return
         incoming_events = getattr(self, "pp_hicache_host_tree_events", None) or []

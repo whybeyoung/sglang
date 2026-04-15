@@ -240,6 +240,11 @@ class HiRadixCache(RadixCache):
         self._in_pp_host_tree_replay = False
         self._pp_write_ack_budget_from_upstream: Optional[int] = None
         self._pp_last_write_ack_consumed: int = 0
+        # Deferred prefetch evict+alloc: in PP>1 mode, when prefetch_from_storage
+        # needs to evict host nodes to allocate space, the eviction is deferred
+        # until the next batch loop iteration (after logical_clock sync) to ensure
+        # deterministic eviction order across PP ranks.
+        self._deferred_prefetch_evict_items: list[tuple] = []
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -529,6 +534,20 @@ class HiRadixCache(RadixCache):
         except Exception:
             logger.exception("Force release pending prefetch ops failed.")
 
+        # Force release deferred prefetch evict items: release anchor protection.
+        try:
+            for _req_id, _plen, last_host_node, *_ in self._deferred_prefetch_evict_items:
+                try:
+                    last_host_node.release_host()
+                except Exception:
+                    logger.exception(
+                        "Failed to release host protection for deferred prefetch %s",
+                        _req_id,
+                    )
+            self._deferred_prefetch_evict_items.clear()
+        except Exception:
+            logger.exception("Force release deferred prefetch evict items failed.")
+
         # Force release leftover backup ops: drop host protection on nodes.
         try:
             for ack_id, node in list(self.ongoing_backup.items()):
@@ -755,6 +774,7 @@ class HiRadixCache(RadixCache):
         self.pp_zero_hit_deferred_req_ids.clear()
         self.pp_zero_hit_pending_promote_req_ids.clear()
         self._deferred_finalize_rids.clear()
+        self._deferred_prefetch_evict_items.clear()
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
@@ -1067,6 +1087,7 @@ class HiRadixCache(RadixCache):
         zero_hit: bool = False,
         mark_local_revoke: bool = True,
     ) -> None:
+        self._drop_deferred_prefetch_req(req_id)
         self.clear_follow_rank_prefetch_issue_pending(req_id)
         if req_id in self.pp_authoritative_revoked_req_ids:
             mark_local_revoke = False
@@ -2614,6 +2635,194 @@ class HiRadixCache(RadixCache):
         self._deferred_finalize_rids.clear()
         return finalized_rids
 
+    def _log_prefetch_skip_and_sync(
+        self, req_id: str, *, reason: str, aligned_tokens: int
+    ):
+        """Log a prefetch skip and emit PREFETCH_SKIP for PP downstream sync."""
+        logger.warning(
+            "[HiCachePrefetchDecision] rid=%s action=skip reason=%s "
+            "aligned_tokens=%s threshold=%s occupied=%s",
+            req_id,
+            reason,
+            aligned_tokens,
+            self.prefetch_threshold,
+            self.cache_controller.prefetch_tokens_occupied,
+        )
+        if self._pp_downstream_sync_enabled():
+            self._append_pp_host_tree_event(
+                PPHostTreeEvent(
+                    seq=self._next_pp_host_tree_seq(),
+                    kind="PREFETCH_SKIP",
+                    rid=req_id,
+                )
+            )
+
+    def _issue_prefetch_impl(
+        self,
+        *,
+        req_id: str,
+        last_host_node: TreeNode,
+        host_indices,
+        new_input_tokens: List[int],
+        prefetch_length: int,
+        last_hash: Optional[str],
+        prefix_keys: Optional[List[str]],
+        trace_phase: str,
+        decision_action: str,
+        emit_req_phase_log: bool = False,
+    ):
+        """Shared tail for issuing a prefetch: submit to cache_controller and
+        update tracking state.  Callers must have already allocated host_indices
+        and validated that the request is safe to issue."""
+        operation = self.cache_controller.prefetch(
+            req_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            **self._get_extra_pools(),
+        )
+        issue_idx = self.prefetch_issue_count_by_reqid.get(req_id, 0) + 1
+        self.prefetch_issue_count_by_reqid[req_id] = issue_idx
+        if os.getenv("SGLANG_DEBUG_PP_PREFETCH_TRACE", "0") == "1":
+            logger.warning(
+                "[PPPrefetchTrace] pp=%s cp=%s tp=%s rid=%s phase=%s issue_idx=%s "
+                "aligned_tokens=%s anchor_node=%s anchor_backuped=%s last_hash=%s prefix_keys=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                _safe_attn_tp_rank(self),
+                req_id,
+                trace_phase,
+                issue_idx,
+                prefetch_length,
+                last_host_node.id if last_host_node is not None else None,
+                last_host_node.backuped if last_host_node is not None else None,
+                last_hash,
+                0 if prefix_keys is None else len(prefix_keys),
+            )
+        if emit_req_phase_log:
+            logger.warning(
+                "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_issue token_count=%s last_hash=%s prefix_keys=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                _safe_attn_tp_rank(self),
+                req_id,
+                len(new_input_tokens),
+                last_hash,
+                0 if prefix_keys is None else len(prefix_keys),
+            )
+        self.ongoing_prefetch[req_id] = (
+            last_host_node,
+            new_input_tokens,
+            host_indices,
+            operation,
+        )
+        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        logger.warning(
+            "[HiCachePrefetchDecision] rid=%s action=%s aligned_tokens=%s threshold=%s occupied=%s",
+            req_id,
+            decision_action,
+            prefetch_length,
+            self.prefetch_threshold,
+            self.cache_controller.prefetch_tokens_occupied,
+        )
+
+    def _drop_deferred_prefetch_req(self, req_id: str) -> bool:
+        """Remove a request from the deferred prefetch evict queue.
+
+        Called on abort / revoke / soft-skip to prevent a stale deferred item
+        from later issuing a prefetch and holding anchor protection.
+        """
+        kept: list[tuple] = []
+        dropped = False
+        for item in self._deferred_prefetch_evict_items:
+            rid = item[0]
+            if rid == req_id:
+                # item: (req_id, prefetch_length, last_host_node, ...)
+                item[2].release_host()
+                dropped = True
+            else:
+                kept.append(item)
+        if dropped:
+            self._deferred_prefetch_evict_items = kept
+        return dropped
+
+    def flush_deferred_prefetch_evicts(self):
+        """Execute deferred prefetch evict+alloc+issue operations.
+
+        In PP>1 mode, when prefetch_from_storage cannot allocate host memory,
+        the evict_host call is deferred to this method which runs inside the
+        batch loop after logical_clock has been synchronized across PP ranks.
+        This guarantees that eviction order is deterministic.
+
+        Items are sorted by req_id before processing to ensure the same flush
+        order across PP ranks even if request arrival order differs.
+        """
+        if not self._deferred_prefetch_evict_items:
+            return
+        # Sort by req_id for deterministic flush order across PP ranks.
+        self._deferred_prefetch_evict_items.sort(key=lambda item: item[0])
+        for req_id, prefetch_length, last_host_node, new_input_tokens, last_hash, prefix_keys in self._deferred_prefetch_evict_items:
+            # Skip if request was aborted / revoked / soft-skipped / zero-hit
+            # while deferred.
+            if (
+                req_id in self.ongoing_prefetch
+                or req_id in self.pp_soft_skipped_req_ids
+                or req_id in self.pp_authoritative_revoked_req_ids
+                or req_id in self.zero_hit_prefetch_req_ids
+            ):
+                last_host_node.release_host()
+                continue
+            # Validate anchor node is still valid: check that the recorded
+            # last_hash still matches the anchor.  The anchor can become stale
+            # due to node splits or evictions during the defer window.
+            current_hash = (
+                last_host_node.get_last_hash_value()
+                if last_host_node is not None
+                else None
+            )
+            if last_hash is not None and current_hash != last_hash:
+                last_host_node.release_host()
+                logger.warning(
+                    "[HiCachePrefetchDecision] rid=%s action=skip reason=deferred_anchor_stale "
+                    "aligned_tokens=%s expected_hash=%s current_hash=%s",
+                    req_id,
+                    prefetch_length,
+                    last_hash,
+                    current_hash,
+                )
+                if self._pp_downstream_sync_enabled():
+                    self._append_pp_host_tree_event(
+                        PPHostTreeEvent(
+                            seq=self._next_pp_host_tree_seq(),
+                            kind="PREFETCH_SKIP",
+                            rid=req_id,
+                        )
+                    )
+                continue
+            self.evict_host(prefetch_length)
+            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+            if host_indices is None:
+                last_host_node.release_host()
+                self._log_prefetch_skip_and_sync(
+                    req_id,
+                    reason="deferred_host_alloc_failed",
+                    aligned_tokens=prefetch_length,
+                )
+                continue
+            self._issue_prefetch_impl(
+                req_id=req_id,
+                last_host_node=last_host_node,
+                host_indices=host_indices,
+                new_input_tokens=new_input_tokens,
+                prefetch_length=prefetch_length,
+                last_hash=last_hash,
+                prefix_keys=prefix_keys,
+                trace_phase="deferred_issue",
+                decision_action="deferred_issue",
+            )
+        self._deferred_prefetch_evict_items.clear()
+
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
             return
@@ -2847,76 +3056,54 @@ class HiRadixCache(RadixCache):
 
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None and self.pp_size > 1:
+            # In PP>1 mode, defer evict_host to the next batch loop iteration
+            # (after logical_clock sync) to ensure deterministic eviction order
+            # across PP ranks.  _prefetch_kvcache runs outside the batch loop
+            # at request-arrival time, which differs between PP ranks; executing
+            # evict_host here would modify the host tree non-deterministically.
+            #
+            # Guard against duplicate deferral: if the same request is already
+            # pending (e.g., _prefetch_kvcache called again before flush),
+            # release the current protect_host and skip.
+            if any(item[0] == req_id for item in self._deferred_prefetch_evict_items):
+                last_host_node.release_host()
+                return
+            self._deferred_prefetch_evict_items.append(
+                (req_id, prefetch_length, last_host_node, new_input_tokens, last_hash, prefix_keys)
+            )
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=defer_evict reason=pp_host_evict_sync "
+                "aligned_tokens=%s threshold=%s occupied=%s deferred_count=%s",
+                req_id,
+                prefetch_length,
+                self.prefetch_threshold,
+                self.cache_controller.prefetch_tokens_occupied,
+                len(self._deferred_prefetch_evict_items),
+            )
+            return
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             last_host_node.release_host()
-            # no sufficient host memory for prefetch
-            logger.warning(
-                "[HiCachePrefetchDecision] rid=%s action=skip reason=host_alloc_failed aligned_tokens=%s threshold=%s occupied=%s",
+            self._log_prefetch_skip_and_sync(
                 req_id,
-                prefetch_length,
-                self.prefetch_threshold,
-                self.cache_controller.prefetch_tokens_occupied,
+                reason="host_alloc_failed",
+                aligned_tokens=prefetch_length,
             )
-            if self._pp_downstream_sync_enabled():
-                self._append_pp_host_tree_event(
-                    PPHostTreeEvent(
-                        seq=self._next_pp_host_tree_seq(),
-                        kind="PREFETCH_SKIP",
-                        rid=req_id,
-                    )
-                )
             return
-        operation = self.cache_controller.prefetch(
-            req_id,
-            host_indices,
-            new_input_tokens,
-            last_hash,
-            prefix_keys,
-            **self._get_extra_pools(),
-        )
-        issue_idx = self.prefetch_issue_count_by_reqid.get(req_id, 0) + 1
-        self.prefetch_issue_count_by_reqid[req_id] = issue_idx
-        if os.getenv("SGLANG_DEBUG_PP_PREFETCH_TRACE", "0") == "1":
-            logger.warning(
-                "[PPPrefetchTrace] pp=%s cp=%s tp=%s rid=%s phase=issue issue_idx=%s "
-                "aligned_tokens=%s anchor_node=%s anchor_backuped=%s last_hash=%s prefix_keys=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                _safe_attn_tp_rank(self),
-                req_id,
-                issue_idx,
-                prefetch_length,
-                last_host_node.id if last_host_node is not None else None,
-                last_host_node.backuped if last_host_node is not None else None,
-                last_hash,
-                0 if prefix_keys is None else len(prefix_keys),
-            )
-        logger.warning(
-            "[PPReqPhase] pp=%s cp=%s tp=%s rid=%s phase=prefetch_issue token_count=%s last_hash=%s prefix_keys=%s",
-            self.pp_rank,
-            self.attn_cp_rank,
-            _safe_attn_tp_rank(self),
-            req_id,
-            len(new_input_tokens),
-            last_hash,
-            0 if prefix_keys is None else len(prefix_keys),
-        )
-        self.ongoing_prefetch[req_id] = (
-            last_host_node,
-            new_input_tokens,
-            host_indices,
-            operation,
-        )
-        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
-        logger.warning(
-            "[HiCachePrefetchDecision] rid=%s action=issue aligned_tokens=%s threshold=%s occupied=%s",
-            req_id,
-            len(new_input_tokens),
-            self.prefetch_threshold,
-            self.cache_controller.prefetch_tokens_occupied,
+        self._issue_prefetch_impl(
+            req_id=req_id,
+            last_host_node=last_host_node,
+            host_indices=host_indices,
+            new_input_tokens=new_input_tokens,
+            prefetch_length=prefetch_length,
+            last_hash=last_hash,
+            prefix_keys=prefix_keys,
+            trace_phase="issue",
+            decision_action="issue",
+            emit_req_phase_log=True,
         )
 
     def _insert_helper_host(
