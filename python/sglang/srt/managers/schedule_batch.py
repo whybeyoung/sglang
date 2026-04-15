@@ -883,9 +883,10 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def init_next_round_input(
-        self,
-        tree_cache: Optional[BasePrefixCache] = None,
-        cow_mamba: Optional[bool] = None,
+       self,
+       tree_cache: Optional[BasePrefixCache] = None,
+       cow_mamba: Optional[bool] = None,
+       match_phase: str = "schedule",
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -950,7 +951,7 @@ class Req(ReqDllmMixin):
                 logger.warning(
                     "[HiCacheMatchChain] init_next_round_input: rid=%s fill_len=%s "
                     "token_ids_len=%s matched_device=%s matched_host=%s prefix_len=%s "
-                    "pp_last_device=%s pp_last_host=%s",
+                    "pp_last_device=%s pp_last_host=%s phase=%s",
                     self.rid,
                     len(self.fill_ids),
                     len(token_ids),
@@ -963,6 +964,7 @@ class Req(ReqDllmMixin):
                     match_result.last_host_node.id
                     if match_result.last_host_node is not None
                     else None,
+                    match_phase,
                 )
 
             if self.is_dllm():
