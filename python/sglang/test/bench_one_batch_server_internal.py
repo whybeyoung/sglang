@@ -19,6 +19,7 @@ from transformers import AutoProcessor, PreTrainedTokenizer
 from sglang.benchmark.datasets import get_dataset
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
@@ -113,8 +114,7 @@ class BenchArgs:
     seed: int = 42
     cache_hit_rate: float = 0.0
     backend: str = "sglang"
-    bootstrap_host: Optional[str] = None
-    bootstrap_room: int = 0
+    fake_prefill: bool = False
     server_args_for_metrics: Optional[List[str]] = None
 
     @staticmethod
@@ -245,18 +245,12 @@ class BenchArgs:
             help="Backend server type (sglang or vllm).",
         )
         parser.add_argument(
-            "--bootstrap-host",
-            type=str,
-            default=BenchArgs.bootstrap_host,
-            help="Bootstrap host for fake decode benchmarking. "
-            "Use '2.2.2.2' (FAKE_BOOTSTRAP_HOST) with a decode server running "
-            "--disaggregation-transfer-backend fake to benchmark pure decode performance.",
-        )
-        parser.add_argument(
-            "--bootstrap-room",
-            type=int,
-            default=BenchArgs.bootstrap_room,
-            help="Bootstrap room for fake decode benchmarking (default: 0).",
+            "--fake-prefill",
+            action="store_true",
+            default=BenchArgs.fake_prefill,
+            help="Enable fake prefill mode for decode-only benchmarking. "
+            "Use with a decode server running --disaggregation-transfer-backend fake "
+            "to benchmark pure decode performance without a real prefill node.",
         )
         parser.add_argument(
             "--server-args-for-metrics",
@@ -442,8 +436,7 @@ def run_one_case(
     gsp_system_prompt_len: int = BenchArgs.gsp_system_prompt_len,
     gsp_question_len: int = BenchArgs.gsp_question_len,
     gsp_output_len: int = BenchArgs.gsp_output_len,
-    bootstrap_host: Optional[str] = None,
-    bootstrap_room: int = 0,
+    fake_prefill: bool = False,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -538,9 +531,9 @@ def run_one_case(
         payload["input_ids"] = input_ids
         if image_data is not None:
             payload["image_data"] = image_data
-        if bootstrap_host is not None:
-            payload["bootstrap_host"] = bootstrap_host
-            payload["bootstrap_room"] = bootstrap_room
+        if fake_prefill:
+            payload["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
+            payload["bootstrap_room"] = 0
         gen_url = url + "/generate"
 
     # Warm up cache if cache_hit_rate > 0.0
@@ -885,8 +878,7 @@ def run_benchmark_internal(
                 parallel_batch=bench_args.parallel_batch,
                 backend=bench_args.backend,
                 model_name=model_name,
-                bootstrap_host=bench_args.bootstrap_host,
-                bootstrap_room=bench_args.bootstrap_room,
+                fake_prefill=bench_args.fake_prefill,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -923,8 +915,7 @@ def run_benchmark_internal(
                     cache_hit_rate=bench_args.cache_hit_rate,
                     backend=bench_args.backend,
                     model_name=model_name,
-                    bootstrap_host=bench_args.bootstrap_host,
-                    bootstrap_room=bench_args.bootstrap_room,
+                    fake_prefill=bench_args.fake_prefill,
                     **gsp_kwargs,
                 )
             )
@@ -970,8 +961,7 @@ def run_benchmark_internal(
                             profile_output_dir=bench_args.profile_output_dir,
                             backend=bench_args.backend,
                             model_name=model_name,
-                            bootstrap_host=bench_args.bootstrap_host,
-                            bootstrap_room=bench_args.bootstrap_room,
+                            fake_prefill=bench_args.fake_prefill,
                             **gsp_kwargs,
                         )
                     )

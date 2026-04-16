@@ -44,6 +44,7 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.network import NetworkAddress
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
@@ -1710,9 +1711,9 @@ def run_benchmark(args_: argparse.Namespace):
         extra_request_body = json.loads(args.extra_request_body)
 
     # Inject bootstrap fields for fake decode benchmarking
-    if getattr(args, "bootstrap_host", None) is not None:
-        extra_request_body["bootstrap_host"] = args.bootstrap_host
-        extra_request_body["bootstrap_room"] = getattr(args, "bootstrap_room", 0)
+    if getattr(args, "fake_prefill", False):
+        extra_request_body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
+        extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
         assert (
@@ -2344,18 +2345,12 @@ if __name__ == "__main__":
         help="Underlying workload for the mooncake dataset.",
     )
     parser.add_argument(
-        "--bootstrap-host",
-        type=str,
-        default=None,
-        help="Bootstrap host for fake decode benchmarking. "
-        "Use '2.2.2.2' (FAKE_BOOTSTRAP_HOST) with a decode server running "
-        "--disaggregation-transfer-backend fake to benchmark pure decode performance.",
-    )
-    parser.add_argument(
-        "--bootstrap-room",
-        type=int,
-        default=0,
-        help="Bootstrap room for fake decode benchmarking (default: 0).",
+        "--fake-prefill",
+        action="store_true",
+        default=False,
+        help="Enable fake prefill mode for decode-only benchmarking. "
+        "Use with a decode server running --disaggregation-transfer-backend fake "
+        "to benchmark pure decode performance without a real prefill node.",
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
