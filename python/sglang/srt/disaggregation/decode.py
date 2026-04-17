@@ -1010,7 +1010,21 @@ class DecodeTransferQueue:
         )
 
         if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
-            pass
+            # Fake transfer: metadata buffer is never populated, so reading
+            # it below would yield 0 for output_id (often EOS) and cached_tokens,
+            # which makes decode terminate after one step and stalls HiSparse
+            # concurrency ramp-up in bench runs. Synthesize benign placeholders
+            # here and return. Benches must set `ignore_eos=True` to run full
+            # max_new_tokens; otherwise sampling on garbage KV may hit EOS.
+            decode_req.req.output_ids.append(1)
+            decode_req.req.cached_tokens = 0
+            decode_req.req.cached_tokens_device = 0
+            decode_req.req.cached_tokens_host = 0
+            decode_req.req.cached_tokens_storage = 0
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            decode_req.req.time_stats.set_wait_queue_entry_time()
+            return True
         elif actual_room == 0:
             # Case 1: Metadata not ready yet (actual_room == 0)
             # Keep request in queue and wait for next poll
