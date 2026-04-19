@@ -2090,6 +2090,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _should_run_flashinfer_sampling_warmup(self) -> bool:
         if self.server_args.sampling_backend != "flashinfer":
             return False
+        if self.server_args.disaggregation_mode == "decode":
+            return False
         if self.pp_rank != self.pp_size - 1:
             return False
         if self.pp_size == 1 and self.tp_size == 1:
