@@ -1014,6 +1014,10 @@ class DecodeTransferQueue:
             decode_req.req.cached_tokens_device = 0
             decode_req.req.cached_tokens_host = 0
             decode_req.req.cached_tokens_storage = 0
+            if not self.spec_algorithm.is_none():
+                decode_req.req.output_topk_p = output_topk_p
+                decode_req.req.output_topk_index = output_topk_index
+                decode_req.req.hidden_states_tensor = output_hidden_states
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
             decode_req.req.time_stats.set_wait_queue_entry_time()
