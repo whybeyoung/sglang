@@ -883,10 +883,10 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def init_next_round_input(
-       self,
-       tree_cache: Optional[BasePrefixCache] = None,
-       cow_mamba: Optional[bool] = None,
-       match_phase: str = "schedule",
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+        cow_mamba: Optional[bool] = None,
+        match_phase: str = "schedule",
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -958,12 +958,16 @@ class Req(ReqDllmMixin):
                     len(match_result.device_indices),
                     match_result.host_hit_length,
                     len(self.prefix_indices),
-                    match_result.last_device_node.id
-                    if match_result.last_device_node is not None
-                    else None,
-                    match_result.last_host_node.id
-                    if match_result.last_host_node is not None
-                    else None,
+                    (
+                        match_result.last_device_node.id
+                        if match_result.last_device_node is not None
+                        else None
+                    ),
+                    (
+                        match_result.last_host_node.id
+                        if match_result.last_host_node is not None
+                        else None
+                    ),
                     match_phase,
                 )
 
@@ -1988,7 +1992,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
-        if server_args.disaggregation_mode == "decode":
+        if (
+            server_args.disaggregation_mode == "decode"
+            and not self.hisparse_coordinator
+        ):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
