@@ -245,6 +245,12 @@ class HiRadixCache(RadixCache):
         # until the next batch loop iteration (after logical_clock sync) to ensure
         # deterministic eviction order across PP ranks.
         self._deferred_prefetch_evict_items: list[tuple] = []
+        # Deferred write_backup evict: in PP>1 mode, when write_backup
+        # cannot allocate host memory, the node is deferred instead of
+        # calling evict_host inline (which would diverge across PP ranks).
+        # Flushed at the next batch cycle's sync point after host memory
+        # has been reclaimed from finalized prefetches.
+        self._deferred_write_backup_items: list[tuple] = []
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -548,6 +554,12 @@ class HiRadixCache(RadixCache):
         except Exception:
             logger.exception("Force release deferred prefetch evict items failed.")
 
+        # Force release deferred write_backup items.
+        try:
+            self._deferred_write_backup_items.clear()
+        except Exception:
+            logger.exception("Force release deferred write_backup items failed.")
+
         # Force release leftover backup ops: drop host protection on nodes.
         try:
             for ack_id, node in list(self.ongoing_backup.items()):
@@ -775,6 +787,7 @@ class HiRadixCache(RadixCache):
         self.pp_zero_hit_pending_promote_req_ids.clear()
         self._deferred_finalize_rids.clear()
         self._deferred_prefetch_evict_items.clear()
+        self._deferred_write_backup_items.clear()
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
@@ -798,6 +811,21 @@ class HiRadixCache(RadixCache):
                 return node.hash_value[-1]
             return ""
         return node.id
+
+    def _write_backup_node_sig(self, node: TreeNode) -> tuple:
+        """Return a rank-stable content signature for a node.
+
+        Uses content hashes (not node.id which differs across PP ranks).
+        """
+        parent = node.parent
+        return (
+            node.get_last_hash_value(),
+            len(node.key) if node.key is not None else 0,
+            node.key.extra_key if node.key is not None else None,
+            parent.get_last_hash_value() if parent is not None else None,
+            len(parent.key) if parent is not None and parent.key is not None else 0,
+            parent.key.extra_key if parent is not None and parent.key is not None else None,
+        )
 
     def _pp_write_backup_replay_enabled(self) -> bool:
         return os.getenv("SGLANG_ENABLE_PP_WRITE_BACKUP_REPLAY", "0") == "1"
@@ -2000,6 +2028,26 @@ class HiRadixCache(RadixCache):
             node_id=node.id,
             **self._get_extra_pools(),
         )
+        if host_indices is None and self.pp_size > 1 and not write_back:
+            # PP>1 write-through path: defer evict_host to the next batch
+            # cycle's sync point so both PP ranks evict the same host-only
+            # leaves.  write_back=True is NOT deferred because evict()'s
+            # synchronous write-back flow asserts node.backuped immediately.
+            sig = self._write_backup_node_sig(node)
+            if not any(item[0] is node for item in self._deferred_write_backup_items):
+                self._deferred_write_backup_items.append((node, sig, write_back))
+                logger.warning(
+                    "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s action=deferred "
+                    "key_len=%s last_hash=%s extra_key=%s deferred_count=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    node.id,
+                    len(node.key) if node.key is not None else 0,
+                    node.get_last_hash_value(),
+                    node.key.extra_key if node.key is not None else None,
+                    len(self._deferred_write_backup_items),
+                )
+            return 0
         if host_indices is None:
             self.evict_host(len(node.value), caller="write_backup")
             host_indices = self.cache_controller.write(
@@ -2892,6 +2940,115 @@ class HiRadixCache(RadixCache):
                 decision_action="deferred_issue",
             )
         self._deferred_prefetch_evict_items.clear()
+
+    def flush_deferred_write_backup_evicts(self):
+        """Execute deferred write_backup evict+alloc operations.
+
+        In PP>1 mode, when write_backup cannot allocate host memory, the node
+        is deferred instead of calling evict_host inline (which would delete
+        different host-only leaf nodes across PP ranks).  By the next batch
+        cycle, prefetch buffers will have been finalized and their host pages
+        released via drain_storage_control_queues, so a TP-synchronized drain
+        of host_mem_release_queue followed by a retry alloc will usually
+        succeed without needing evict_host at all.
+
+        Items are sorted by content-hash signature for deterministic flush
+        order across PP ranks.
+        """
+        if not self._deferred_write_backup_items:
+            return
+
+        cc = self.cache_controller
+
+        # Drain host_mem_release_queue first (TP-synchronized) to reclaim
+        # pages from finalized prefetches before attempting alloc.
+        release_qsize = torch.tensor(
+            [cc.host_mem_release_queue.qsize()], dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(release_qsize, torch.distributed.ReduceOp.MIN)
+        n_release = int(release_qsize.item())
+        if n_release > 0:
+            host_indices_list = []
+            drained = 0
+            while drained < n_release:
+                try:
+                    host_indices = cc.host_mem_release_queue.get_nowait()
+                except Empty:
+                    break
+                host_indices_list.append(host_indices)
+                drained += 1
+            if host_indices_list:
+                cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
+
+        # Sort by rank-stable signature for deterministic order.
+        self._deferred_write_backup_items.sort(key=lambda item: item[1])
+
+        for node, orig_sig, write_back in self._deferred_write_backup_items:
+            # Stale check: skip if node was split/reparented since deferral.
+            current_sig = self._write_backup_node_sig(node)
+            if current_sig != orig_sig:
+                logger.warning(
+                    "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s action=deferred_stale "
+                    "orig_sig=%s current_sig=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    node.id,
+                    orig_sig,
+                    current_sig,
+                )
+                continue
+            # Skip if node already got host_value (e.g. from a concurrent path).
+            if node.host_value is not None:
+                continue
+            # Skip if node's device value was evicted while deferred.
+            if node.value is None:
+                continue
+
+            # Try alloc without eviction first.
+            host_indices = cc.write(
+                device_indices=node.value,
+                node_id=node.id,
+                **self._get_extra_pools(),
+            )
+            if host_indices is None:
+                # Retry with evict_host (now deterministic across PP ranks).
+                self.evict_host(len(node.value), caller="flush_deferred_write_backup")
+                host_indices = cc.write(
+                    device_indices=node.value,
+                    node_id=node.id,
+                    **self._get_extra_pools(),
+                )
+            if host_indices is not None:
+                node.host_value = host_indices.clone()
+                assert len(node.host_value) > 0
+                self.ongoing_write_through[node.id] = node
+                logger.warning(
+                    "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s key_len=%s "
+                    "last_hash=%s extra_key=%s write_back=%s action=deferred_flush "
+                    "ongoing_write=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    node.id,
+                    len(node.key) if node.key is not None else 0,
+                    node.get_last_hash_value(),
+                    node.key.extra_key if node.key is not None else None,
+                    write_back,
+                    len(self.ongoing_write_through),
+                )
+                if not write_back:
+                    self.inc_lock_ref(node)
+            else:
+                logger.warning(
+                    "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s action=deferred_alloc_failed "
+                    "key_len=%s last_hash=%s extra_key=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    node.id,
+                    len(node.key) if node.key is not None else 0,
+                    node.get_last_hash_value(),
+                    node.key.extra_key if node.key is not None else None,
+                )
+        self._deferred_write_backup_items.clear()
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
