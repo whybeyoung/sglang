@@ -1100,17 +1100,21 @@ class HiCacheController:
                             operation.host_indices = operation.host_indices[token_offset:]
                             operation.token_ids = operation.token_ids[token_offset:]
                         elif token_offset < 0:
-                            # PP1 matched more than PP0 (rare).  The local
-                            # hash chain would differ from PP0's, so we
-                            # cannot safely reuse pp0's hit_count.  Force
-                            # a revoke so both ranks stay consistent.
+                            # PP1 matched more on device than PP0 (rare).
+                            # PP1's token_ids starts |offset| tokens later
+                            # in the sequence, so we cannot reconstruct
+                            # PP0's hash chain (missing prefix tokens).
+                            # Revoke to stay safe; the host tree already
+                            # has existing write-through data.
                             logger.warning(
                                 "[HiCachePrefetchThread][pp_follow_negative_offset] "
-                                "rid=%s local_tokens=%s pp0_tokens=%s offset=%s — revoking",
+                                "rid=%s local_tokens=%s pp0_tokens=%s offset=%s "
+                                "pp0_hit=%s — revoking",
                                 operation.request_id,
                                 local_token_len,
                                 pp0_token_len,
                                 token_offset,
+                                storage_hit_count,
                             )
                             token_offset = 0
                             storage_hit_count = 0
