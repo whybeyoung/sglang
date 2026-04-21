@@ -1788,10 +1788,7 @@ class HiRadixCache(RadixCache):
         if operation.host_indices is None:
             return False
         if not self.can_terminate_prefetch(operation):
-            # PP0's PREFETCH_FINALIZE is the authoritative signal. Instead of
-            # blocking the entire replay queue waiting for local IO to complete
-            # (which causes head-of-line blocking and request timeouts), force-
-            # terminate the local IO and proceed with whatever was fetched so far.
+            # PP0's PREFETCH_FINALIZE is the authoritative signal.
             if (
                 len(operation.hash_value) == 0
                 and operation.completed_tokens == 0
@@ -1811,18 +1808,32 @@ class HiRadixCache(RadixCache):
                     event.loaded_from_storage,
                 )
                 return True
-            # Force-terminate local IO to avoid HOL blocking the replay queue.
-            # PP0 already decided to finalize; proceed with locally completed tokens.
-            operation.mark_terminate()
+            # Defer unconditionally: return False to keep the event at
+            # the head of the replay queue.  On the next batch loop,
+            # can_terminate_prefetch() will be called again (with its
+            # TP all-reduce) and will eventually return True once all
+            # CP ranks' io_aux complete.
+            #
+            # We must NOT bypass can_terminate_prefetch() using local
+            # state (e.g. operation.is_terminated()) because that would
+            # cause a collective mismatch: one rank enters the MIN
+            # all-reduce in _finalize_prefetch_progress while another
+            # rank is still in the MAX all-reduce of can_terminate —
+            # deadlock.
             logger.warning(
-                "[HiCachePPReplay][force_terminate_for_upstream] rid=%s "
-                "local_completed=%s upstream_loaded=%s pp=%s cp=%s",
+                "[HiCachePPReplay][defer_for_io_completion] rid=%s "
+                "local_completed=%s/%s upstream_loaded=%s "
+                "terminated=%s age=%.3fs pp=%s cp=%s",
                 req_id,
                 operation.completed_tokens,
+                len(operation.hash_value) * self.page_size,
                 event.loaded_from_storage,
+                operation.is_terminated(),
+                time.monotonic() - operation.start_time,
                 self.pp_rank,
                 self.attn_cp_rank,
             )
+            return False
         loaded_from_storage = self._finalize_prefetch_progress(
             req_id, operation, emit_event=True
         )
