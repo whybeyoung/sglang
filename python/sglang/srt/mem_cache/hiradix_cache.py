@@ -2001,15 +2001,6 @@ class HiRadixCache(RadixCache):
             **self._get_extra_pools(),
         )
         if host_indices is None:
-            if self.pp_size > 1 and not write_back:
-                logger.warning(
-                    "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s action=skip_evict_pp reason=pp_host_tree_determinism key_len=%s",
-                    self.pp_rank,
-                    self.attn_cp_rank,
-                    node.id,
-                    len(node.key) if node.key is not None else 0,
-                )
-                return 0
             self.evict_host(len(node.value), caller="write_backup")
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
