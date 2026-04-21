@@ -1569,7 +1569,17 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        logger.warning(
+            "[HiCacheDiag][_finalize_prefetch_progress] rid=%s completed_tokens=%s "
+            "hash_pages=%s op_terminated=%s op_token_ids=%s op_host_indices=%s pp=%s",
+            req_id,
+            completed_tokens,
+            len(hash_value),
+            operation.is_terminated(),
+            len(operation.token_ids),
+            len(operation.host_indices),
+            self.pp_rank,
+        )
 
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:
@@ -1621,6 +1631,21 @@ class HiRadixCache(RadixCache):
             # by the prefetch thread via append_host_mem_release.
             token_ids = list(operation.token_ids)
             host_indices = operation.host_indices
+
+        logger.warning(
+            "[HiCacheDiag][_finalize_prefetch_progress][pre_insert] rid=%s "
+            "min_completed_tokens=%s token_offset=%s orig_len=%s op_len=%s "
+            "fetched_token_ids_len=%s written_indices_len=%s hash_pages_for_insert=%s pp=%s",
+            req_id,
+            min_completed_tokens,
+            token_offset,
+            orig_len,
+            op_len,
+            min_completed_tokens,
+            min_completed_tokens,
+            min_completed_tokens // self.page_size,
+            self.pp_rank,
+        )
 
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
@@ -2496,6 +2521,16 @@ class HiRadixCache(RadixCache):
         # the operation should be terminated if it is already terminated on any TP worker
         # or it meets the termination condition on all TP workers
         can_terminate = can_terminate or operation_terminated
+        logger.warning(
+            "[HiCacheDiag][can_terminate_prefetch] rid=%s can_terminate=%s "
+            "op_terminated=%s completed=%s/%s pp=%s",
+            operation.request_id,
+            can_terminate,
+            operation_terminated,
+            operation.completed_tokens,
+            len(operation.hash_value) * self.page_size,
+            self.pp_rank,
+        )
         return can_terminate
 
     def _get_prefetch_progress_debug(self, req_id: str) -> dict[str, Any]:
@@ -2586,6 +2621,18 @@ class HiRadixCache(RadixCache):
         if operation.host_indices is None:
             # prefetch has not been issued due to insufficient host memory
             return True
+
+        logger.warning(
+            "[HiCacheDiag][check_prefetch_progress][pre_can_terminate] rid=%s "
+            "completed_tokens=%s hash_pages=%s terminated=%s "
+            "expected_tokens=%s pp=%s",
+            req_id,
+            operation.completed_tokens,
+            len(operation.hash_value),
+            operation.is_terminated(),
+            len(operation.hash_value) * self.page_size,
+            self.pp_rank,
+        )
 
         if not self.can_terminate_prefetch(operation):
             debug_state = self._get_prefetch_progress_debug(req_id)

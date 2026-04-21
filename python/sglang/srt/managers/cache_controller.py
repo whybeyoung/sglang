@@ -829,7 +829,17 @@ class HiCacheController:
         return operation
 
     def terminate_prefetch(self, operation):
+        was_terminated = operation.is_terminated()
         operation.mark_terminate()
+        logger.warning(
+            "[HiCacheDiag][terminate_prefetch] rid=%s completed_tokens=%s "
+            "was_already_terminated=%s hash_pages=%s pp=%s",
+            operation.request_id,
+            operation.completed_tokens,
+            was_terminated,
+            len(operation.hash_value),
+            self.pp_rank,
+        )
         return operation.completed_tokens, operation.hash_value
 
     def append_host_mem_release(self, host_indices: torch.Tensor):
@@ -842,6 +852,7 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):
+        terminated_before = operation.is_terminated()
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
@@ -853,7 +864,23 @@ class HiCacheController:
                 )
                 break
             inc += self.page_size
-        operation.increment(inc)
+        accepted = operation.increment(inc)
+        if not accepted or terminated_before:
+            logger.warning(
+                "[HiCacheDiag][_page_get_zero_copy] rid=%s inc=%s accepted=%s "
+                "terminated_before_get=%s terminated_after_inc=%s "
+                "completed_tokens=%s hash_pages=%s results_ok=%s/%s pp=%s",
+                operation.request_id,
+                inc,
+                accepted,
+                terminated_before,
+                operation.is_terminated(),
+                operation.completed_tokens,
+                len(hash_values),
+                sum(1 for r in results if r),
+                len(results),
+                self.pp_rank,
+            )
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
@@ -881,6 +908,15 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
+        logger.warning(
+            "[HiCacheDiag][_page_transfer][start] rid=%s total_hash_pages=%s "
+            "terminated=%s completed_tokens=%s pp=%s",
+            operation.request_id,
+            len(operation.hash_value),
+            operation.is_terminated(),
+            operation.completed_tokens,
+            self.pp_rank,
+        )
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -895,11 +931,30 @@ class HiCacheController:
                 operation.completed_tokens
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
+                logger.warning(
+                    "[HiCacheDiag][_page_transfer][early_exit] rid=%s batch_idx=%s "
+                    "prev_completed=%s cur_completed=%s expected=%s terminated=%s pp=%s",
+                    operation.request_id,
+                    i // self.storage_batch_size,
+                    prev_completed_tokens,
+                    operation.completed_tokens,
+                    prev_completed_tokens + len(batch_hashes) * self.page_size,
+                    operation.is_terminated(),
+                    self.pp_rank,
+                )
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+        logger.warning(
+            "[HiCacheDiag][_page_transfer][done] rid=%s completed_tokens=%s "
+            "terminated=%s pp=%s",
+            operation.request_id,
+            operation.completed_tokens,
+            operation.is_terminated(),
+            self.pp_rank,
+        )
 
     def prefetch_io_aux_func(self):
         """
@@ -910,7 +965,29 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                logger.warning(
+                    "[HiCacheDiag][prefetch_io_aux][dequeued] rid=%s "
+                    "terminated=%s completed_tokens=%s hash_pages=%s "
+                    "host_indices_len=%s pp=%s",
+                    operation.request_id,
+                    operation.is_terminated(),
+                    operation.completed_tokens,
+                    len(operation.hash_value),
+                    len(operation.host_indices),
+                    self.pp_rank,
+                )
                 self._page_transfer(operation)
+                release_count = len(operation.host_indices[operation.completed_tokens :])
+                logger.warning(
+                    "[HiCacheDiag][prefetch_io_aux][release] rid=%s "
+                    "completed_tokens=%s host_release_count=%s "
+                    "terminated=%s pp=%s",
+                    operation.request_id,
+                    operation.completed_tokens,
+                    release_count,
+                    operation.is_terminated(),
+                    self.pp_rank,
+                )
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
