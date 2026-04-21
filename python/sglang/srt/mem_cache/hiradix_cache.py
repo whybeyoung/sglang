@@ -1763,10 +1763,10 @@ class HiRadixCache(RadixCache):
         if operation.host_indices is None:
             return False
         if not self.can_terminate_prefetch(operation):
-            # Upstream may already have finalized an empty prefetch (no hash pages /
-            # no completed tokens). In that case, waiting for local
-            # can_terminate_prefetch() will never make progress, so consume the
-            # authoritative finalize by cleaning up the local empty prefetch state.
+            # PP0's PREFETCH_FINALIZE is the authoritative signal. Instead of
+            # blocking the entire replay queue waiting for local IO to complete
+            # (which causes head-of-line blocking and request timeouts), force-
+            # terminate the local IO and proceed with whatever was fetched so far.
             if (
                 len(operation.hash_value) == 0
                 and operation.completed_tokens == 0
@@ -1786,7 +1786,18 @@ class HiRadixCache(RadixCache):
                     event.loaded_from_storage,
                 )
                 return True
-            return False
+            # Force-terminate local IO to avoid HOL blocking the replay queue.
+            # PP0 already decided to finalize; proceed with locally completed tokens.
+            operation.mark_terminate()
+            logger.warning(
+                "[HiCachePPReplay][force_terminate_for_upstream] rid=%s "
+                "local_completed=%s upstream_loaded=%s pp=%s cp=%s",
+                req_id,
+                operation.completed_tokens,
+                event.loaded_from_storage,
+                self.pp_rank,
+                self.attn_cp_rank,
+            )
         loaded_from_storage = self._finalize_prefetch_progress(
             req_id, operation, emit_event=True
         )
@@ -1954,7 +1965,16 @@ class HiRadixCache(RadixCache):
             **self._get_extra_pools(),
         )
         if host_indices is None:
-            self.evict_host(len(node.value))
+            if self.pp_size > 1 and not write_back:
+                logger.warning(
+                    "[HiCacheWriteBackup] pp=%s cp=%s node_id=%s action=skip_evict_pp reason=pp_host_tree_determinism key_len=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    node.id,
+                    len(node.key) if node.key is not None else 0,
+                )
+                return 0
+            self.evict_host(len(node.value), caller="write_backup")
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
@@ -2237,7 +2257,7 @@ class HiRadixCache(RadixCache):
         self._delete_leaf(node)
         return num_evicted
 
-    def evict_host(self, num_tokens: int):
+    def evict_host(self, num_tokens: int, caller: str = "unknown"):
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), self._evict_tie_breaker(node), node)
@@ -2286,13 +2306,14 @@ class HiRadixCache(RadixCache):
                 heapq.heappush(eviction_heap, (new_priority, self._evict_tie_breaker(x.parent), x.parent))
         if evicted_nodes > 0:
             logger.warning(
-                "[HostEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s",
+                "[HostEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s caller=%s",
                 self.pp_rank,
                 self.attn_cp_rank,
                 num_tokens,
                 num_evicted,
                 evicted_nodes,
                 len(leaves),
+                caller,
             )
 
     def load_back(
@@ -2800,7 +2821,7 @@ class HiRadixCache(RadixCache):
                         )
                     )
                 continue
-            self.evict_host(prefetch_length)
+            self.evict_host(prefetch_length, caller="flush_deferred_prefetch")
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
             if host_indices is None:
                 last_host_node.release_host()
@@ -3083,7 +3104,7 @@ class HiRadixCache(RadixCache):
             )
             return
         if host_indices is None:
-            self.evict_host(prefetch_length)
+            self.evict_host(prefetch_length, caller="prefetch_from_storage")
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             last_host_node.release_host()
