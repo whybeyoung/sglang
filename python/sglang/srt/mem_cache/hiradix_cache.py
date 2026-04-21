@@ -3195,23 +3195,50 @@ class HiRadixCache(RadixCache):
         child_key = self.get_child_key_fn(key)
 
         matched_length = 0
+        clamped = False
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = self.get_access_time()
             prefix_len = self.key_match_fn(node.key, key)
+
+            if prefix_len < len(node.key):
+                if self.pp_size > 1:
+                    # PP mode: do NOT split the shared tree.  Splitting
+                    # would change device-side node boundaries and cause
+                    # PP ranks to diverge when their prefetch lengths
+                    # differ.  Count all remaining tokens as matched
+                    # (the device node already covers them) and let the
+                    # caller release the un-insertable host indices.
+                    matched_length += len(key)
+                    clamped = True
+                    if os.getenv("SGLANG_DEBUG_HICACHE_HOST_DRIFT", "0") == "1":
+                        logger.warning(
+                            "[HiCacheHostInsert][clamp_partial] rid=%s pp=%s cp=%s "
+                            "node=%s prefix_len=%s node_key_len=%s "
+                            "remaining_host_tokens=%s matched_so_far=%s",
+                            req_id,
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            node.id,
+                            prefix_len,
+                            len(node.key),
+                            len(key),
+                            matched_length,
+                        )
+                    break
+                # PP=1: safe to split, no cross-rank divergence risk.
+                new_node = self._split_node(node.key, node, prefix_len)
+                node = new_node
+
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
 
-            if prefix_len < len(node.key):
-                new_node = self._split_node(node.key, node, prefix_len)
-                node = new_node
-
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
-        if len(key):
+        if len(key) and not clamped:
             new_node = TreeNode(priority=node.priority)
             new_node.last_access_time = self.get_access_time()
             new_node.parent = node
