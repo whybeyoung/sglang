@@ -303,9 +303,9 @@ class PrefillBootstrapQueue:
                 bad_rids.append(req.rid)
                 continue
             if poll != KVPoll.WaitingForInput:
-                break
+                continue
             if not self._is_hicache_ready(req):
-                break
+                continue
             good_rids.append(req.rid)
 
         if hasattr(self.scheduler.tree_cache, "flush_deferred_finalizes"):
