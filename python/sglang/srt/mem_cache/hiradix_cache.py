@@ -2368,19 +2368,13 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit BlockRemoved so the router removes this block from its index.
+            _t0 = time.perf_counter()
             self._record_remove_event(x)
+            _t1 = time.perf_counter()
             tokens_freed = self.cache_controller.evict_host(x.host_value)
+            _t2 = time.perf_counter()
             num_evicted += tokens_freed
             evicted_nodes += 1
-            logger.warning(
-                "[HostEvict] pp=%s cp=%s node=%s key_len=%s tokens_freed=%s priority=%s",
-                self.pp_rank,
-                self.attn_cp_rank,
-                x.id,
-                len(x.key) if x.key is not None else 0,
-                tokens_freed,
-                _priority,
-            )
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -2388,6 +2382,27 @@ class HiRadixCache(RadixCache):
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
             self._update_host_leaf_status(x.parent)
+            _t3 = time.perf_counter()
+            _free_slots_len = (
+                self.cache_controller.mem_pool_host.free_slots.numel()
+                if hasattr(self.cache_controller, "mem_pool_host")
+                and hasattr(self.cache_controller.mem_pool_host, "free_slots")
+                else -1
+            )
+            logger.warning(
+                "[HostEvict] pp=%s cp=%s node=%s key_len=%s tokens_freed=%s priority=%s "
+                "event_ms=%.1f free_ms=%.1f tree_ms=%.1f free_slots=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                x.id,
+                len(x.key) if x.key is not None else 0,
+                tokens_freed,
+                _priority,
+                (_t1 - _t0) * 1000,
+                (_t2 - _t1) * 1000,
+                (_t3 - _t2) * 1000,
+                _free_slots_len,
+            )
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
