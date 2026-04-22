@@ -70,6 +70,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+from sglang.srt.distributed.parallel_state import is_pipeline_last_stage
+
 _is_npu = is_npu()
 
 if is_cuda():
@@ -297,16 +299,17 @@ class EAGLEWorker(TpModelWorker):
                 seq_lens_cpu,
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self.forward_draft_extend(
-                    batch,
-                    logits_output.hidden_states,
-                    next_token_ids,
-                    seq_lens_cpu,
-                    logits_output.mm_input_embeds,
-                )
+            if is_pipeline_last_stage():
+                with self.draft_tp_context(
+                    self.draft_model_runner.tp_group
+                ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                    self.forward_draft_extend(
+                        batch,
+                        logits_output.hidden_states,
+                        next_token_ids,
+                        seq_lens_cpu,
+                        logits_output.mm_input_embeds,
+                    )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,

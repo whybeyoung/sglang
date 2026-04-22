@@ -5,6 +5,7 @@ from typing import List, Tuple
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.distributed import is_pipeline_last_stage
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
@@ -50,14 +51,14 @@ class AscendKVManager(MooncakeKVManager):
         else:
             ptrs_per_layer = 2
 
-        src_layers = len(src_kv_ptrs) // ptrs_per_layer
-        total_num_layers = len(dst_kv_ptrs) // ptrs_per_layer
-
-        has_mtp_draft = src_layers > total_num_layers - start_layer
+        has_mtp_draft = is_pipeline_last_stage()
 
         if has_mtp_draft:
-            num_target_layers = total_num_layers - 1
-            total_num_layers = num_target_layers + 1
+            src_layers = len(src_kv_ptrs - 1) // ptrs_per_layer
+            total_num_layers = len(dst_kv_ptrs - 1) // ptrs_per_layer
+        else:
+            src_layers = len(src_kv_ptrs) // ptrs_per_layer
+            total_num_layers = len(dst_kv_ptrs) // ptrs_per_layer
 
         end_layer = start_layer + src_layers
 
