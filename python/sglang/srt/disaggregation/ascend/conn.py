@@ -44,26 +44,32 @@ class AscendKVManager(MooncakeKVManager):
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], int]:
         start_layer = self.kv_args.prefill_start_layer
+
         if self.kv_args.state_type == "nsa":
-            src_layers = len(src_kv_ptrs) // 3
-            total_layers = len(dst_kv_ptrs) // 3
-            end_layer = start_layer + src_layers
-            if src_layers == total_layers:
-                sliced_dst_kv_ptrs = dst_kv_ptrs
-            else:
-                k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-                v_ptrs = dst_kv_ptrs[total_layers + start_layer: total_layers + end_layer]
-                index_k_ptrs = dst_kv_ptrs[2 * total_layers + start_layer: 2 * total_layers + end_layer]
-                sliced_dst_kv_ptrs = k_ptrs + v_ptrs + index_k_ptrs
+            ptrs_per_layer = 3
         else:
-            src_layers = len(src_kv_ptrs) // 2
-            total_layers = len(dst_kv_ptrs) // 2
-            end_layer = start_layer + src_layers
-            if src_layers == total_layers:
-                sliced_dst_kv_ptrs = dst_kv_ptrs
+            ptrs_per_layer = 2
+
+        src_layers = len(src_kv_ptrs) // ptrs_per_layer
+        total_num_layers = len(dst_kv_ptrs) // ptrs_per_layer
+
+        has_mtp_draft = src_layers > total_num_layers - start_layer
+
+        if has_mtp_draft:
+            num_target_layers = total_num_layers - 1
+            total_num_layers = num_target_layers + 1
+
+        end_layer = start_layer + src_layers
+
+        if src_layers == total_num_layers:
+            sliced_dst_kv_ptrs = dst_kv_ptrs
+        else:
+            k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            v_ptrs = dst_kv_ptrs[total_num_layers + start_layer: total_num_layers + end_layer]
+            if self.kv_args.state_type == "nsa":
+                index_k_ptrs = dst_kv_ptrs[2 * total_num_layers + start_layer: 2 * total_num_layers + end_layer]
+                sliced_dst_kv_ptrs = k_ptrs + v_ptrs + index_k_ptrs
             else:
-                k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-                v_ptrs = dst_kv_ptrs[total_layers + start_layer: total_layers + end_layer]
                 sliced_dst_kv_ptrs = k_ptrs + v_ptrs
 
         layers_current_pp_stage = len(src_kv_ptrs)
