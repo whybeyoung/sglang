@@ -1210,6 +1210,7 @@ class HiRadixCache(RadixCache):
         self.pp_zero_hit_deferred_req_ids.discard(req_id)
         self.pp_zero_hit_pending_promote_req_ids.discard(req_id)
         self.clear_follow_rank_prefetch_issue_pending(req_id)
+        self._drop_deferred_prefetch_req(req_id)
         self.discard_pp_locally_revoked_req(req_id)
         self._purge_matching_local_revoke_residue(req_id)
 
@@ -2881,12 +2882,16 @@ class HiRadixCache(RadixCache):
         return dropped
 
     def flush_deferred_prefetch_evicts(self):
-        """Execute deferred prefetch evict+alloc+issue operations.
+        """Execute deferred prefetch alloc+issue operations.
 
-        In PP>1 mode, when prefetch_from_storage cannot allocate host memory,
-        the evict_host call is deferred to this method which runs inside the
-        batch loop after logical_clock has been synchronized across PP ranks.
-        This guarantees that eviction order is deterministic.
+        In PP>1 mode, all prefetch_from_storage calls are deferred to this
+        method which runs inside the batch loop after logical_clock has been
+        synchronized and host_release_queue has been drained.
+
+        Prefetch is speculative, so in PP>1 mode this method must NOT call
+        evict_host — doing so would mutate the host tree non-deterministically
+        (one rank may have enough free memory while another doesn't, causing
+        different eviction decisions and host tree divergence).
 
         Items are sorted by req_id before processing to ensure the same flush
         order across PP ranks even if request arrival order differs.
@@ -2933,8 +2938,13 @@ class HiRadixCache(RadixCache):
                         )
                     )
                 continue
-            self.evict_host(prefetch_length, caller="flush_deferred_prefetch")
+            # After drain_host_release_queue_synchronized and
+            # flush_deferred_write_backup, both PP ranks have identical host
+            # trees, so evict_host here is deterministic and safe.
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+            if host_indices is None:
+                self.evict_host(prefetch_length, caller="flush_deferred_prefetch")
+                host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
             if host_indices is None:
                 last_host_node.release_host()
                 self._log_prefetch_skip_and_sync(
@@ -2942,6 +2952,14 @@ class HiRadixCache(RadixCache):
                     reason="deferred_host_alloc_failed",
                     aligned_tokens=prefetch_length,
                 )
+                # PP0 must publish a zero-hit result so that PP1's storage
+                # thread (which may have issued and is waiting on
+                # pp0_storage_hit_results) can wake up and revoke cleanly.
+                if self.pp_size > 1 and self.pp_rank == 0:
+                    cc = self.cache_controller
+                    with cc._pp0_storage_hit_cond:
+                        cc.pp0_storage_hit_results[req_id] = (0, last_hash, prefetch_length)
+                        cc._pp0_storage_hit_cond.notify_all()
                 continue
             self._issue_prefetch_impl(
                 req_id=req_id,
@@ -3302,17 +3320,15 @@ class HiRadixCache(RadixCache):
             return
 
         last_host_node.protect_host()
-        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None and self.pp_size > 1:
-            # In PP>1 mode, defer evict_host to the next batch loop iteration
-            # (after logical_clock sync) to ensure deterministic eviction order
-            # across PP ranks.  _prefetch_kvcache runs outside the batch loop
-            # at request-arrival time, which differs between PP ranks; executing
-            # evict_host here would modify the host tree non-deterministically.
-            #
-            # Guard against duplicate deferral: if the same request is already
-            # pending (e.g., _prefetch_kvcache called again before flush),
-            # release the current protect_host and skip.
+
+        if self.pp_size > 1:
+            # In PP>1 mode, ALWAYS defer prefetch to the synchronized flush
+            # point (flush_deferred_prefetch_evicts) regardless of whether
+            # host memory is currently available.  The decision of whether
+            # to alloc inline depends on local host memory availability which
+            # differs between PP ranks (host_release_queue drain is async).
+            # If one rank allocs inline while another defers+evicts at flush
+            # time, the host trees diverge.
             if any(item[0] == req_id for item in self._deferred_prefetch_evict_items):
                 last_host_node.release_host()
                 return
@@ -3320,7 +3336,7 @@ class HiRadixCache(RadixCache):
                 (req_id, prefetch_length, last_host_node, new_input_tokens, last_hash, prefix_keys)
             )
             logger.warning(
-                "[HiCachePrefetchDecision] rid=%s action=defer_evict reason=pp_host_evict_sync "
+                "[HiCachePrefetchDecision] rid=%s action=defer reason=pp_always_defer "
                 "aligned_tokens=%s threshold=%s occupied=%s deferred_count=%s",
                 req_id,
                 prefetch_length,
@@ -3329,6 +3345,8 @@ class HiRadixCache(RadixCache):
                 len(self._deferred_prefetch_evict_items),
             )
             return
+
+        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             self.evict_host(prefetch_length, caller="prefetch_from_storage")
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
