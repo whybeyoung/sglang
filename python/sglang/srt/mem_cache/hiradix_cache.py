@@ -2023,16 +2023,14 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-            **self._get_extra_pools(),
-        )
-        if host_indices is None and self.pp_size > 1 and not write_back:
-            # PP>1 write-through path: defer evict_host to the next batch
-            # cycle's sync point so both PP ranks evict the same host-only
-            # leaves.  write_back=True is NOT deferred because evict()'s
-            # synchronous write-back flow asserts node.backuped immediately.
+        if self.pp_size > 1 and not write_back:
+            # PP>1 write-through path: ALWAYS defer to the next batch cycle's
+            # sync point so both PP ranks add host nodes at the same time.
+            # Without this, one rank's alloc may succeed immediately while the
+            # other defers/fails, causing host tree divergence that accumulates
+            # into matched_host mismatch and batch-pick crash.
+            # write_back=True is NOT deferred because evict()'s synchronous
+            # write-back flow asserts node.backuped immediately.
             sig = self._write_backup_node_sig(node)
             if not any(item[0] is node for item in self._deferred_write_backup_items):
                 self._deferred_write_backup_items.append((node, sig, write_back))
@@ -2048,6 +2046,11 @@ class HiRadixCache(RadixCache):
                     len(self._deferred_write_backup_items),
                 )
             return 0
+        host_indices = self.cache_controller.write(
+            device_indices=node.value,
+            node_id=node.id,
+            **self._get_extra_pools(),
+        )
         if host_indices is None:
             self.evict_host(len(node.value), caller="write_backup")
             host_indices = self.cache_controller.write(
@@ -2262,6 +2265,7 @@ class HiRadixCache(RadixCache):
             (self.eviction_strategy.get_priority(node), self._evict_tie_breaker(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
+        heap_time_ms = (time.perf_counter() - start_time) * 1000
 
         num_evicted = 0
         evicted_nodes = 0
@@ -2300,14 +2304,17 @@ class HiRadixCache(RadixCache):
                 self._evict_backuped(node)
 
         if evicted_nodes > 0:
+            total_time_ms = (time.perf_counter() - start_time) * 1000
             logger.warning(
-                "[GPUEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s",
+                "[GPUEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s heap_ms=%.1f total_ms=%.1f",
                 self.pp_rank,
                 self.attn_cp_rank,
                 num_tokens,
                 num_evicted,
                 evicted_nodes,
                 len(leaves),
+                heap_time_ms,
+                total_time_ms,
             )
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -2333,12 +2340,14 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def evict_host(self, num_tokens: int, caller: str = "unknown"):
+        start_time = time.perf_counter()
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), self._evict_tie_breaker(node), node)
             for node in leaves
         ]
         heapq.heapify(eviction_heap)
+        heap_time = time.perf_counter() - start_time
 
         num_evicted = 0
         evicted_nodes = 0
@@ -2380,8 +2389,9 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, self._evict_tie_breaker(x.parent), x.parent))
         if evicted_nodes > 0:
+            total_time = time.perf_counter() - start_time
             logger.warning(
-                "[HostEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s caller=%s",
+                "[HostEvict][summary] pp=%s cp=%s requested=%s evicted_tokens=%s evicted_nodes=%s leaves_before=%s caller=%s heap_ms=%.1f total_ms=%.1f",
                 self.pp_rank,
                 self.attn_cp_rank,
                 num_tokens,
@@ -2389,6 +2399,8 @@ class HiRadixCache(RadixCache):
                 evicted_nodes,
                 len(leaves),
                 caller,
+                heap_time * 1000,
+                total_time * 1000,
             )
 
     def load_back(
