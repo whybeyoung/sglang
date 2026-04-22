@@ -504,6 +504,10 @@ class SchedulerPPMixin:
             return
         if hasattr(self.tree_cache, "inc_logical_clock"):
             self.tree_cache.inc_logical_clock()
+        # Drain released host pages once (TP-synchronized) before both deferred
+        # flushes, so reclaimed pages are available to write_backup and prefetch.
+        if hasattr(self.tree_cache, "drain_host_release_queue_synchronized"):
+            self.tree_cache.drain_host_release_queue_synchronized()
         # Flush deferred write_backup first (structural / correctness-sensitive),
         # then deferred prefetch (speculative).  Both were deferred so that
         # evict_host executes after logical_clock sync, ensuring deterministic

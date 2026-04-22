@@ -815,16 +815,19 @@ class HiRadixCache(RadixCache):
     def _write_backup_node_sig(self, node: TreeNode) -> tuple:
         """Return a rank-stable content signature for a node.
 
-        Uses content hashes (not node.id which differs across PP ranks).
+        Uses full content hash tuples (not node.id which differs across PP
+        ranks) so that any split / reparent / key mutation is detected.
+        extra_key is normalized to "" so that None vs str never causes a
+        TypeError during tuple sorting.
         """
         parent = node.parent
         return (
-            node.get_last_hash_value(),
+            tuple(node.hash_value) if node.hash_value is not None else (),
             len(node.key) if node.key is not None else 0,
-            node.key.extra_key if node.key is not None else None,
-            parent.get_last_hash_value() if parent is not None else None,
+            node.key.extra_key or "" if node.key is not None else "",
+            tuple(parent.hash_value) if parent is not None and parent.hash_value is not None else (),
             len(parent.key) if parent is not None and parent.key is not None else 0,
-            parent.key.extra_key if parent is not None and parent.key is not None else None,
+            (parent.key.extra_key or "") if parent is not None and parent.key is not None else "",
         )
 
     def _pp_write_backup_replay_enabled(self) -> bool:
@@ -2953,27 +2956,14 @@ class HiRadixCache(RadixCache):
             )
         self._deferred_prefetch_evict_items.clear()
 
-    def flush_deferred_write_backup_evicts(self):
-        """Execute deferred write_backup evict+alloc operations.
+    def drain_host_release_queue_synchronized(self):
+        """Drain host_mem_release_queue with TP-synchronized MIN all-reduce.
 
-        In PP>1 mode, when write_backup cannot allocate host memory, the node
-        is deferred instead of calling evict_host inline (which would delete
-        different host-only leaf nodes across PP ranks).  By the next batch
-        cycle, prefetch buffers will have been finalized and their host pages
-        released via drain_storage_control_queues, so a TP-synchronized drain
-        of host_mem_release_queue followed by a retry alloc will usually
-        succeed without needing evict_host at all.
-
-        Items are sorted by content-hash signature for deterministic flush
-        order across PP ranks.
+        Should be called once per batch cycle before any deferred flush that
+        may need host memory (write_backup, prefetch).  This avoids duplicate
+        drains and ensures released pages are available to both flush paths.
         """
-        if not self._deferred_write_backup_items:
-            return
-
         cc = self.cache_controller
-
-        # Drain host_mem_release_queue first (TP-synchronized) to reclaim
-        # pages from finalized prefetches before attempting alloc.
         release_qsize = torch.tensor(
             [cc.host_mem_release_queue.qsize()], dtype=torch.int,
         )
@@ -2992,6 +2982,24 @@ class HiRadixCache(RadixCache):
             if host_indices_list:
                 cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
 
+    def flush_deferred_write_backup_evicts(self):
+        """Execute deferred write_backup evict+alloc operations.
+
+        In PP>1 mode, when write_backup cannot allocate host memory, the node
+        is deferred instead of calling evict_host inline (which would delete
+        different host-only leaf nodes across PP ranks).  By the next batch
+        cycle, prefetch buffers will have been finalized and their host pages
+        released via drain_storage_control_queues, so a TP-synchronized drain
+        of host_mem_release_queue followed by a retry alloc will usually
+        succeed without needing evict_host at all.
+
+        Items are sorted by content-hash signature for deterministic flush
+        order across PP ranks.
+        """
+        if not self._deferred_write_backup_items:
+            return
+
+        cc = self.cache_controller
         # Sort by rank-stable signature for deterministic order.
         self._deferred_write_backup_items.sort(key=lambda item: item[1])
 
