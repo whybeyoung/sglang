@@ -3635,6 +3635,47 @@ class HiRadixCache(RadixCache):
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
 
+    def force_bypass_prefetch(self, req_id: str):
+        """Force-terminate a prefetch and clean up, letting the request
+        proceed with storage_hit_length=0.  Called when the hicache gate
+        wait exceeds the bootstrap timeout budget.
+
+        Unlike release_aborted_request, this is designed to be called from
+        the bootstrap poll path where the request is NOT being aborted —
+        it will continue through prefill with no storage cache hit.
+        """
+        # Mark loaded tokens as 0 so later pop returns 0.
+        self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+
+        if req_id not in self.ongoing_prefetch:
+            return
+
+        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+            req_id
+        ]
+        if operation.host_indices is None:
+            del self.ongoing_prefetch[req_id]
+            return
+
+        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
+        self._barrier_attn_groups()
+
+        # Release the host-node protection ref.
+        last_host_node.release_host()
+        del self.ongoing_prefetch[req_id]
+
+        # Free the already-completed prefix pages; the I/O thread will
+        # release the unfinished suffix on its own.
+        if completed_tokens > 0:
+            self.cache_controller.append_host_mem_release(
+                host_indices[:completed_tokens]
+            )
+
+        # Restore capacity accounting.
+        self.cache_controller.prefetch_tokens_occupied = max(
+            0, self.cache_controller.prefetch_tokens_occupied - len(token_ids)
+        )
+
     def release_aborted_request(self, rid: str):
         # Clean up per-request transient PP/HiCache state for aborted requests.
         self._release_request_ephemeral_state(rid)

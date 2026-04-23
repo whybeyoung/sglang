@@ -1416,9 +1416,27 @@ class MooncakeKVManager(CommonKVManager):
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
                     )
+                    current_count = len(self.transfer_infos[room])
+                    is_dummy = self.transfer_infos[room][mooncake_session_id].is_dummy
+                    logger.debug(
+                        f"[bootstrap_thread] TransferInfo received: room={room}, "
+                        f"session={mooncake_session_id}, is_dummy={is_dummy}, "
+                        f"count={current_count}/{required_dst_info_num}, "
+                        f"sessions_so_far={list(self.transfer_infos[room].keys())}"
+                    )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
+                    if current_count == required_dst_info_num:
+                        logger.debug(
+                            f"[bootstrap_thread] Room {room} bootstrap complete: "
+                            f"all {required_dst_info_num} TransferInfo(s) received, "
+                            f"transitioning to WaitingForInput"
+                        )
                         self.update_status(room, KVPoll.WaitingForInput)
+                    elif current_count > required_dst_info_num:
+                        logger.warning(
+                            f"[bootstrap_thread] Room {room} received MORE TransferInfos "
+                            f"than expected: count={current_count} > required={required_dst_info_num}"
+                        )
 
         threading.Thread(target=bootstrap_thread).start()
 

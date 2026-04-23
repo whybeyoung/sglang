@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -267,15 +268,53 @@ class PrefillBootstrapQueue:
             return True
 
         if not self.scheduler.tree_cache.check_prefetch_progress(req.rid):
-            logger.warning(
-                "[PPPrefillProblem][hicache_gate_wait] pp=%s tp=%s rid=%s storage_hit_length=%s state=%s",
+            # Check how long this request has been waiting in bootstrap queue.
+            now = time.monotonic()
+            if not hasattr(req, "_bootstrap_gate_start"):
+                req._bootstrap_gate_start = now
+            elapsed = now - req._bootstrap_gate_start
+            # Use half of SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to leave
+            # room for batch pick + forward + KV transfer before decode times out.
+            gate_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get() / 2.0
+
+            # Make the timeout decision collective across all CP/TP ranks to
+            # avoid barrier deadlock: if any rank considers it expired, all
+            # ranks must take the timeout path together.
+            local_expired = int(elapsed >= gate_timeout)
+            expired_tensor = torch.tensor(
+                [local_expired], dtype=torch.int, device="cpu"
+            )
+            self.scheduler.tree_cache._all_reduce_attn_groups(
+                expired_tensor, torch.distributed.ReduceOp.MAX
+            )
+            collective_expired = expired_tensor.item() == 1
+
+            if not collective_expired:
+                logger.warning(
+                    "[PPPrefillProblem][hicache_gate_wait] pp=%s tp=%s rid=%s "
+                    "storage_hit_length=%s elapsed=%.1fs timeout=%.0fs state=%s",
+                    self.pp_rank,
+                    self.tp_rank,
+                    req.rid,
+                    req.storage_hit_length,
+                    elapsed,
+                    gate_timeout,
+                    self.scheduler.tree_cache.get_prefetch_progress_debug(req.rid),
+                )
+                return False
+            # Timed out — force-terminate prefetch and let the request through
+            # with storage_hit_length=0 to avoid decode-side bootstrap timeout.
+            logger.error(
+                "[PPPrefillProblem][hicache_gate_timeout] pp=%s tp=%s rid=%s "
+                "elapsed=%.1fs — forcing bootstrap pass with no storage hit",
                 self.pp_rank,
                 self.tp_rank,
                 req.rid,
-                req.storage_hit_length,
-                self.scheduler.tree_cache.get_prefetch_progress_debug(req.rid),
+                elapsed,
             )
-            return False
+            self.scheduler.tree_cache.force_bypass_prefetch(req.rid)
+            req.storage_hit_length = 0
+            return True
 
         if req.storage_hit_length == 0:
             req.storage_hit_length = self.scheduler.tree_cache.pop_prefetch_loaded_tokens(
@@ -467,9 +506,11 @@ class PrefillBootstrapQueue:
             self.scheduler.attn_tp_cpu_group,
         )
 
+        bootstrapping_count = 0
         for queue_index, (req, poll) in zip(queue_indices, zip(reqs_to_poll, polls)):
 
             if poll == KVPoll.Bootstrapping:
+                bootstrapping_count += 1
                 continue
             elif poll == KVPoll.Failed:
                 self._handle_bootstrap_failed_req(req)
@@ -486,6 +527,20 @@ class PrefillBootstrapQueue:
             self._init_bootstrapped_req(req)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(queue_index)
+
+        if bootstrapping_count > 0 and len(self.queue) > 10:
+            # Log first few stuck rooms to help diagnose bootstrap stalls
+            stuck_rooms = [
+                str(req.bootstrap_room)
+                for req, poll in zip(reqs_to_poll, polls)
+                if poll == KVPoll.Bootstrapping
+            ][:5]
+            logger.debug(
+                f"[pop_bootstrapped] queue_size={len(self.queue)}, "
+                f"bootstrapping={bootstrapping_count}, "
+                f"popped={len(bootstrapped_reqs)}, failed={len(failed_reqs)}, "
+                f"sample_stuck_rooms=[{','.join(stuck_rooms)}]"
+            )
 
         if hasattr(self.scheduler.tree_cache, "flush_deferred_finalizes"):
             deferred = self.scheduler.tree_cache.flush_deferred_finalizes()
