@@ -263,6 +263,11 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Bitmap: 0=allocated, 1=free.  Used to filter double-frees so that
+        # duplicate entries never accumulate in free_slots (which would let
+        # alloc() hand the same slot to two holders, cascading into more
+        # double-frees).
+        self._slot_state = np.ones(self.size, dtype=np.uint8)
 
     def available_size(self):
         return len(self.free_slots)
@@ -277,13 +282,38 @@ class HostKVCache(abc.ABC):
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-
+        self._slot_state[select_index.detach().cpu().numpy()] = 0
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
-        return len(indices)
+        idx = indices.detach().cpu().numpy().astype(np.int64)
+        if idx.size == 0:
+            return 0
+        # Dedupe within batch + filter already-free slots.
+        idx = np.unique(idx)
+        mask = (idx >= 0) & (idx < self.size) & (self._slot_state[np.clip(idx, 0, self.size - 1)] == 0)
+        if int(mask.sum()) != len(idx):
+            import traceback as _tb
+            n_dup = len(idx) - int(mask.sum())
+            bad = idx[~mask][:8].tolist()
+            caller = " -> ".join(
+                f"{f.filename.split('/')[-1]}:{f.lineno}:{f.name}"
+                for f in _tb.extract_stack(limit=6)[:-1]
+            )
+            logger.error(
+                "[HostPoolDoubleFree] filtered %d/%d slots, "
+                "free_slots_len=%d pool_size=%d sample=%s caller=[%s]",
+                n_dup, len(idx), len(self.free_slots), self.size,
+                bad, caller,
+            )
+        actual = idx[mask]
+        if len(actual) > 0:
+            self._slot_state[actual] = 1
+            self.free_slots = torch.cat(
+                [self.free_slots, torch.from_numpy(actual)]
+            )
+        return len(actual)
 
 
 class MHATokenToKVPoolHost(HostKVCache):

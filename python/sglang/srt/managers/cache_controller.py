@@ -808,8 +808,7 @@ class HiCacheController:
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")
 
-        self.mem_pool_host.free(host_indices)
-        return len(host_indices)
+        return self.mem_pool_host.free(host_indices)
 
     def prefetch(
         self,
