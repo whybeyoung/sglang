@@ -762,6 +762,13 @@ class SchedulerPPMixin:
                         transferred=self._pp_prefill_diag_rids(transferred_rids),
                     )
 
+                if (
+                    self.enable_hicache_storage
+                    and hasattr(self.tree_cache, "_prefetch_backpressure_depth")
+                ):
+                    self.tree_cache._prefetch_backpressure_depth = len(
+                        self.disagg_prefill_bootstrap_queue.queue
+                    )
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
                 batch = self.maybe_prepare_mlp_sync_batch(batch)

@@ -609,6 +609,15 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
+            # Update prefetch backpressure signal before batch pick
+            if (
+                self.enable_hicache_storage
+                and hasattr(self.tree_cache, "_prefetch_backpressure_depth")
+            ):
+                self.tree_cache._prefetch_backpressure_depth = len(
+                    self.disagg_prefill_bootstrap_queue.queue
+                )
+
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
@@ -639,6 +648,15 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+
+            # Update prefetch backpressure signal before batch pick
+            if (
+                self.enable_hicache_storage
+                and hasattr(self.tree_cache, "_prefetch_backpressure_depth")
+            ):
+                self.tree_cache._prefetch_backpressure_depth = len(
+                    self.disagg_prefill_bootstrap_queue.queue
+                )
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()

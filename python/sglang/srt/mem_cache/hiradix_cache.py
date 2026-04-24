@@ -225,6 +225,25 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+        # Adaptive prefetch backpressure: when bootstrap queue depth exceeds
+        # this threshold, skip L3 prefetch to avoid host-evict + PP-sync
+        # overhead that slows down the batch cycle and starves bootstrap
+        # polling.  The prefetch IO itself is fast (<0.5s), but the evict +
+        # PP sync it triggers can add 5-10s per batch cycle, collapsing
+        # bootstrap graduation rate below request arrival rate.
+        # Default 15: healthy-period max bootstrap depth is ~7; sustained
+        # values above 15 indicate the system cannot keep up and needs to
+        # shed prefetch overhead to recover.
+        self._prefetch_backpressure_depth: int = 0
+        try:
+            self._prefetch_skip_threshold = max(
+                0, int(os.getenv("SGLANG_PREFETCH_BACKPRESSURE_THRESHOLD", "15"))
+            )
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid SGLANG_PREFETCH_BACKPRESSURE_THRESHOLD; disabling backpressure"
+            )
+            self._prefetch_skip_threshold = 0
         self.pp_host_tree_event_seq = 0
         self.pp_outgoing_host_tree_events: List[dict[str, Any]] = []
         self.pp_pending_host_tree_events: Deque[PPHostTreeEvent] = deque()
@@ -3323,6 +3342,29 @@ class HiRadixCache(RadixCache):
                 prefetch_length,
                 self.prefetch_threshold,
                 self.cache_controller.prefetch_tokens_occupied,
+            )
+            if self._pp_downstream_sync_enabled():
+                self._append_pp_host_tree_event(
+                    PPHostTreeEvent(
+                        seq=self._next_pp_host_tree_seq(),
+                        kind="PREFETCH_SKIP",
+                        rid=req_id,
+                    )
+                )
+            return
+        if (
+            self._prefetch_skip_threshold > 0
+            and self._prefetch_backpressure_depth > self._prefetch_skip_threshold
+            and (self.pp_size == 1 or self.pp_rank == 0)
+        ):
+            logger.warning(
+                "[HiCachePrefetchDecision] rid=%s action=skip reason=bootstrap_backpressure "
+                "tokens=%s aligned_tokens=%s bootstrap_depth=%s threshold=%s",
+                req_id,
+                len(new_input_tokens),
+                prefetch_length,
+                self._prefetch_backpressure_depth,
+                self._prefetch_skip_threshold,
             )
             if self._pp_downstream_sync_enabled():
                 self._append_pp_host_tree_event(
