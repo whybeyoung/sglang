@@ -160,6 +160,8 @@ class PrefillBootstrapQueue:
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+        if self.draft_token_to_kv_pool is not None:
+            kv_args.has_draft_pool = True
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

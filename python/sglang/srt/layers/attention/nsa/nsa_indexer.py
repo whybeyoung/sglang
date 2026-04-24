@@ -235,6 +235,7 @@ class Indexer(MultiPlatformOp):
             is_neox_style=is_neox_style,
             device=get_global_server_args().device,
         )
+        self.all_num = 1
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
@@ -1495,7 +1496,10 @@ class Indexer(MultiPlatformOp):
                 )
 
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
-
+        # if layer_id == 0 and is_prefill:
+        #     from sglang.srt.distributed import get_world_rank
+        #     torch.save(past_key_states, f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}---{forward_batch.forward_mode}-past_key_states.pt")
+        #     self.all_num += 1
         if self.rotary_emb.is_neox_style and self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():

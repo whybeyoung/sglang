@@ -72,6 +72,8 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 from sglang.srt.distributed.parallel_state import is_pipeline_last_stage
 
+from python.sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
 _is_npu = is_npu()
 
 if is_cuda():
@@ -158,34 +160,34 @@ class EAGLEWorker(TpModelWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
+        if self.pp_group.is_last_rank:
+            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+            if self.speculative_algorithm.is_eagle3():
+                # most cases EAGLE3 models don't share lm_head
+                # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+                if (
+                    hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                    and self.draft_model_runner.model.load_lm_head_from_target
+                ):
+                    self.draft_model_runner.model.set_embed_and_head(embed, head)
+                else:
+                    self.draft_model_runner.model.set_embed(embed)
 
-        if self.speculative_algorithm.is_eagle3():
-            # most cases EAGLE3 models don't share lm_head
-            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
-                and self.draft_model_runner.model.load_lm_head_from_target
-            ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
+                # grab hot token ids
+                if self.draft_model_runner.model.hot_token_id is not None:
+                    self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+                        embed.device
+                    )
+
             else:
-                self.draft_model_runner.model.set_embed(embed)
+                if self.hot_token_id is not None:
+                    head = head.clone()
+                    self.hot_token_id = self.hot_token_id.to(head.device)
+                    head.data = head.data[self.hot_token_id]
 
-            # grab hot token ids
-            if self.draft_model_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
-                    embed.device
-                )
-
-        else:
-            if self.hot_token_id is not None:
-                head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
-
-            # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
+                # Share the embedding and lm_head
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
@@ -280,7 +282,7 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def forward_batch_generation(self, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors] = None,) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -293,13 +295,13 @@ class EAGLEWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            (
-                logits_output,
-                next_token_ids,
-                seq_lens_cpu,
-                can_run_cuda_graph,
-            ) = self.forward_target_extend(batch)
             if is_pipeline_last_stage():
+                (
+                    logits_output,
+                    next_token_ids,
+                    seq_lens_cpu,
+                    can_run_cuda_graph,
+                ) = self.forward_target_extend(batch, pp_proxy_tensors=pp_proxy_tensors)
                 with self.draft_tp_context(
                     self.draft_model_runner.tp_group
                 ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -310,12 +312,19 @@ class EAGLEWorker(TpModelWorker):
                         seq_lens_cpu,
                         logits_output.mm_input_embeds,
                     )
-            return GenerationBatchResult(
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
-                can_run_cuda_graph=can_run_cuda_graph,
-            )
+                return GenerationBatchResult(
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
+                    num_accepted_tokens=0,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                )
+            else:
+                batch_result = self.forward_target_extend(batch, pp_proxy_tensors=pp_proxy_tensors)
+                return GenerationBatchResult(
+                    pp_hidden_states_proxy_tensors=batch_result.pp_hidden_states_proxy_tensors,
+                    can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                    expert_distribution_metrics=batch_result.expert_distribution_metrics,
+                )
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
@@ -383,7 +392,7 @@ class EAGLEWorker(TpModelWorker):
         return need_forward
 
     def forward_target_extend(
-        self, batch: ScheduleBatch
+        self, batch: ScheduleBatch, pp_proxy_tensors
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], bool]:
         """Run the target extend.
 
@@ -400,17 +409,20 @@ class EAGLEWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-        logits_output, next_token_ids = (
-            batch_result.logits_output,
-            batch_result.next_token_ids,
-        )
-        return (
-            logits_output,
-            next_token_ids,
-            model_worker_batch.seq_lens_cpu,
-            batch_result.can_run_cuda_graph,
-        )
+        batch_result = self.target_worker.forward_batch_generation(model_worker_batch, pp_proxy_tensors=pp_proxy_tensors)
+        if is_pipeline_last_stage():
+            logits_output, next_token_ids = (
+                batch_result.logits_output,
+                batch_result.next_token_ids,
+            )
+            return (
+                logits_output,
+                next_token_ids,
+                model_worker_batch.seq_lens_cpu,
+                batch_result.can_run_cuda_graph,
+            )
+        else:
+            return batch_result
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()

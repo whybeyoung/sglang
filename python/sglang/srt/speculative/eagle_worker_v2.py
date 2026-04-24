@@ -178,6 +178,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.all_num = 1
 
     def init_token_map(self):
         # Load hot token ids
@@ -601,7 +602,19 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-
+        # if not batch.forward_mode.is_idle():
+        #     k_nope, k_pe = forward_batch.token_to_kv_pool.get_kv_buffer(0)
+        #     index_k = forward_batch.token_to_kv_pool.get_index_k_buffer(0)
+        #     from sglang.srt.distributed import get_world_rank
+        #     torch.save(k_nope,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}--draft-k_nope.pt")
+        #     torch.save(k_pe,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}--draft-k_pe.pt")
+        #     torch.save(index_k,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}--draft-index_k.pt")
+        #     torch.save(forward_batch.out_cache_loc,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}--draft-loc.pt")
+        #     self.all_num += 1
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
@@ -684,6 +697,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.all_num = 1
 
     @property
     def target_worker(self):
@@ -805,6 +819,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        # if not batch.forward_mode.is_idle():
+        #     k_nope, k_pe = verify_forward_batch.token_to_kv_pool.get_kv_buffer(0)
+        #     index_k = verify_forward_batch.token_to_kv_pool.get_index_k_buffer(0)
+        #     from sglang.srt.distributed import get_world_rank
+        #     torch.save(k_nope,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}---decode-k_nope.pt")
+        #     torch.save(k_pe,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}---decode-k_pe.pt")
+        #     torch.save(index_k,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}---decode-index_k.pt")
+        #     torch.save(verify_forward_batch.out_cache_loc,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}---decode-loc.pt")
+        #     self.all_num += 1
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding

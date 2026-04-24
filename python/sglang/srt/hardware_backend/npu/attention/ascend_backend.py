@@ -220,6 +220,7 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.all_num = 1
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -762,7 +763,13 @@ class AscendAttnBackend(AttentionBackend):
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
+        # if layer.layer_id == 0 and is_prefill:
+        #     from sglang.srt.distributed import get_world_rank
+        #     torch.save(k_nope, f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}--{forward_batch.forward_mode}--k_nope.pt")
+        #     torch.save(k_pe, f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}--{forward_batch.forward_mode}--k_pe.pt")
+        #     torch.save(forward_batch.out_cache_loc,
+        #                f"/home/chenxu/tmp/{self.all_num}-{get_world_rank()}--{forward_batch.forward_mode}-loc.pt")
+        #     self.all_num += 1
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q

@@ -16,6 +16,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.utils.network import get_local_ip_auto
 
+from sglang.srt.distributed import get_world_rank
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,17 +53,20 @@ class AscendKVManager(MooncakeKVManager):
         else:
             ptrs_per_layer = 2
 
-        has_mtp_draft = is_pipeline_last_stage()
+        if self.kv_args.has_draft_pool:
+            total_num_layers = len(dst_kv_ptrs) // ptrs_per_layer - 1
+        else:
+            total_num_layers = len(dst_kv_ptrs) // ptrs_per_layer
 
-        if has_mtp_draft:
-            src_layers = len(src_kv_ptrs - 1) // ptrs_per_layer
-            total_num_layers = len(dst_kv_ptrs - 1) // ptrs_per_layer
+        if is_pipeline_last_stage() and self.kv_args.has_draft_pool:
+            src_layers = len(src_kv_ptrs) // ptrs_per_layer  - 1
         else:
             src_layers = len(src_kv_ptrs) // ptrs_per_layer
-            total_num_layers = len(dst_kv_ptrs) // ptrs_per_layer
 
         end_layer = start_layer + src_layers
 
+        from sglang.srt.distributed import get_world_rank
+        # print(f'==={get_world_rank}======={src_layers=}=={total_num_layers=}==={start_layer=}=={end_layer=}==={len(dst_kv_ptrs)=}==={len(src_kv_ptrs)=}')
         if src_layers == total_num_layers:
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
@@ -70,6 +75,8 @@ class AscendKVManager(MooncakeKVManager):
             if self.kv_args.state_type == "nsa":
                 index_k_ptrs = dst_kv_ptrs[2 * total_num_layers + start_layer: 2 * total_num_layers + end_layer]
                 sliced_dst_kv_ptrs = k_ptrs + v_ptrs + index_k_ptrs
+                if is_pipeline_last_stage() and self.kv_args.has_draft_pool:
+                    sliced_dst_kv_ptrs += dst_kv_ptrs[-ptrs_per_layer:]
             else:
                 sliced_dst_kv_ptrs = k_ptrs + v_ptrs
 
@@ -100,6 +107,7 @@ class AscendKVManager(MooncakeKVManager):
                     )
                     for layer_id in range(layers_current_pp_stage)
                 ]
+                # print(f'{get_world_rank()}========{layers_params=}')
             else:
                 src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                     self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
