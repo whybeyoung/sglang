@@ -2937,13 +2937,17 @@ class HiRadixCache(RadixCache):
         for req_id, prefetch_length, last_host_node, new_input_tokens, last_hash, prefix_keys in self._deferred_prefetch_evict_items:
             # Skip if request was aborted / revoked / soft-skipped / zero-hit
             # while deferred.
+            if req_id in self.ongoing_prefetch:
+                # Real ongoing prefetch will publish its own result.
+                last_host_node.release_host()
+                continue
             if (
-                req_id in self.ongoing_prefetch
-                or req_id in self.pp_soft_skipped_req_ids
+                req_id in self.pp_soft_skipped_req_ids
                 or req_id in self.pp_authoritative_revoked_req_ids
                 or req_id in self.zero_hit_prefetch_req_ids
             ):
                 last_host_node.release_host()
+                self._publish_pp0_prefetch_skip(req_id)
                 continue
             # Validate anchor node is still valid: check that the recorded
             # last_hash still matches the anchor.  The anchor can become stale
@@ -2971,6 +2975,7 @@ class HiRadixCache(RadixCache):
                             rid=req_id,
                         )
                     )
+                self._publish_pp0_prefetch_skip(req_id)
                 continue
             # After drain_host_release_queue_synchronized and
             # flush_deferred_write_backup, both PP ranks have identical host
@@ -2986,14 +2991,7 @@ class HiRadixCache(RadixCache):
                     reason="deferred_host_alloc_failed",
                     aligned_tokens=prefetch_length,
                 )
-                # PP0 must publish a zero-hit result so that PP1's storage
-                # thread (which may have issued and is waiting on
-                # pp0_storage_hit_results) can wake up and revoke cleanly.
-                if self.pp_size > 1 and self.pp_rank == 0:
-                    cc = self.cache_controller
-                    with cc._pp0_storage_hit_cond:
-                        cc.pp0_storage_hit_results[req_id] = (0, last_hash, prefetch_length)
-                        cc._pp0_storage_hit_cond.notify_all()
+                self._publish_pp0_prefetch_skip(req_id)
                 continue
             self._issue_prefetch_impl(
                 req_id=req_id,
@@ -3256,6 +3254,27 @@ class HiRadixCache(RadixCache):
             host_hit_length=host_hit_length,
         )
 
+    def _publish_pp0_prefetch_skip(self, req_id: str):
+        """Publish a zero-hit result to pp0_storage_hit_results so PP1's
+        prefetch_thread can wake up and revoke immediately instead of
+        waiting indefinitely for a result that PP0 will never produce.
+
+        Must be called on PP0 whenever prefetch_from_storage skips a request
+        that PP1 might have issued (due to the 1-cycle event delivery lag,
+        PP1 may not have received the PREFETCH_SKIP event yet).
+        """
+        if self.pp_size <= 1 or self.pp_rank != 0:
+            return
+        if req_id in self.ongoing_prefetch:
+            return
+        cc = self.cache_controller
+        with cc._pp0_storage_hit_cond:
+            existing = cc.pp0_storage_hit_results.get(req_id)
+            if existing is not None and existing[0] > 0:
+                return
+            cc.pp0_storage_hit_results[req_id] = (0, None, 0)
+            cc._pp0_storage_hit_cond.notify_all()
+
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -3275,6 +3294,7 @@ class HiRadixCache(RadixCache):
                 len(new_input_tokens),
                 self.prefetch_threshold,
             )
+            self._publish_pp0_prefetch_skip(req_id)
             return
 
         new_input_tokens = (
@@ -3295,6 +3315,7 @@ class HiRadixCache(RadixCache):
                 prefetch_length,
                 self.prefetch_threshold,
             )
+            self._publish_pp0_prefetch_skip(req_id)
             return
         if prefetch_length < self.prefetch_threshold:
             logger.warning(
@@ -3312,6 +3333,7 @@ class HiRadixCache(RadixCache):
                         rid=req_id,
                     )
                 )
+            self._publish_pp0_prefetch_skip(req_id)
             return
         if self._pp_should_skip_large_shallow_prefetch(
             last_host_node, prefetch_length
@@ -3333,6 +3355,7 @@ class HiRadixCache(RadixCache):
                     rid=req_id,
                 )
             )
+            self._publish_pp0_prefetch_skip(req_id)
             return
         if self.cache_controller.prefetch_rate_limited():
             logger.warning(
@@ -3351,6 +3374,7 @@ class HiRadixCache(RadixCache):
                         rid=req_id,
                     )
                 )
+            self._publish_pp0_prefetch_skip(req_id)
             return
         if (
             self._prefetch_skip_threshold > 0
@@ -3374,6 +3398,7 @@ class HiRadixCache(RadixCache):
                         rid=req_id,
                     )
                 )
+            self._publish_pp0_prefetch_skip(req_id)
             return
 
         last_host_node.protect_host()

@@ -1077,11 +1077,12 @@ class HiCacheController:
                             and not self.storage_stop_event.is_set()
                         ):
                             self._pp0_storage_hit_cond.wait(timeout=0.5)
-                    storage_hit_count, pp0_anchor_hash, pp0_token_len = (
-                        self.pp0_storage_hit_results.pop(
-                            operation.request_id, (0, None, 0)
+                        # Pop under the same lock to keep wait+consume atomic.
+                        storage_hit_count, pp0_anchor_hash, pp0_token_len = (
+                            self.pp0_storage_hit_results.pop(
+                                operation.request_id, (0, None, 0)
+                            )
                         )
-                    )
                     # Align token_ids and anchor with PP0 to ensure
                     # identical hash chains across PP ranks.
                     # PP1 may have a longer token_ids (lower matched_len)
