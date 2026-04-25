@@ -802,6 +802,7 @@ class HiRadixCache(RadixCache):
         self.pp_retry_prefetch_req_ids.clear()
         self.pp_authoritative_revoked_req_ids.clear()
         self.pp_soft_skipped_req_ids.clear()
+        self.pp_staged_prefetch_skip_req_ids.clear()
         self.pp_zero_hit_deferred_req_ids.clear()
         self.pp_zero_hit_pending_promote_req_ids.clear()
         self._deferred_finalize_rids.clear()
@@ -810,7 +811,22 @@ class HiRadixCache(RadixCache):
         super().reset()
 
     def _pp_downstream_sync_enabled(self) -> bool:
+        # NOTE: misnomer for historical reasons.  This actually means "I have
+        # an UPSTREAM PP peer, so I receive/replay/consume host-tree events".
+        # Used to gate consume-side paths (stage incoming events, replay,
+        # peek pending queue, defer local_revoke, drain_revoke promotion).
         return self.enable_storage and self.pp_size > 1 and self.pp_rank > 0
+
+    def _pp_has_downstream_peer(self) -> bool:
+        # True iff this rank has a DOWNSTREAM PP peer to which host-tree
+        # decisions (PREFETCH_SKIP / PREFETCH_FINALIZE / REVOKE / ...) must
+        # be forwarded.  Used to gate emit-side paths.
+        # Critical for PP0: PP0 is the upstream-most rank making the skip
+        # decisions, so it must emit PREFETCH_SKIP events to keep PP1's host
+        # tree symmetric.  The old code used _pp_downstream_sync_enabled
+        # (pp_rank > 0) which silenced PP0's emits and caused host-tree
+        # divergence under bootstrap backpressure.
+        return self.enable_storage and self.pp_size > 1 and self.pp_rank < self.pp_size - 1
 
     def get_access_time(self) -> float:
         if self.pp_size > 1:
@@ -1025,6 +1041,18 @@ class HiRadixCache(RadixCache):
                 len(staged_rids),
                 staged_rids[:8],
             )
+            # pp_size >= 3: forward upstream PREFETCH_SKIP to downstream so
+            # that all PP ranks below us see the skip decision and keep host
+            # trees symmetric.  No-op on the last rank (no downstream peer).
+            if self._pp_has_downstream_peer():
+                for rid in staged_rids:
+                    self._append_pp_host_tree_event(
+                        PPHostTreeEvent(
+                            seq=self._next_pp_host_tree_seq(),
+                            kind="PREFETCH_SKIP",
+                            rid=rid,
+                        )
+                    )
 
     def poll_follow_rank_prefetch_issue_action(
         self,
@@ -2816,7 +2844,7 @@ class HiRadixCache(RadixCache):
             self.prefetch_threshold,
             self.cache_controller.prefetch_tokens_occupied,
         )
-        if self._pp_downstream_sync_enabled():
+        if self._pp_has_downstream_peer():
             self._append_pp_host_tree_event(
                 PPHostTreeEvent(
                     seq=self._next_pp_host_tree_seq(),
@@ -2945,7 +2973,12 @@ class HiRadixCache(RadixCache):
                 req_id in self.pp_soft_skipped_req_ids
                 or req_id in self.pp_authoritative_revoked_req_ids
                 or req_id in self.zero_hit_prefetch_req_ids
+                # Upstream PP rank already decided to skip this request.
+                # Drop the deferred alloc so PP host trees stay symmetric
+                # (otherwise this rank alloc/evicts while upstream did not).
+                or req_id in self.pp_staged_prefetch_skip_req_ids
             ):
+                self.pp_staged_prefetch_skip_req_ids.discard(req_id)
                 last_host_node.release_host()
                 self._publish_pp0_prefetch_skip(req_id)
                 continue
@@ -2967,7 +3000,7 @@ class HiRadixCache(RadixCache):
                     last_hash,
                     current_hash,
                 )
-                if self._pp_downstream_sync_enabled():
+                if self._pp_has_downstream_peer():
                     self._append_pp_host_tree_event(
                         PPHostTreeEvent(
                             seq=self._next_pp_host_tree_seq(),
@@ -3325,7 +3358,7 @@ class HiRadixCache(RadixCache):
                 prefetch_length,
                 self.prefetch_threshold,
             )
-            if self._pp_downstream_sync_enabled():
+            if self._pp_has_downstream_peer():
                 self._append_pp_host_tree_event(
                     PPHostTreeEvent(
                         seq=self._next_pp_host_tree_seq(),
@@ -3366,7 +3399,7 @@ class HiRadixCache(RadixCache):
                 self.prefetch_threshold,
                 self.cache_controller.prefetch_tokens_occupied,
             )
-            if self._pp_downstream_sync_enabled():
+            if self._pp_has_downstream_peer():
                 self._append_pp_host_tree_event(
                     PPHostTreeEvent(
                         seq=self._next_pp_host_tree_seq(),
@@ -3390,7 +3423,7 @@ class HiRadixCache(RadixCache):
                 self._prefetch_backpressure_depth,
                 self._prefetch_skip_threshold,
             )
-            if self._pp_downstream_sync_enabled():
+            if self._pp_has_downstream_peer():
                 self._append_pp_host_tree_event(
                     PPHostTreeEvent(
                         seq=self._next_pp_host_tree_seq(),
