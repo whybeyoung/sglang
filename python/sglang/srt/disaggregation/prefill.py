@@ -290,23 +290,17 @@ class PrefillBootstrapQueue:
             collective_expired = expired_tensor.item() == 1
 
             if not collective_expired:
-                # Rate-limit gate_wait logs: first hit, then every 10s per rid.
-                # Prevents log flood when many requests are stuck (up to
-                # ~1800 lines/sec with 20 rids × 8 CPs × 56 Hz polling).
-                last_log = getattr(req, "_gate_wait_last_log", 0.0)
-                if last_log == 0.0 or now - last_log >= 10.0:
-                    req._gate_wait_last_log = now
-                    logger.warning(
-                        "[PPPrefillProblem][hicache_gate_wait] pp=%s tp=%s rid=%s "
-                        "storage_hit_length=%s elapsed=%.1fs timeout=%.0fs state=%s",
-                        self.pp_rank,
-                        self.tp_rank,
-                        req.rid,
-                        req.storage_hit_length,
-                        elapsed,
-                        gate_timeout,
-                        self.scheduler.tree_cache.get_prefetch_progress_debug(req.rid),
-                    )
+                logger.warning(
+                    "[PPPrefillProblem][hicache_gate_wait] pp=%s tp=%s rid=%s "
+                    "storage_hit_length=%s elapsed=%.1fs timeout=%.0fs state=%s",
+                    self.pp_rank,
+                    self.tp_rank,
+                    req.rid,
+                    req.storage_hit_length,
+                    elapsed,
+                    gate_timeout,
+                    self.scheduler.tree_cache.get_prefetch_progress_debug(req.rid),
+                )
                 return False
             # Timed out — force-terminate prefetch and let the request through
             # with storage_hit_length=0 to avoid decode-side bootstrap timeout.
