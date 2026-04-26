@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
@@ -294,19 +295,23 @@ class HostKVCache(abc.ABC):
         idx = np.unique(idx)
         mask = (idx >= 0) & (idx < self.size) & (self._slot_state[np.clip(idx, 0, self.size - 1)] == 0)
         if int(mask.sum()) != len(idx):
-            import traceback as _tb
-            n_dup = len(idx) - int(mask.sum())
-            bad = idx[~mask][:8].tolist()
-            caller = " -> ".join(
-                f"{f.filename.split('/')[-1]}:{f.lineno}:{f.name}"
-                for f in _tb.extract_stack(limit=6)[:-1]
-            )
-            logger.error(
-                "[HostPoolDoubleFree] filtered %d/%d slots, "
-                "free_slots_len=%d pool_size=%d sample=%s caller=[%s]",
-                n_dup, len(idx), len(self.free_slots), self.size,
-                bad, caller,
-            )
+            # Rate-limit expensive logging to at most once per 60s.
+            now = time.monotonic()
+            if now - getattr(self, "_last_double_free_log", 0.0) >= 60.0:
+                self._last_double_free_log = now
+                import traceback as _tb
+                n_dup = len(idx) - int(mask.sum())
+                bad = idx[~mask][:8].tolist()
+                caller = " -> ".join(
+                    f"{f.filename.split('/')[-1]}:{f.lineno}:{f.name}"
+                    for f in _tb.extract_stack(limit=6)[:-1]
+                )
+                logger.error(
+                    "[HostPoolDoubleFree] filtered %d/%d slots, "
+                    "free_slots_len=%d pool_size=%d sample=%s caller=[%s]",
+                    n_dup, len(idx), len(self.free_slots), self.size,
+                    bad, caller,
+                )
         actual = idx[mask]
         if len(actual) > 0:
             self._slot_state[actual] = 1

@@ -2988,6 +2988,7 @@ class HiRadixCache(RadixCache):
                 self.pp_staged_prefetch_skip_req_ids.discard(req_id)
                 last_host_node.release_host()
                 self._publish_pp0_prefetch_skip(req_id)
+                self._record_prefetch_skip("deferred_stale_req")
                 continue
             # Validate anchor node is still valid: check that the recorded
             # last_hash still matches the anchor.  The anchor can become stale
@@ -3016,6 +3017,7 @@ class HiRadixCache(RadixCache):
                         )
                     )
                 self._publish_pp0_prefetch_skip(req_id)
+                self._record_prefetch_skip("deferred_anchor_stale")
                 continue
             # After drain_host_release_queue_synchronized and
             # flush_deferred_write_backup, both PP ranks have identical host
@@ -3032,6 +3034,7 @@ class HiRadixCache(RadixCache):
                     aligned_tokens=prefetch_length,
                 )
                 self._publish_pp0_prefetch_skip(req_id)
+                self._record_prefetch_skip("deferred_host_alloc_failed")
                 continue
             self._issue_prefetch_impl(
                 req_id=req_id,
@@ -3370,7 +3373,7 @@ class HiRadixCache(RadixCache):
         cc = self.cache_controller
         with cc._pp0_storage_hit_cond:
             existing = cc.pp0_storage_hit_results.get(req_id)
-            if existing is not None and existing[0] > 0:
+            if existing is not None:
                 return
             cc.pp0_storage_hit_results[req_id] = (0, None, 0)
             cc._pp0_storage_hit_cond.notify_all()
