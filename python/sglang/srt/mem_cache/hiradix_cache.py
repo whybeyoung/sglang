@@ -259,6 +259,12 @@ class HiRadixCache(RadixCache):
         self._in_pp_host_tree_replay = False
         self._pp_write_ack_budget_from_upstream: Optional[int] = None
         self._pp_last_write_ack_consumed: int = 0
+        # Low-frequency prefetch decision counters (reset every summary interval).
+        self._prefetch_diag_issued: int = 0
+        self._prefetch_diag_skipped: int = 0
+        self._prefetch_diag_deferred: int = 0
+        self._prefetch_diag_skip_reasons: Dict[str, int] = {}
+        self._prefetch_diag_last_log: float = 0.0
         # Deferred prefetch evict+alloc: in PP>1 mode, when prefetch_from_storage
         # needs to evict host nodes to allocate space, the eviction is deferred
         # until the next batch loop iteration (after logical_clock sync) to ensure
@@ -2878,6 +2884,7 @@ class HiRadixCache(RadixCache):
             prefix_keys,
             **self._get_extra_pools(),
         )
+        self._record_prefetch_issued()
         issue_idx = self.prefetch_issue_count_by_reqid.get(req_id, 0) + 1
         self.prefetch_issue_count_by_reqid[req_id] = issue_idx
         if os.getenv("SGLANG_DEBUG_PP_PREFETCH_TRACE", "0") == "1":
@@ -3287,6 +3294,66 @@ class HiRadixCache(RadixCache):
             host_hit_length=host_hit_length,
         )
 
+    def _record_prefetch_skip(self, reason: str):
+        self._prefetch_diag_skipped += 1
+        self._prefetch_diag_skip_reasons[reason] = (
+            self._prefetch_diag_skip_reasons.get(reason, 0) + 1
+        )
+
+    def _record_prefetch_issued(self):
+        self._prefetch_diag_issued += 1
+
+    def _record_prefetch_deferred(self):
+        self._prefetch_diag_deferred += 1
+
+    def _maybe_log_prefetch_diag_summary(self):
+        """Emit a low-frequency summary of prefetch decisions (~every 30s).
+
+        Uses the prefix [PrefetchDiag] which is NOT filtered by
+        _HiCacheDebugFilter, so it always appears in production logs.
+        """
+        now = time.monotonic()
+        if now - self._prefetch_diag_last_log < 30.0:
+            return
+        total = (
+            self._prefetch_diag_issued
+            + self._prefetch_diag_skipped
+            + self._prefetch_diag_deferred
+        )
+        if total == 0 and self._prefetch_diag_last_log > 0:
+            return
+        host_free = -1
+        host_size = -1
+        try:
+            cc = self.cache_controller
+            pool = getattr(cc, "mem_pool_host", None)
+            if pool is not None:
+                host_free = pool.available_size()
+                host_size = pool.size
+        except Exception:
+            pass
+        logger.warning(
+            "[PrefetchDiag] pp=%s cp=%s interval=%.0fs issued=%s skipped=%s "
+            "deferred=%s skip_reasons=%s ongoing=%s backpressure_depth=%s "
+            "host_free=%s/%s",
+            self.pp_rank,
+            self.attn_cp_rank,
+            now - self._prefetch_diag_last_log if self._prefetch_diag_last_log > 0 else 0,
+            self._prefetch_diag_issued,
+            self._prefetch_diag_skipped,
+            self._prefetch_diag_deferred,
+            self._prefetch_diag_skip_reasons,
+            len(self.ongoing_prefetch),
+            self._prefetch_backpressure_depth,
+            host_free,
+            host_size,
+        )
+        self._prefetch_diag_issued = 0
+        self._prefetch_diag_skipped = 0
+        self._prefetch_diag_deferred = 0
+        self._prefetch_diag_skip_reasons.clear()
+        self._prefetch_diag_last_log = now
+
     def _publish_pp0_prefetch_skip(self, req_id: str):
         """Publish a zero-hit result to pp0_storage_hit_results so PP1's
         prefetch_thread can wake up and revoke immediately instead of
@@ -3316,6 +3383,7 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
+        self._maybe_log_prefetch_diag_summary()
         self.pp_authoritative_revoked_req_ids.discard(req_id)
         if req_id in self.zero_hit_prefetch_req_ids:
             # This request already proved to have no storage benefit on this pass.
@@ -3328,6 +3396,7 @@ class HiRadixCache(RadixCache):
                 self.prefetch_threshold,
             )
             self._publish_pp0_prefetch_skip(req_id)
+            self._record_prefetch_skip("zero_hit_marked")
             return
 
         new_input_tokens = (
@@ -3349,6 +3418,7 @@ class HiRadixCache(RadixCache):
                 self.prefetch_threshold,
             )
             self._publish_pp0_prefetch_skip(req_id)
+            self._record_prefetch_skip("storage_disabled")
             return
         if prefetch_length < self.prefetch_threshold:
             logger.warning(
@@ -3367,6 +3437,7 @@ class HiRadixCache(RadixCache):
                     )
                 )
             self._publish_pp0_prefetch_skip(req_id)
+            self._record_prefetch_skip("below_threshold")
             return
         if self._pp_should_skip_large_shallow_prefetch(
             last_host_node, prefetch_length
@@ -3389,6 +3460,7 @@ class HiRadixCache(RadixCache):
                 )
             )
             self._publish_pp0_prefetch_skip(req_id)
+            self._record_prefetch_skip("large_shallow")
             return
         if self.cache_controller.prefetch_rate_limited():
             logger.warning(
@@ -3408,6 +3480,7 @@ class HiRadixCache(RadixCache):
                     )
                 )
             self._publish_pp0_prefetch_skip(req_id)
+            self._record_prefetch_skip("rate_limited")
             return
         if (
             self._prefetch_skip_threshold > 0
@@ -3432,6 +3505,7 @@ class HiRadixCache(RadixCache):
                     )
                 )
             self._publish_pp0_prefetch_skip(req_id)
+            self._record_prefetch_skip("bootstrap_backpressure")
             return
 
         last_host_node.protect_host()
@@ -3459,6 +3533,7 @@ class HiRadixCache(RadixCache):
                 self.cache_controller.prefetch_tokens_occupied,
                 len(self._deferred_prefetch_evict_items),
             )
+            self._record_prefetch_deferred()
             return
 
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
