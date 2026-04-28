@@ -58,6 +58,8 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPoo
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 

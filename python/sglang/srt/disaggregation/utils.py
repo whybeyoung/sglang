@@ -14,6 +14,8 @@ import torch.distributed as dist
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
+from python.sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs
     from sglang.srt.disaggregation.common.conn import (
@@ -565,10 +567,10 @@ def setup_state_kv_args(
         # Get state dimension info for cross-TP slice transfer
         if hasattr(token_to_kv_pool, "get_state_dim_per_tensor"):
             kv_args.state_dim_per_tensor = token_to_kv_pool.get_state_dim_per_tensor()
-    elif isinstance(token_to_kv_pool, NSATokenToKVPool):
+    elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
         kv_args.state_type = "nsa"
         if draft_token_to_kv_pool is not None and isinstance(
-            draft_token_to_kv_pool, NSATokenToKVPool
+            draft_token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)
         ):
             (
                 draft_state_data_ptrs,
