@@ -293,17 +293,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_state_buf_infos(self):
-        data_ptrs = [
-            self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
-        ]
-        data_lens = [
-            self.index_k_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        item_lens = [
-            self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
+        data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
+        data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
         return data_ptrs, data_lens, item_lens
-
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:

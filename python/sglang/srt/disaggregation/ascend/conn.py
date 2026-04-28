@@ -55,9 +55,11 @@ class AscendKVManager(MooncakeKVManager):
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
             k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            v_ptrs = dst_kv_ptrs[total_layers + start_layer: total_layers + end_layer]
+            v_ptrs = dst_kv_ptrs[total_layers + start_layer : total_layers + end_layer]
             if self.kv_args.state_type == "nsa":
-                index_k_ptrs = dst_kv_ptrs[2 * total_layers + start_layer: 2 * total_layers + end_layer]
+                index_k_ptrs = dst_kv_ptrs[
+                    2 * total_layers + start_layer : 2 * total_layers + end_layer
+                ]
                 sliced_dst_kv_ptrs = k_ptrs + v_ptrs + index_k_ptrs
             else:
                 sliced_dst_kv_ptrs = k_ptrs + v_ptrs
@@ -80,7 +82,9 @@ class AscendKVManager(MooncakeKVManager):
 
         if self.pp_size > 1:
             if self.is_mla_backend:
-                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                )
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -90,9 +94,13 @@ class AscendKVManager(MooncakeKVManager):
                     for layer_id in range(layers_current_pp_stage)
                 ]
             else:
-                src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                    self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-                )
+                (
+                    src_k_ptrs,
+                    src_v_ptrs,
+                    dst_k_ptrs,
+                    dst_v_ptrs,
+                    layers_current_pp_stage,
+                ) = self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
 
                 layers_params = [
                     (
