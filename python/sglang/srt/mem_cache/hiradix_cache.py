@@ -93,11 +93,6 @@ class PPHostTreeEvent:
     kind: str
     rid: Optional[str] = None
     loaded_from_storage: int = 0
-    # PP cross-rank MIN of completed_tokens (after vote consensus).
-    # Carried on PREFETCH_FINALIZE so PP1 uses the same authoritative value
-    # PP0 already used to write its host tree. Falls back to local on None
-    # for backward compatibility with old logs/replay paths.
-    pp_min_completed_tokens: Optional[int] = None
     node_ids: List[int] = field(default_factory=list)
     node_key_lens: List[int] = field(default_factory=list)
     node_last_hashes: List[Optional[str]] = field(default_factory=list)
@@ -252,36 +247,6 @@ class HiRadixCache(RadixCache):
         self.pp_host_tree_event_seq = 0
         self.pp_outgoing_host_tree_events: List[dict[str, Any]] = []
         self.pp_pending_host_tree_events: Deque[PPHostTreeEvent] = deque()
-        # Cross-PP vote tables for prefetch finalize consensus.
-        # Each PP rank stashes its LOCAL post-TP-MIN completed_tokens in
-        # _pp_local_prefetch_votes when its IO is observed to be terminable.
-        # Peer votes from every other PP rank arrive via PIGGYBACK on the
-        # existing scheduler ring messages — no dedicated channel:
-        #   * Forward direction (PP_i → PP_{i+1}, i<last): votes ride on
-        #     _pp_build_req_payload (the dict already carrying recv_reqs +
-        #     hicache_host_tree_events + pp0_storage_hits).
-        #   * Ring-close (PP_last → PP_0): votes ride on the existing
-        #     `consensus_bootstrapped` pyobj — see
-        #     `_pp_pd_send_consensus_bootstrapped_ids` /
-        #     `_pp_pd_wrap_cb_with_votes`.  We deliberately picked a message
-        #     already gated by the prefill-disagg ring-close instead of
-        #     `_pp_pack_release_payload` to avoid FIFO corruption with the
-        #     release pyobj's own conditional traffic.
-        # _pp_peer_prefetch_votes maps rid -> {peer_rank -> completed_tokens}.
-        # PP_0 only commits the host tree write after it has votes from ALL
-        # pp_size-1 peers and uses MIN(local, MIN(peers)) so a transient L3
-        # transfer failure on any side symmetrically downgrades to "no L3
-        # hit" instead of diverging the tree.  Because the ring naturally
-        # forwards votes accumulated from prior ranks, this scheme stays
-        # generic for pp_size > 2 with no rank-specific code paths.
-        self._pp_local_prefetch_votes: dict[str, int] = {}
-        self._pp_peer_prefetch_votes: dict[str, dict[int, int]] = {}
-        # Reverse-bookkeeping: track which rids' local vote we have already
-        # broadcast at least once on the ring.  This lets us drop them from
-        # the outbound snapshot after the round trip (avoid forwarding stale
-        # votes forever) while still allowing PP0 to use them locally until
-        # consume_pp_finalize_consensus is called on commit.
-        self._pp_local_prefetch_votes_broadcasted: set[str] = set()
         self.pp_deferred_revoke_req_ids: Deque[tuple[str, bool]] = deque()
         self.pp_locally_revoked_req_ids: set[str] = set()
         self.pp_locally_revoked_req_queue: Deque[str] = deque()
@@ -620,28 +585,6 @@ class HiRadixCache(RadixCache):
         except Exception:
             logger.exception("Force release deferred write_backup items failed.")
 
-        # Drop any deferred finalize / cross-PP vote bookkeeping; storage
-        # threads are gone so there is nothing to commit.  Keeping these
-        # would deadlock the next attach (PP_0 would still wait on a
-        # consensus that can never arrive).
-        try:
-            self._deferred_finalize_rids.clear()
-            self._pp_local_prefetch_votes.clear()
-            self._pp_peer_prefetch_votes.clear()
-            self._pp_local_prefetch_votes_broadcasted.clear()
-        except Exception:
-            logger.exception("Force release deferred finalize state failed.")
-
-        # Drop pending PP host-tree events too: any unreplayed
-        # PREFETCH_FINALIZE / REVOKE / WRITE_BACKUP_COMMITTED / etc. would
-        # be applied against an empty host tree after re-attach, leading
-        # to spurious shape mismatches.
-        try:
-            self.pp_outgoing_host_tree_events.clear()
-            self.pp_pending_host_tree_events.clear()
-        except Exception:
-            logger.exception("Force release pending PP host-tree events failed.")
-
         # Force release leftover backup ops: drop host protection on nodes.
         try:
             for ack_id, node in list(self.ongoing_backup.items()):
@@ -869,143 +812,9 @@ class HiRadixCache(RadixCache):
         self.pp_zero_hit_deferred_req_ids.clear()
         self.pp_zero_hit_pending_promote_req_ids.clear()
         self._deferred_finalize_rids.clear()
-        self._pp_local_prefetch_votes.clear()
-        self._pp_peer_prefetch_votes.clear()
-        self._pp_local_prefetch_votes_broadcasted.clear()
         self._deferred_prefetch_evict_items.clear()
         self._deferred_write_backup_items.clear()
         super().reset()
-
-    # =====================================================================
-    # PP cross-rank prefetch finalize vote helpers
-    # =====================================================================
-    # Design: each PP rank computes its post-TP-MIN completed_tokens locally
-    # when its prefetch IO is observed terminable.  Both ranks then exchange
-    # votes via the scheduler PP loop and commit the host tree using
-    # MIN(local, peer).  This makes the host tree update deterministic across
-    # PP even when the L3 storage backend has a transient transfer failure
-    # on one side: both ranks symmetrically downgrade to "no L3 hit" instead
-    # of diverging.
-
-    def record_local_prefetch_vote(self, req_id: str, completed_tokens: int) -> None:
-        """Stash this rank's post-TP-MIN completed_tokens for cross-PP MIN.
-
-        Called by check_prefetch_progress / replay paths once
-        can_terminate_prefetch returns True and the local TP-MIN is computed.
-        Idempotent: subsequent calls with the same rid keep the first value
-        because the operation has already been TP-MIN'd to a stable result.
-        """
-        if self.pp_size <= 1 or not self.enable_storage:
-            return
-        if req_id in self._pp_local_prefetch_votes:
-            return
-        self._pp_local_prefetch_votes[req_id] = int(completed_tokens)
-        # New vote: clear the "broadcasted" mark so it is included in the
-        # next outbound piggyback snapshot.
-        self._pp_local_prefetch_votes_broadcasted.discard(req_id)
-
-    def record_peer_prefetch_vote(
-        self,
-        req_id: str,
-        completed_tokens: int,
-        peer_rank: int,
-    ) -> None:
-        """Apply a peer's vote for `req_id` (called by scheduler after recv).
-
-        Per-peer slot to support pp_size > 2.  Subsequent reports from the
-        same peer keep the MIN — defensive against ring-forwarded duplicates
-        that might race a fresh local recompute on the originating rank.
-        """
-        if self.pp_size <= 1 or not self.enable_storage:
-            return
-        peer_rank = int(peer_rank)
-        if peer_rank == self.pp_rank or not (0 <= peer_rank < self.pp_size):
-            return
-        table = self._pp_peer_prefetch_votes.setdefault(req_id, {})
-        value = int(completed_tokens)
-        if peer_rank in table:
-            table[peer_rank] = min(table[peer_rank], value)
-        else:
-            table[peer_rank] = value
-
-    def apply_peer_prefetch_votes(self, votes: Optional[dict]) -> None:
-        """Apply a piggyback votes dict received from another rank.
-
-        Accepts both the canonical {rid: {peer_rank: completed_tokens}} form
-        and the legacy flat {rid: completed_tokens} form (treated as coming
-        from the previous rank in the ring).  No-op for pp_size <= 1.
-        """
-        if not votes or self.pp_size <= 1 or not self.enable_storage:
-            return
-        prev_rank = (self.pp_rank - 1) % self.pp_size
-        for rid, payload in votes.items():
-            if isinstance(payload, dict):
-                for peer_rank, tokens in payload.items():
-                    self.record_peer_prefetch_vote(
-                        rid, int(tokens), int(peer_rank)
-                    )
-            else:
-                # Legacy flat encoding — attribute to the immediate sender.
-                self.record_peer_prefetch_vote(rid, int(payload), prev_rank)
-
-    def has_pp_finalize_consensus(self, req_id: str) -> bool:
-        """True iff local AND votes from ALL pp_size-1 peers are available."""
-        if self.pp_size <= 1 or not self.enable_storage:
-            return True
-        if req_id not in self._pp_local_prefetch_votes:
-            return False
-        peers = self._pp_peer_prefetch_votes.get(req_id, {})
-        return len(peers) >= (self.pp_size - 1)
-
-    def get_pp_consensus_completed_tokens(self, req_id: str) -> int:
-        """MIN over local + every recorded peer vote.
-
-        For pp_size > 2 the caller is expected to verify
-        has_pp_finalize_consensus() first; otherwise the MIN may reflect a
-        partial subset of peers.
-        """
-        if self.pp_size <= 1 or not self.enable_storage:
-            return int(self._pp_local_prefetch_votes.get(req_id, 0))
-        local = int(self._pp_local_prefetch_votes.get(req_id, 0))
-        peers = self._pp_peer_prefetch_votes.get(req_id, {})
-        if not peers:
-            return local
-        return min(local, min(int(v) for v in peers.values()))
-
-    def consume_pp_finalize_consensus(self, req_id: str) -> None:
-        """Drop all vote entries after the consensus has been applied."""
-        self._pp_local_prefetch_votes.pop(req_id, None)
-        self._pp_peer_prefetch_votes.pop(req_id, None)
-        self._pp_local_prefetch_votes_broadcasted.discard(req_id)
-
-    def snapshot_pp_prefetch_votes_for_piggyback(self) -> dict:
-        """Return a {rid: {peer_rank: completed_tokens}} dict for piggyback.
-
-        Includes:
-          * this rank's own pending local votes (under self.pp_rank), so the
-            next ring stage learns about them;
-          * peer votes already received via prior ring hops, so they keep
-            propagating to ranks downstream that have not yet seen them.
-
-        After this call, the local-vote rids are marked "broadcasted" so
-        repeated emissions are suppressed; they are re-armed automatically
-        when consume_pp_finalize_consensus drops the rid.
-        """
-        if self.pp_size <= 1 or not self.enable_storage:
-            return {}
-        out: dict[str, dict[int, int]] = {}
-        for rid, peer_table in self._pp_peer_prefetch_votes.items():
-            if peer_table:
-                out[rid] = dict(peer_table)
-        for rid, value in self._pp_local_prefetch_votes.items():
-            slot = out.setdefault(rid, {})
-            slot[self.pp_rank] = int(value)
-            self._pp_local_prefetch_votes_broadcasted.add(rid)
-        return out
-
-    # Backward-compat alias used by older callers.
-    def snapshot_local_prefetch_votes(self) -> dict[str, int]:
-        return dict(self._pp_local_prefetch_votes)
 
     def _pp_downstream_sync_enabled(self) -> bool:
         # NOTE: misnomer for historical reasons.  This actually means "I have
@@ -1129,16 +938,6 @@ class HiRadixCache(RadixCache):
                 "kind": event.kind,
                 "rid": event.rid,
                 "loaded_from_storage": event.loaded_from_storage,
-                # Authoritative cross-PP MIN attached by PP_0 on
-                # PREFETCH_FINALIZE.  MUST be serialized through the dict
-                # round-trip so downstream ranks replay the same value
-                # PP_0 used to write its host tree (see
-                # `_finalize_prefetch_progress` /
-                # `_try_replay_prefetch_finalize_event`).  Otherwise
-                # downstream replays with `None` and falls back to its
-                # local completed_tokens, breaking the deterministic
-                # cross-PP host tree contract.
-                "pp_min_completed_tokens": event.pp_min_completed_tokens,
                 "node_ids": list(event.node_ids),
                 "node_key_lens": list(event.node_key_lens),
                 "node_last_hashes": list(event.node_last_hashes),
@@ -1199,19 +998,12 @@ class HiRadixCache(RadixCache):
                 and not self._pp_write_backup_replay_enabled()
             ):
                 continue
-            # Restore the cross-PP MIN override emitted by PP_0.  Default
-            # to None for backward compatibility with old payloads (the
-            # consumer treats None as "no override → use local value").
-            pp_min_raw = event.get("pp_min_completed_tokens", None)
             self.pp_pending_host_tree_events.append(
                 PPHostTreeEvent(
                     seq=int(event.get("seq", 0)),
                     kind=str(event["kind"]),
                     rid=event.get("rid"),
                     loaded_from_storage=int(event.get("loaded_from_storage", 0)),
-                    pp_min_completed_tokens=(
-                        None if pp_min_raw is None else int(pp_min_raw)
-                    ),
                     node_ids=[int(v) for v in event.get("node_ids", [])],
                     node_key_lens=[int(v) for v in event.get("node_key_lens", [])],
                     node_last_hashes=list(event.get("node_last_hashes", [])),
@@ -1366,18 +1158,6 @@ class HiRadixCache(RadixCache):
         # scheduling for the same req.
         self.discard_pp_locally_revoked_req(req_id)
         self.zero_hit_prefetch_req_ids.discard(req_id)
-        # Drop any stale finalize-consensus state from a previous attempt so
-        # the retry's fresh vote (and peer votes) are not shadowed by the
-        # vote=0 we recorded during the revoke that triggered this retry.
-        # `record_local_prefetch_vote` is idempotent on first-write, so we
-        # MUST clear here for the next attempt to take effect.
-        if self.pp_size > 1 and self.enable_storage:
-            if req_id in self._deferred_finalize_rids:
-                try:
-                    self._deferred_finalize_rids.remove(req_id)
-                except ValueError:
-                    pass
-            self.consume_pp_finalize_consensus(req_id)
         return True
 
     def _pop_pp_host_tree_event(self) -> Optional[PPHostTreeEvent]:
@@ -1408,43 +1188,6 @@ class HiRadixCache(RadixCache):
             if self.cache_controller.prefetch_tokens_occupied < 0:
                 self.cache_controller.prefetch_tokens_occupied = 0
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
-        # Anti-deadlock for cross-PP finalize consensus.
-        # When a request is locally revoked (zero-hit, abort, transfer
-        # failure, force-release), this rank will never reach the
-        # PREFETCH_FINALIZE path and therefore never call
-        # `_stash_local_prefetch_vote` /
-        # `_maybe_stash_replay_wait_local_vote` for this rid.  Without an
-        # explicit vote signal, PP_0 (which may already have its own
-        # successful finalize stashed in `_deferred_finalize_rids`) would
-        # wait forever in `has_pp_finalize_consensus()`.
-        #
-        # We resolve this by:
-        #   1) Recording a local vote of 0 — ride this rank's piggyback
-        #      to peers so PP_0's MIN(local, peer)=0 downgrades to "no L3
-        #      hit" symmetrically, matching the design's transient-failure
-        #      contract.
-        #   2) Dropping the rid from this rank's own `_deferred_finalize_rids`
-        #      defensively — if this is PP_0 self-revoking, the deferred
-        #      flush would otherwise spin re-checking consensus until the
-        #      `ongoing_prefetch` short-circuit on the next iteration.
-        #   3) Clearing any peer-vote entries we have already received for
-        #      this rid via `consume_pp_finalize_consensus`, BEFORE writing
-        #      the vote=0 — `record_local_prefetch_vote` is first-write
-        #      idempotent, so we must drop the stale local vote first or
-        #      the new 0 would be silently ignored.  This also cleans the
-        #      "broadcasted" mark so the new 0 is included in the next
-        #      outbound piggyback snapshot.  Note: `consume_pp_retry_prefetch_req`
-        #      is a defensive helper for a future same-rid retry pathway
-        #      and currently has no caller; per-attempt cleanup is provided
-        #      here at every terminal site.
-        if self.pp_size > 1 and self.enable_storage:
-            if req_id in self._deferred_finalize_rids:
-                try:
-                    self._deferred_finalize_rids.remove(req_id)
-                except ValueError:
-                    pass
-            self.consume_pp_finalize_consensus(req_id)
-            self.record_local_prefetch_vote(req_id, 0)
         if zero_hit:
             self.zero_hit_prefetch_req_ids.add(req_id)
             if mark_local_revoke and self._pp_downstream_sync_enabled():
@@ -1523,21 +1266,6 @@ class HiRadixCache(RadixCache):
         self._drop_deferred_prefetch_req(req_id)
         self.discard_pp_locally_revoked_req(req_id)
         self._purge_matching_local_revoke_residue(req_id)
-        # PP finalize consensus bookkeeping: terminal cleanup must drop any
-        # leftover deferred-finalize entry and vote-table entries for this
-        # rid.  This is the last-resort safety net — `_drain_single_revoke_req`
-        # and `flush_deferred_finalizes` already clear them on the normal
-        # paths, but a request reaching the finished/abort terminal path
-        # without first going through revoke (e.g. successful prefill with
-        # later abort) could otherwise leave dangling votes that confuse a
-        # subsequent rid collision.
-        if self.pp_size > 1 and self.enable_storage:
-            if req_id in self._deferred_finalize_rids:
-                try:
-                    self._deferred_finalize_rids.remove(req_id)
-                except ValueError:
-                    pass
-            self.consume_pp_finalize_consensus(req_id)
 
     def release_finished_request(self, rid: str) -> None:
         self._release_request_ephemeral_state(rid)
@@ -1919,24 +1647,8 @@ class HiRadixCache(RadixCache):
         return True
 
     def _finalize_prefetch_progress(
-        self,
-        req_id: str,
-        operation: PrefetchOperation,
-        emit_event: bool,
-        *,
-        pp_min_completed_tokens_override: Optional[int] = None,
+        self, req_id: str, operation: PrefetchOperation, emit_event: bool
     ) -> int:
-        """Commit one finalized prefetch into the host tree.
-
-        Args:
-            req_id, operation: the prefetch slot to finalize.
-            emit_event: emit PREFETCH_FINALIZE downstream (PP0 only path).
-            pp_min_completed_tokens_override: cross-PP consensus MIN obtained
-                from the vote exchange.  When provided, the actual host tree
-                write uses MIN(local_post_tp, override) so all PP ranks write
-                the same number of tokens regardless of per-rank L3 transfer
-                outcome.  None disables the override (legacy behaviour).
-        """
         orig_last_host_node, token_ids, host_indices, _ = self.ongoing_prefetch[req_id]
         last_host_node = orig_last_host_node
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
@@ -1963,26 +1675,6 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
             min_completed_tokens = completed_tokens_tensor.item()
-
-        # Cross-PP MIN: when a vote consensus is provided, downgrade the
-        # write to MIN(local_tp_min, peer_tp_min) so both PP ranks insert
-        # the exact same prefix length into the host tree.  This is the
-        # critical step that prevents host tree divergence when the L3
-        # transfer succeeds on one PP rank and fails on the other.
-        if (
-            self.pp_size > 1
-            and pp_min_completed_tokens_override is not None
-            and pp_min_completed_tokens_override < min_completed_tokens
-        ):
-            logger.warning(
-                "[HiCacheDiag][_finalize_prefetch_progress][pp_consensus_downgrade] "
-                "rid=%s local_tp_min=%s pp_consensus=%s pp=%s",
-                req_id,
-                min_completed_tokens,
-                pp_min_completed_tokens_override,
-                self.pp_rank,
-            )
-            min_completed_tokens = int(pp_min_completed_tokens_override)
 
         # The prefetch thread may have trimmed operation.token_ids and
         # operation.host_indices when PP1 aligns its token range to PP0's
@@ -2126,10 +1818,6 @@ class HiRadixCache(RadixCache):
                     kind="PREFETCH_FINALIZE",
                     rid=req_id,
                     loaded_from_storage=loaded_from_storage,
-                    # Carry the authoritative cross-PP MIN we just used to
-                    # write the host tree.  PP1's replay path uses this as
-                    # the override so its host tree write is bit-identical.
-                    pp_min_completed_tokens=int(min_completed_tokens),
                 )
             )
         if self.enable_storage_metrics:
@@ -2231,31 +1919,19 @@ class HiRadixCache(RadixCache):
                 self.attn_cp_rank,
             )
             return False
-        # PP1: use PP0's authoritative pp_min_completed_tokens as override
-        # so the host tree write is bit-identical to PP0's regardless of
-        # PP1's own L3 transfer outcome.  Old events without this field
-        # (mixed-version rolling upgrade) gracefully fall back to None,
-        # which keeps the legacy local-only behaviour for those entries.
         loaded_from_storage = self._finalize_prefetch_progress(
-            req_id,
-            operation,
-            emit_event=True,
-            pp_min_completed_tokens_override=event.pp_min_completed_tokens,
+            req_id, operation, emit_event=True
         )
         if loaded_from_storage != event.loaded_from_storage:
             logger.warning(
                 "[PPHiCacheSync] prefetch finalize mismatch: rid=%s upstream=%s local=%s "
-                "pp_min_override=%s pp=%s cp=%s",
+                "pp=%s cp=%s",
                 req_id,
                 event.loaded_from_storage,
                 loaded_from_storage,
-                event.pp_min_completed_tokens,
                 self.pp_rank,
                 self.attn_cp_rank,
             )
-        # Drop any vote entries we may have stashed for this rid: the
-        # consensus path is now authoritative and we don't need them.
-        self.consume_pp_finalize_consensus(req_id)
         return True
 
     def replay_pp_host_tree_events(self) -> int:
@@ -3051,13 +2727,6 @@ class HiRadixCache(RadixCache):
             if req_id in self.ongoing_prefetch:
                 _, _, _, op = self.ongoing_prefetch[req_id]
                 if op.host_indices is not None:
-                    # Cross-PP MIN: opportunistically publish PP1's local
-                    # post-TP-MIN vote so PP0 can compute consensus.  Done
-                    # only when the local IO appears complete or terminated
-                    # to avoid publishing premature 0-token votes.  All TP
-                    # workers in this PP rank reach this code path together
-                    # (collective-safe).
-                    self._maybe_stash_replay_wait_local_vote(req_id, op)
                     wait_age = time.monotonic() - op.start_time
                     pending_head = self._peek_pp_host_tree_event()
                     if wait_age > 5.0:
@@ -3084,24 +2753,7 @@ class HiRadixCache(RadixCache):
         ]
 
         if operation.host_indices is None:
-            # prefetch has not been issued due to insufficient host memory.
-            # Anti-deadlock: this rank will not produce a finalize event, so
-            # publish a vote=0 to peers via piggyback so PP_0 (which may
-            # have a successful prefetch and be sitting in
-            # `_deferred_finalize_rids`) does not hang in
-            # `has_pp_finalize_consensus()`.  We MUST clear any stale
-            # consensus state first because `record_local_prefetch_vote`
-            # is first-write idempotent — a positive vote left over from a
-            # prior attempt would otherwise shadow the vote=0 we want to
-            # publish here.
-            if self.pp_size > 1 and self.enable_storage:
-                if req_id in self._deferred_finalize_rids:
-                    try:
-                        self._deferred_finalize_rids.remove(req_id)
-                    except ValueError:
-                        pass
-                self.consume_pp_finalize_consensus(req_id)
-                self.record_local_prefetch_vote(req_id, 0)
+            # prefetch has not been issued due to insufficient host memory
             return True
 
         logger.warning(
@@ -3141,35 +2793,6 @@ class HiRadixCache(RadixCache):
         if self.pp_size > 1 and self.pp_rank == 0:
             if req_id not in self._deferred_finalize_rids:
                 self._deferred_finalize_rids.append(req_id)
-            # Stash the local TP-MIN vote NOW (before deferred flush) so the
-            # scheduler can forward it to downstream ranks in this iteration's
-            # piggy-back round (`_pp_build_req_payload`).  The actual finalize
-            # waits until every peer's reciprocal vote arrives — handled by
-            # flush_deferred_finalizes after the batch loop.
-            self._stash_local_prefetch_vote(req_id, operation)
-            # RC1 (timing) gate: PP_0 must NOT advance the request into the
-            # batch until cross-PP consensus is reached.  Otherwise PP_0 picks
-            # the request and runs forward while downstream ranks are still
-            # blocked waiting for PREFETCH_FINALIZE — that is exactly the
-            # pipeline-offset condition that produces the proxy-tensor shape
-            # mismatch crash.  Holding the request in waiting_queue until
-            # has_pp_finalize_consensus() turns true keeps PP_0's progress
-            # bounded by the slowest peer's vote arrival, so once it does
-            # advance, every downstream rank also has the authoritative
-            # finalize event available within the natural PP pipeline depth.
-            if not self.has_pp_finalize_consensus(req_id):
-                logger.warning(
-                    "[HiCachePrefetchWaitBlocked][pp0] rid=%s "
-                    "reason=awaiting_pp_consensus local_vote=%s peer_votes=%s",
-                    req_id,
-                    self._pp_local_prefetch_votes.get(req_id),
-                    list(self._pp_peer_prefetch_votes.get(req_id, {}).keys()),
-                )
-                return False
-            # Consensus has been reached: fall through and let the
-            # post-batch-loop flush_deferred_finalizes commit the host tree
-            # write with the authoritative MIN.  The request is now safe to
-            # be picked into the current iteration's batch.
         else:
             self._finalize_prefetch_progress(req_id, operation, emit_event=True)
             if self._pp_downstream_sync_enabled():
@@ -3183,149 +2806,26 @@ class HiRadixCache(RadixCache):
 
         return True
 
-    def _maybe_stash_replay_wait_local_vote(
-        self, req_id: str, operation: PrefetchOperation
-    ) -> None:
-        """Stash this rank's local vote while waiting for PP0's PREFETCH_FINALIZE.
-
-        Generic for any non-zero PP rank — called from
-        check_prefetch_progress's wait-for-PP0-event path so each downstream
-        rank publishes its post-TP-MIN completed_tokens without first
-        observing PP0's authoritative event.  Gated on the local IO being
-        either marked terminated by the IO thread (e.g. transfer failure)
-        or having reached the expected completed_tokens, to avoid publishing
-        a stale 0-token vote while the IO is still in-flight.
-
-        TP all-reduce inside is collective-safe because every TP worker in
-        this PP rank reaches this branch on the same scheduler tick
-        (check_prefetch_progress is invoked uniformly across TP).
-        """
-        if not (self.pp_size > 1 and self.pp_rank > 0 and self.enable_storage):
-            return
-        if req_id in self._pp_local_prefetch_votes:
-            return
-        # Only stash once the IO outcome is observable.  An in-flight op
-        # whose completed_tokens has not yet caught up is still mutating;
-        # publishing it now would be premature.
-        expected_tokens = len(operation.hash_value) * self.page_size
-        is_complete = (
-            expected_tokens > 0 and operation.completed_tokens >= expected_tokens
-        )
-        is_terminated = operation.is_terminated()
-        local_ready = is_complete or is_terminated
-        local_completed = int(operation.completed_tokens)
-        # TP-collective safety: every TP worker reaches this branch on the
-        # same scheduler tick (check_prefetch_progress is invoked uniformly
-        # across TP), but their local IO state may diverge transiently
-        # (e.g. one TP rank already saw is_terminated while another has
-        # not).  Gating the all-reduce on the local readiness flag would
-        # then deadlock — half the ranks call all_reduce, half skip.
-        # Solution: pack the readiness flag and completed_tokens into a
-        # single MIN-reduction.  After the reduction we agree on both:
-        # - tensor[0] == 1  iff EVERY TP rank is ready (AND via MIN);
-        # - tensor[1]       is the TP-MIN completed_tokens.
-        # This keeps the collective unconditional and turns divergent
-        # readiness into "skip recording this iteration; retry next tick".
-        if self.tp_world_size > 1:
-            tensor = torch.tensor(
-                [1 if local_ready else 0, local_completed], dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            all_ready = int(tensor[0].item()) == 1
-            local_completed = int(tensor[1].item())
-            if not all_ready:
-                return
-        elif not local_ready:
-            return
-        self.record_local_prefetch_vote(req_id, local_completed)
-        logger.warning(
-            "[HiCacheDiag][replay_wait_vote_stashed] rid=%s local_completed=%s "
-            "is_complete=%s is_terminated=%s pp=%s",
-            req_id,
-            local_completed,
-            is_complete,
-            is_terminated,
-            self.pp_rank,
-        )
-
-    def _stash_local_prefetch_vote(
-        self, req_id: str, operation: PrefetchOperation
-    ) -> None:
-        """Compute this rank's post-TP-MIN vote and stash it for PP exchange.
-
-        Mirrors the TP all-reduce inside _finalize_prefetch_progress so the
-        vote we publish is the same value we will eventually use to write
-        the host tree (modulo cross-PP MIN downgrade).  Done here, before
-        the deferred flush, so the scheduler can forward the vote on the
-        same iteration the IO completed.
-        """
-        if not (self.pp_size > 1 and self.enable_storage):
-            return
-        if req_id in self._pp_local_prefetch_votes:
-            return
-        local_completed = int(operation.completed_tokens)
-        if self.tp_world_size > 1:
-            tensor = torch.tensor(local_completed, dtype=torch.int)
-            torch.distributed.all_reduce(
-                tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            local_completed = int(tensor.item())
-        self.record_local_prefetch_vote(req_id, local_completed)
-
     def flush_deferred_finalizes(self) -> list[str]:
-        """Execute all deferred prefetch finalizes that have PP consensus.
+        """Execute all deferred prefetch finalizes.
 
         Called by the scheduler after the batch scheduling loop completes
         (i.e., after all requests' match_prefix calls are done).  This
         ensures that within a single batch, no request's match_prefix
         observes host tree nodes inserted by another request's finalize.
 
-        In PP>1 mode, a deferred rid is finalized only when both this rank
-        and the peer have voted (via record_local_prefetch_vote /
-        record_peer_prefetch_vote).  rids without a peer vote are kept on
-        the deferred list and re-checked in subsequent flushes; this is
-        what gives the cross-PP MIN protocol its determinism without
-        requiring a hard PP collective in the IO path.
-
         Returns the list of finalized request IDs so the caller can
         update storage_hit_length for those requests.
         """
         if not self._deferred_finalize_rids:
             return []
-        finalized_rids: list[str] = []
-        carry_forward: list[str] = []
+        finalized_rids = []
         for req_id in self._deferred_finalize_rids:
             if req_id not in self.ongoing_prefetch:
-                # Already cleaned up (revoke, abort, etc.).  Drop both
-                # vote entries to avoid leaks.
-                self.consume_pp_finalize_consensus(req_id)
-                continue
-            # PP>1: hold this rid until peer vote has arrived.  Without
-            # consensus we cannot safely write the host tree because we
-            # don't yet know the cross-PP MIN.
-            if self.pp_size > 1 and not self.has_pp_finalize_consensus(req_id):
-                carry_forward.append(req_id)
                 continue
             _, _, _, operation = self.ongoing_prefetch[req_id]
-            override = (
-                self.get_pp_consensus_completed_tokens(req_id)
-                if self.pp_size > 1
-                else None
-            )
-            self._finalize_prefetch_progress(
-                req_id,
-                operation,
-                emit_event=True,
-                pp_min_completed_tokens_override=override,
-            )
+            self._finalize_prefetch_progress(req_id, operation, emit_event=True)
             finalized_rids.append(req_id)
-            self.consume_pp_finalize_consensus(req_id)
             if self._pp_downstream_sync_enabled():
                 event = self._peek_pp_host_tree_event()
                 if (
@@ -3334,8 +2834,7 @@ class HiRadixCache(RadixCache):
                     and event.rid == req_id
                 ):
                     self._pop_pp_host_tree_event()
-        # Replace the deferred list with rids still awaiting peer vote.
-        self._deferred_finalize_rids = carry_forward
+        self._deferred_finalize_rids.clear()
         return finalized_rids
 
     def _log_prefetch_skip_and_sync(
@@ -4325,23 +3824,6 @@ class HiRadixCache(RadixCache):
         """
         # Mark loaded tokens as 0 so later pop returns 0.
         self.prefetch_loaded_tokens_by_reqid[req_id] = 0
-
-        # Anti-deadlock for cross-PP finalize consensus: this rank is
-        # giving up on the prefetch with storage_hit_length=0, so it
-        # symmetrically downgrades to "no L3 hit".  Without an explicit
-        # vote signal, PP_0 (which may already have a successful finalize
-        # stashed in `_deferred_finalize_rids`) would wait forever.
-        # `consume_pp_finalize_consensus` is required before
-        # `record_local_prefetch_vote(0)` because the local-vote dict is
-        # first-write idempotent.
-        if self.pp_size > 1 and self.enable_storage:
-            if req_id in self._deferred_finalize_rids:
-                try:
-                    self._deferred_finalize_rids.remove(req_id)
-                except ValueError:
-                    pass
-            self.consume_pp_finalize_consensus(req_id)
-            self.record_local_prefetch_vote(req_id, 0)
 
         if req_id not in self.ongoing_prefetch:
             return
