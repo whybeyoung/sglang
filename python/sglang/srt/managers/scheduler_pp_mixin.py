@@ -1701,7 +1701,33 @@ class SchedulerPPMixin:
                 effective_prev_good_bootstrapped_rids = (
                     effective_prev_good_bootstrapped_rids[len(deferred_bootstrapped_rids) :]
                 )
-            good_bootstrapped_rids = _ordered_common_prefix(
+            # Use ORDERED INTERSECTION (PP_0-authoritative) instead of
+            # strict zip-prefix.  Background:
+            #
+            # - `get_bootstrapped_rids` skips reqs where
+            #   `_is_hicache_ready` is False with `continue` (per
+            #   f3b2016f8) so each rank's good list is "sparse but
+            #   ordered".
+            # - `_is_hicache_ready` can legitimately diverge across PP
+            #   ranks: PP_0 holds real prefetch state and answers False
+            #   while a transfer is still in flight; downstream ranks
+            #   only observe `PREFETCH_SKIP` events and therefore answer
+            #   True for the same rid.
+            # - With the previous `_ordered_common_prefix` semantics, the
+            #   first positional mismatch between `[A, C, E, …]` (sparse
+            #   on PP_0 due to in-flight prefetches at B/D) and the
+            #   downstream rank's view truncated the consensus to `[A]`.
+            #   That moved head-of-line blocking from the local poll
+            #   into the cross-PP consensus layer, capping the bootstrap
+            #   graduation rate at ~1/tick under load and starving the
+            #   inflight pipeline.
+            # - Ordered intersection (PP_0's order kept, only rids that
+            #   downstream also confirms are retained) gives:
+            #     * sparse PP_0 → sparse consensus (correct), and
+            #     * never positional truncation when the rid sets agree.
+            #   This matches the consensus shape already used by the
+            #   `_pp_pd_get_prefill_transferred_ids` path.
+            good_bootstrapped_rids = _ordered_intersection(
                 effective_prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
             # Treat upstream abort/fail as authoritative, but only consume the
@@ -1816,8 +1842,15 @@ class SchedulerPPMixin:
                 and curr_good_bootstrapped_rids
                 and not good_bootstrapped_rids
             ):
+                # After switching to ordered intersection, this branch
+                # only fires when prev_good and curr_good have NO rid in
+                # common — i.e. PP_0 says A,B,C are ready and the
+                # downstream rank says X,Y,Z are ready.  That should not
+                # happen on the steady-state path (curr is filtered by
+                # prev_good_rids_set upstream) and indicates a queue/mb
+                # rebind drift worth diagnosing.
                 self._pp_prefill_problem_log(
-                    "bootstrap_prefix_collapsed",
+                    "bootstrap_consensus_empty_overlap",
                     key=(
                         tuple(prev_good_bootstrapped_rids[:4]),
                         tuple(curr_good_bootstrapped_rids[:4]),
