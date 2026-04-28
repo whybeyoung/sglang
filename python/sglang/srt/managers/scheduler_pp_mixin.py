@@ -488,7 +488,17 @@ class SchedulerPPMixin:
         ):
             write_ack_count = self.tree_cache.get_pp_last_write_ack_consumed()
 
-        if not events and not pp0_storage_hits and write_ack_count <= 0:
+        # Piggyback prefetch-finalize votes on the forward ring (this rank's
+        # own pending local vote + any peer votes already accumulated from
+        # upstream ranks).  No new comm channel is introduced.
+        pp_prefetch_votes = self._pp_pd_snapshot_piggyback_votes()
+
+        if (
+            not events
+            and not pp0_storage_hits
+            and write_ack_count <= 0
+            and not pp_prefetch_votes
+        ):
             return recv_reqs
         payload = {"recv_reqs": recv_reqs}
         if events:
@@ -497,6 +507,8 @@ class SchedulerPPMixin:
             payload["pp0_storage_hits"] = pp0_storage_hits
         if write_ack_count > 0:
             payload["pp_write_ack_count"] = write_ack_count
+        if pp_prefetch_votes:
+            payload["pp_prefetch_votes"] = pp_prefetch_votes
         return payload
 
     def _pp_apply_hicache_sync_before_batch(self: Scheduler) -> None:
@@ -522,6 +534,15 @@ class SchedulerPPMixin:
         if incoming_events and hasattr(self.tree_cache, "enqueue_pp_host_tree_events"):
             self.tree_cache.enqueue_pp_host_tree_events(incoming_events)
         self.pp_hicache_host_tree_events = []
+        # Apply piggyback prefetch votes that rode on the forward `recv_reqs`
+        # payload from the previous PP rank.  Generic for pp_size > 2: every
+        # non-first rank consumes the accumulated upstream votes and merges
+        # them into its own _pp_peer_prefetch_votes table before forwarding
+        # to the next stage on its own iteration.
+        incoming_votes = getattr(self, "pp_hicache_prefetch_votes", None)
+        if incoming_votes:
+            self._pp_pd_apply_piggyback_votes(incoming_votes)
+        self.pp_hicache_prefetch_votes = None
         # Keep PP transport minimal: only stage/broadcast the ordered host-tree events
         # here. The actual local application should stay on the original hicache pump
         # paths (writing_check/check_prefetch_progress), otherwise batch selection can
@@ -682,6 +703,14 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
+        # PP prefetch vote ring (Defer-then-Vote consensus).
+        # FULLY piggy-backed on existing pyobj messages — no new comm hop:
+        #   * Forward (PP_i → PP_{i+1}, i<last): rides on `_pp_build_req_payload`
+        #     (alongside `recv_reqs`/`hicache_host_tree_events`).
+        #   * Ring-close (PP_last → PP_0): rides on the existing
+        #     `consensus_bootstrapped` pyobj — see `_pp_pd_send_consensus_bootstrapped_ids`.
+        # Riding on an existing message preserves FIFO with the channel's
+        # other conditional traffic and avoids any deadlock/corruption risk.
 
         while True:
             server_is_idle = True
@@ -878,6 +907,15 @@ class SchedulerPPMixin:
                 if bmbs[next_mb_id] is not None:
                     recv_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
+                    )
+                    # Strip piggyback prefetch votes (only present on
+                    # PP_last → PP_0 hop) and apply them to the local tree
+                    # cache before unpacking the bootstrap payload.  No-op
+                    # on every other rank.
+                    recv_consensus_bootstrapped_rids = (
+                        self._pp_pd_unwrap_cb_with_votes(
+                            recv_consensus_bootstrapped_rids
+                        )
                     )
                     recv_good, recv_bad, recv_deferred, _recv_shared_capacity = (
                         self._pp_unpack_bootstrap_payload(
@@ -1893,13 +1931,18 @@ class SchedulerPPMixin:
         consensus_bootstrapped_rids: List[str],
         bootstrapped_rids: List[str],
     ):
-        # 3 (Release): send the release rids from last stage to the first stage
+        # 3 (Release): send the release rids from last stage to the first stage.
+        # PIGGYBACK: PP_last attaches accumulated prefetch votes to this hop so
+        # PP_0 can compute the cross-PP MIN consensus.  Riding on the existing
+        # cb message preserves FIFO ordering with cb's existing
+        # conditional-with-1-iter-lag protocol on the PP_last → PP_0 channel.
         send_consensus_bootstrapped_work = []
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
                 consensus_bootstrapped_rids = bootstrapped_rids
+                payload = self._pp_pd_wrap_cb_with_votes(consensus_bootstrapped_rids)
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
+                    payload, async_send=True
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
@@ -1908,6 +1951,40 @@ class SchedulerPPMixin:
                     consensus_bootstrapped_rids, async_send=True
                 )
         return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
+
+    def _pp_pd_wrap_cb_with_votes(
+        self: Scheduler, consensus_bootstrapped_rids
+    ):
+        """Optionally wrap PP_last → PP_0 cb payload with prefetch votes.
+
+        Returns the original payload unchanged when there are no votes (so
+        `_pp_unpack_bootstrap_payload` keeps working without modification on
+        intermediate ranks that just forward the cb without inspecting it).
+        """
+        if self.pp_size <= 1 or not getattr(self, "enable_hicache_storage", False):
+            return consensus_bootstrapped_rids
+        if not self.pp_group.is_last_rank:
+            return consensus_bootstrapped_rids
+        votes = self._pp_pd_snapshot_piggyback_votes()
+        if not votes:
+            return consensus_bootstrapped_rids
+        return {
+            "consensus_bootstrapped_rids": consensus_bootstrapped_rids,
+            "pp_prefetch_votes": votes,
+        }
+
+    def _pp_pd_unwrap_cb_with_votes(self: Scheduler, payload):
+        """Strip a piggyback votes wrapper if present and apply the votes locally.
+
+        Called by every rank on cb recv.  Only PP_0 will actually find the
+        wrapper (last_rank only attaches it on the PP_last → PP_0 hop), so on
+        intermediate ranks this is a cheap no-op pass-through.  Applying the
+        votes here also keeps the format opaque to `_pp_unpack_bootstrap_payload`.
+        """
+        if isinstance(payload, dict) and "consensus_bootstrapped_rids" in payload:
+            self._pp_pd_apply_piggyback_votes(payload.get("pp_prefetch_votes"))
+            return payload["consensus_bootstrapped_rids"]
+        return payload
 
     def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
@@ -1938,6 +2015,81 @@ class SchedulerPPMixin:
                     release_rids, async_send=True
                 )
         return send_release_work, release_rids
+
+    # ------------------------------------------------------------------
+    # PP cross-rank prefetch vote exchange (Defer-then-Vote consensus)
+    # ------------------------------------------------------------------
+    # Goal: PP_0 must commit each PREFETCH_FINALIZE host-tree write using
+    # MIN(local, peers) of completed_tokens so a transient L3 RDMA failure
+    # on any rank symmetrically downgrades to "no L3 hit" instead of
+    # diverging the host tree (which crashes the proxy-tensor FIFO).
+    #
+    # Generic for any pp_size (no PP1-specific code paths) and *fully
+    # piggy-backed* on existing pyobj messages — no new comm hop, no new
+    # collective, no barrier, no deadlock risk:
+    #
+    #   * FORWARD ring (PP_i → PP_{i+1}, i < last):
+    #       Votes ride on `_pp_build_req_payload` via the `pp_prefetch_votes`
+    #       field (alongside `hicache_host_tree_events` / `pp0_storage_hits`).
+    #       Each rank merges accumulated peer votes with its own pending
+    #       local vote and forwards the union to the next stage, so PP_last
+    #       receives the union of votes from PP_0..PP_(last-1).
+    #
+    #   * RING-CLOSE hop (PP_last → PP_0):
+    #       Votes ride on the existing `consensus_bootstrapped` pyobj that
+    #       PP_last already sends back to PP_0 (`_pp_pd_send_consensus_bootstrapped_ids`).
+    #       Riding the *same* message preserves FIFO with cb's existing
+    #       conditional-with-1-iter-lag protocol — there is no risk of an
+    #       unconditional read consuming a stale conditional message and
+    #       therefore no risk of corruption or deadlock.  Intermediate ranks
+    #       just forward the wrapped payload as opaque cb data.
+    #
+    #   * BROADCAST PP_0 → others (consensus result):
+    #       Piggy-backed on the existing PREFETCH_FINALIZE host tree event
+    #       via `pp_min_completed_tokens`; downstream ranks apply that as
+    #       the authoritative override.
+    #
+    # PP_0 holds rids on the deferred-finalize list until it has gathered
+    # votes from all (pp_size − 1) peers.  Until then nothing is committed
+    # to the host tree.  Because votes ride on the existing cb message that
+    # PP_last sends every iteration after warmup, vote progress is bounded
+    # by cb cadence — never starved by an isolated empty channel.
+
+    def _pp_pd_snapshot_piggyback_votes(self: Scheduler) -> Dict[str, Dict[int, int]]:
+        """Snapshot {rid: {peer_rank: completed_tokens}} for outbound piggyback.
+
+        Returns a dict suitable for serialization on the forward ring (via
+        `_pp_build_req_payload`) or the ring-close hop (PP_last → PP_0).
+        Includes this rank's own pending local vote AND any peer votes
+        accumulated from upstream ranks so they continue propagating along
+        the ring even on intermediate hops.
+        """
+        if self.pp_size <= 1 or not getattr(self, "enable_hicache_storage", False):
+            return {}
+        tree_cache = getattr(self, "tree_cache", None)
+        if tree_cache is None or not hasattr(
+            tree_cache, "snapshot_pp_prefetch_votes_for_piggyback"
+        ):
+            return {}
+        try:
+            return tree_cache.snapshot_pp_prefetch_votes_for_piggyback()
+        except Exception:
+            logger.exception("[PPPrefetchVote] snapshot failed")
+            return {}
+
+    def _pp_pd_apply_piggyback_votes(
+        self: Scheduler, votes: Optional[Dict[str, Dict[int, int]]]
+    ) -> None:
+        """Feed a received piggyback vote dict into the local tree cache."""
+        if not votes:
+            return
+        tree_cache = getattr(self, "tree_cache", None)
+        if tree_cache is None or not hasattr(tree_cache, "apply_peer_prefetch_votes"):
+            return
+        try:
+            tree_cache.apply_peer_prefetch_votes(votes)
+        except Exception:
+            logger.exception("[PPPrefetchVote] apply peer votes failed")
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:

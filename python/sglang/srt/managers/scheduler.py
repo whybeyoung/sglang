@@ -1496,6 +1496,7 @@ class Scheduler(
 
         pp0_storage_hits = {}
         pp_write_ack_count = 0
+        pp_prefetch_votes = {}
         if self.pp_rank > 0:
             if (
                 self.attn_tp_rank == 0
@@ -1508,10 +1509,12 @@ class Scheduler(
                 )
                 pp0_storage_hits = recv_reqs.get("pp0_storage_hits", {})
                 pp_write_ack_count = recv_reqs.get("pp_write_ack_count", 0)
+                pp_prefetch_votes = recv_reqs.get("pp_prefetch_votes", {}) or {}
                 recv_reqs = recv_reqs["recv_reqs"]
             elif self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 pp_hicache_host_tree_events = []
                 pp_write_ack_count = 0
+                pp_prefetch_votes = {}
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
@@ -1522,6 +1525,7 @@ class Scheduler(
                 pp_hicache_host_tree_events = None
                 pp0_storage_hits = None
                 pp_write_ack_count = None
+                pp_prefetch_votes = None
 
             if self.attn_tp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1553,6 +1557,12 @@ class Scheduler(
                         pp_write_ack_count = pp_write_ack_count[0]
                     else:
                         pp_write_ack_count = 0
+                    pp_prefetch_votes = broadcast_pyobj(
+                        pp_prefetch_votes,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
 
             if self.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1584,6 +1594,12 @@ class Scheduler(
                         pp_write_ack_count = pp_write_ack_count[0]
                     else:
                         pp_write_ack_count = 0
+                    pp_prefetch_votes = broadcast_pyobj(
+                        pp_prefetch_votes,
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
 
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
@@ -1623,6 +1639,12 @@ class Scheduler(
                     pp_write_ack_count = pp_write_ack_count[0]
                 else:
                     pp_write_ack_count = 0
+                pp_prefetch_votes = broadcast_pyobj(
+                    pp_prefetch_votes,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
 
         if self.pp_rank > 0 and pp0_storage_hits:
             if (
@@ -1638,6 +1660,9 @@ class Scheduler(
 
         if self.pp_rank > 0:
             self.pp_hicache_host_tree_events = list(pp_hicache_host_tree_events or [])
+            self.pp_hicache_prefetch_votes = (
+                pp_prefetch_votes if isinstance(pp_prefetch_votes, dict) else {}
+            )
             if (
                 self.enable_hicache_storage
                 and self.tree_cache is not None
@@ -1656,6 +1681,7 @@ class Scheduler(
                 self.tree_cache.set_pp_upstream_write_ack_count(pp_write_ack_count)
         else:
             self.pp_hicache_host_tree_events = []
+            self.pp_hicache_prefetch_votes = {}
 
         # Process MM requests under EPD-disaggregation mode
         if (
