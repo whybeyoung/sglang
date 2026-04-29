@@ -72,7 +72,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 from sglang.srt.distributed.parallel_state import is_pipeline_last_stage
 
-from python.sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 _is_npu = is_npu()
 

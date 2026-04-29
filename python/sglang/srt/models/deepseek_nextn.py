@@ -22,8 +22,8 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
-from python.sglang.srt.distributed.parallel_state import is_pipeline_last_stage
-from python.sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.distributed.parallel_state import is_pipeline_last_stage
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -151,7 +151,6 @@ class DeepseekModelNextN(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        print(f'===={forward_batch.forward_mode=}==={is_pipeline_last_stage()=}')
         if forward_batch.forward_mode.is_extend():
             if is_pipeline_last_stage():
                 if input_embeds is None:
