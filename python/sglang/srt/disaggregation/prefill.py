@@ -42,7 +42,6 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -58,8 +57,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
-
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
