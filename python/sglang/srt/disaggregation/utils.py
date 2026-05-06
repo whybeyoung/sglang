@@ -12,7 +12,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -544,6 +543,7 @@ def setup_state_kv_args(
     """
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
     if not hasattr(token_to_kv_pool, "get_state_buf_infos"):
         kv_args.state_data_ptrs = []
