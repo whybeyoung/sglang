@@ -569,7 +569,7 @@ def setup_state_kv_args(
     elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
         kv_args.state_type = "nsa"
         if draft_token_to_kv_pool is not None and isinstance(
-            draft_token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)
+            draft_token_to_kv_pool, NSATokenToKVPool
         ):
             (
                 draft_state_data_ptrs,
