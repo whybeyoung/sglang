@@ -157,3 +157,60 @@ def zeros(shape, dtype, device):
     # `out` keeps `flat`'s storage alive via tensor storage refcounting,
     # so the parent allocation is not freed when this function returns.
     return out
+
+
+def zeros_aligned_segments(num_segments, segment_shape, dtype, device):
+    """Return ``(owner, segments)`` where every ``segments[i].data_ptr()`` is
+    2 MB aligned on NPU. Each segment has logical shape ``segment_shape``.
+
+    Each segment is allocated as its OWN independent NPU tensor (its own
+    underlying aclrtMalloc), so:
+
+    * Mooncake registers each per-layer slice on a separate underlying
+      allocation, avoiding any ambiguity / interaction caused by sharing
+      one large IPC-registered backing allocation across layers.
+    * This matches the parent ``MHATokenToKVPool`` / ``MLATokenToKVPool``
+      layout (one ``torch.zeros`` per layer), only with the additional
+      2 MB alignment via ``_npu_align.zeros``.
+
+    For non-NPU runtimes / non-NPU devices this falls back to plain
+    ``torch.zeros(segment_shape, ...)`` per segment — bit-exact identical
+    to the parent class's pattern. GPU/CPU paths are not affected.
+
+    Padding overhead is < 2 MB per segment.
+
+    Returns
+    -------
+    owner : None
+        Independent allocations are exposed via ``segments[i]`` directly;
+        each segment owns its storage. ``owner`` is ``None`` and exists
+        only for API symmetry with earlier shared-owner variants.
+    segments : list[torch.Tensor]
+        ``num_segments`` tensors, each of shape ``segment_shape``, each
+        with a 2 MB aligned ``data_ptr()`` on NPU.
+    """
+    if not is_npu() or _device_type(device) != "npu":
+        # Match the parent MHA / MLA pool's list-of-tensors fallback layout.
+        segments = [
+            torch.zeros(segment_shape, dtype=dtype, device=device)
+            for _ in range(num_segments)
+        ]
+        return None, segments
+
+    if isinstance(segment_shape, Integral):
+        segment_shape = (int(segment_shape),)
+    else:
+        segment_shape = tuple(int(s) for s in segment_shape)
+
+    segments = []
+    for i in range(num_segments):
+        seg = zeros(segment_shape, dtype=dtype, device=device)
+        if seg.data_ptr() % ALIGNMENT_BLOCK != 0:
+            raise RuntimeError(
+                f"segment {i} not aligned: ptr=0x{seg.data_ptr():x}"
+            )
+        if not seg.is_contiguous():
+            raise RuntimeError(f"segment {i} unexpectedly non-contiguous")
+        segments.append(seg)
+
+    return None, segments
