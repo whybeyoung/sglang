@@ -183,6 +183,18 @@ class PrefillBootstrapQueue:
                 kv_args.state_data_ptrs = state_data_ptrs
                 kv_args.state_data_lens = state_data_lens
                 kv_args.state_item_lens = state_item_lens
+            else:
+                # NPUMLATokenToKVPool already exposes index_k_buffer through
+                # get_contiguous_buf_infos() (i.e. inside kv_data_ptrs), so we
+                # must NOT also register it as a separate state batch — that
+                # would make Mooncake's registerLocalMemoryBatch reject the
+                # whole batch as exact_dup overlap and leave the underlying
+                # ADXL/HIXL engine in an inconsistent state, surfacing later
+                # as connect status 503900. Keep state_type="nsa" below so
+                # that PD-disagg still sends the correct state_indices.
+                kv_args.state_data_ptrs = []
+                kv_args.state_data_lens = []
+                kv_args.state_item_lens = []
 
             if isinstance(self.token_to_kv_pool, SWAKVPool):
                 kv_args.state_type = "swa"

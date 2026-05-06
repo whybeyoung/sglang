@@ -56,6 +56,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -351,12 +352,25 @@ class DecodePreallocQueue:
         )
 
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
-            state_data_ptrs, state_data_lens, state_item_lens = (
-                self.token_to_kv_pool.get_state_buf_infos()
-            )
-            kv_args.state_data_ptrs = state_data_ptrs
-            kv_args.state_data_lens = state_data_lens
-            kv_args.state_item_lens = state_item_lens
+            if not isinstance(self.token_to_kv_pool, NPUMLATokenToKVPool):
+                state_data_ptrs, state_data_lens, state_item_lens = (
+                    self.token_to_kv_pool.get_state_buf_infos()
+                )
+                kv_args.state_data_ptrs = state_data_ptrs
+                kv_args.state_data_lens = state_data_lens
+                kv_args.state_item_lens = state_item_lens
+            else:
+                # NPUMLATokenToKVPool already exposes index_k_buffer through
+                # get_contiguous_buf_infos() (i.e. inside kv_data_ptrs), so we
+                # must NOT also register it as a separate state batch — that
+                # would make Mooncake's registerLocalMemoryBatch reject the
+                # whole batch as exact_dup overlap and leave the underlying
+                # ADXL/HIXL engine in an inconsistent state, surfacing later
+                # as connect status 503900. Keep state_type="nsa" below so
+                # that PD-disagg still sends the correct state_indices.
+                kv_args.state_data_ptrs = []
+                kv_args.state_data_lens = []
+                kv_args.state_item_lens = []
 
             if isinstance(self.token_to_kv_pool, SWAKVPool):
                 kv_args.state_type = "swa"
@@ -367,7 +381,9 @@ class DecodePreallocQueue:
                     kv_args.state_dim_per_tensor = (
                         self.token_to_kv_pool.get_state_dim_per_tensor()
                     )
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+            elif isinstance(
+                self.token_to_kv_pool, (NPUMLATokenToKVPool, NSATokenToKVPool)
+            ):
                 kv_args.state_type = "nsa"
             else:
                 kv_args.state_type = "none"
