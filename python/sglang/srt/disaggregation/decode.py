@@ -342,6 +342,13 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        # NPU-only: see prefill.py:_init_kv_manager for the full rationale.
+        # GPU pools leave this field unset (slicing falls back to legacy
+        # layer-stripe behavior, bit-exact identical to before).
+        if isinstance(self.token_to_kv_pool, NPUMLATokenToKVPool):
+            kv_args.kv_data_num_groups = (
+                len(kv_data_ptrs) // self.token_to_kv_pool.layer_num
+            )
         # HiSparse Host pool has page_size=1; use it when hisparse is enabled
         kv_args.page_size = (
             1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size

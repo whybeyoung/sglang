@@ -416,8 +416,28 @@ class CommonKVManager(BaseKVManager):
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
-            # Decode pp size should be equal to prefill pp size or 1
-            sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            # NPU-only specialization: NPUMLATokenToKVPool exposes multiple
+            # buffers per layer in kv_data_ptrs grouped by type — e.g.
+            #     [K_0..K_{N-1}, V_0..V_{N-1}, IK_0..IK_{N-1}]   (NSA, groups=3)
+            # Naive layer-stripe slicing dst[start:end] would pair layer X's
+            # K with a different layer's V/IK under PP, causing silent
+            # KV corruption. NPU prefill.py sets kv_data_num_groups>1; on
+            # GPU the field is absent and this branch reduces to the
+            # original layer-stripe slice (bit-exact identical behavior).
+            groups = getattr(self.kv_args, "kv_data_num_groups", 1)
+            if groups > 1:
+                local_layers = len(src_kv_ptrs) // groups
+                dst_total_layers = len(dst_kv_ptrs) // groups
+                end_layer = start_layer + local_layers
+                sliced_dst_kv_ptrs = []
+                for g in range(groups):
+                    base = g * dst_total_layers
+                    sliced_dst_kv_ptrs.extend(
+                        dst_kv_ptrs[base + start_layer : base + end_layer]
+                    )
+            else:
+                # Decode pp size should be equal to prefill pp size or 1
+                sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 

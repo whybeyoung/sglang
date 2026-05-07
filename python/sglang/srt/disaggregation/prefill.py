@@ -162,6 +162,15 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        # NPU-only: NPUMLATokenToKVPool exposes [K..., V...(, IK...)] in
+        # kv_data_ptrs (2 or 3 groups per layer). The MLA PP slicing path
+        # needs this to slice each group independently. GPU pools expose
+        # 1 entry per layer; leave the field unset so GPU behavior is
+        # unchanged.
+        if isinstance(self.token_to_kv_pool, NPUMLATokenToKVPool):
+            kv_args.kv_data_num_groups = (
+                len(kv_data_ptrs) // self.token_to_kv_pool.layer_num
+            )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (

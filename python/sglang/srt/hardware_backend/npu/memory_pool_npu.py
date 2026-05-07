@@ -287,6 +287,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_state_buf_infos(self):
+        # NOTE: index_k_buffer is also exposed in get_contiguous_buf_infos()
+        # below (kv_data_ptrs[2*N:3*N]). PD-disagg callers (prefill.py /
+        # decode.py) explicitly SKIP this method for NPUMLATokenToKVPool to
+        # avoid registering the same buffer twice with Mooncake (the
+        # second batch_register would be rejected as exact_dup overlap and
+        # leave the underlying ADXL/HIXL engine in an inconsistent state,
+        # surfacing later as connect status 503900). This method is kept
+        # for non-PD callers that want to introspect the indexer cache.
         data_ptrs = [
             self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
         ]
@@ -325,7 +333,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
-        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+        # NPU MLA / NSA layout. Unlike the upstream MLATokenToKVPool which
+        # packs K and V into a single combined kv_buffer per layer, the NPU
+        # variant exposes K and V (and, for NSA, index_k) as INDEPENDENT
+        # per-layer buffers — each with its own 2 MB-aligned base pointer.
+        # The returned lists are GROUP-ORDERED:
+        #     kv_data_ptrs = [K_0..K_{N-1}, V_0..V_{N-1}, IK_0..IK_{N-1}]
+        #     kv_item_lens = [k_il...,      v_il...,      ik_il...      ]
+        # where each *_il may differ (head dims differ for K/V/IK in NSA).
+        # PD-disagg callers must treat this as 2 or 3 GROUPS per layer, NOT
+        # a single layer-stripe list. See:
+        #   - common/conn.py:get_mla_kv_ptrs_with_pp (group-aware PP slicing)
+        #   - mooncake/conn.py:_send_kvcache_generic (per-entry item_len)
         kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
             self.v_buffer[i].data_ptr() for i in range(self.layer_num)
         ]
