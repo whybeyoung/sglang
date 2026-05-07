@@ -415,6 +415,26 @@ class DeepEPMoE(FusedMoE):
             group_list = group_list.to(torch.int64)
 
             if self.w13_weight.dtype == torch.bfloat16:
+                # DeepEP-LL dispatcher always quantizes activations to INT8
+                # (per-token + scale) for low-latency RDMA. The fully-BF16
+                # GMM kernel below cannot accept INT8×BF16 (CANN GMM rejects
+                # this combo with EZ1001 "no matching xDtype and weightDtype
+                # pattern"). This path is hit on NPU when the model has
+                # BF16 expert weights AND deepep low_latency is enabled,
+                # e.g. GLM-5.1 NEXTN/MTP layer when started with:
+                #     --speculative-draft-model-quantization unquant
+                #     --deepep-mode low_latency
+                # Dequantize INT8 act back to BF16 so the BF16 GMM works.
+                # Cost: one elementwise mul on (active_tokens, hidden_size),
+                # which is negligible vs the GMM itself and runs only on
+                # BF16-weight layers (i.e. the MTP layer for a W8A8 main
+                # model). All quantized layers go through the else branch
+                # untouched, preserving native INT8×INT8 LL performance.
+                if hidden_states.dtype != torch.bfloat16:
+                    hidden_states = (
+                        hidden_states.to(torch.bfloat16)
+                        * hidden_states_scale.to(torch.bfloat16).unsqueeze(-1)
+                    )
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )
