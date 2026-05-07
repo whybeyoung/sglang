@@ -440,6 +440,19 @@ class CommonKVManager(BaseKVManager):
                 else:
                     dst_total_layers = dst_per_group
                 end_layer = start_layer + local_layers
+                logger.warning(
+                    "[mla_pp_slice] groups=%d local=%d dst_per_group=%d "
+                    "dst_total_layers=%d start=%d end=%d "
+                    "src_len=%d dst_len=%d",
+                    groups,
+                    local_layers,
+                    dst_per_group,
+                    dst_total_layers,
+                    start_layer,
+                    end_layer,
+                    len(src_kv_ptrs),
+                    len(dst_kv_ptrs),
+                )
                 sliced_dst_kv_ptrs = []
                 for g in range(groups):
                     base = g * dst_total_layers
