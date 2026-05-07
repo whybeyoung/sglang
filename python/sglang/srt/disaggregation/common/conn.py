@@ -427,7 +427,18 @@ class CommonKVManager(BaseKVManager):
             groups = getattr(self.kv_args, "kv_data_num_groups", 1)
             if groups > 1:
                 local_layers = len(src_kv_ptrs) // groups
-                dst_total_layers = len(dst_kv_ptrs) // groups
+                dst_per_group = len(dst_kv_ptrs) // groups
+                # When decode appends a draft pool but prefill has not,
+                # dst_per_group includes those draft layers and shifts
+                # V/IK offsets, silently corrupting target KV. Mirror
+                # get_mha_kv_ptrs_with_pp: floor-div ratio recovers the
+                # true target stride; if counts align, no draft asymmetry.
+                if local_layers > 0 and dst_per_group % local_layers != 0:
+                    dst_total_layers = (
+                        dst_per_group // local_layers
+                    ) * local_layers
+                else:
+                    dst_total_layers = dst_per_group
                 end_layer = start_layer + local_layers
                 sliced_dst_kv_ptrs = []
                 for g in range(groups):
