@@ -349,6 +349,43 @@ class DecodePreallocQueue:
             kv_args.kv_data_num_groups = (
                 len(kv_data_ptrs) // self.token_to_kv_pool.layer_num
             )
+            # DIAG: dump decode-side KV pool composition so prefill PP slicer
+            # can be verified against the real dst_kv_ptrs layout.
+            target_layer_num = self.token_to_kv_pool.layer_num
+            draft_layer_num = getattr(
+                self.draft_token_to_kv_pool, "layer_num", None
+            )
+            target_ptrs_count = target_layer_num * kv_args.kv_data_num_groups
+            draft_ptrs_count = (
+                len(kv_data_ptrs) - target_ptrs_count
+                if self.draft_token_to_kv_pool is not None
+                else 0
+            )
+            per_group = (
+                len(kv_data_ptrs) // kv_args.kv_data_num_groups
+                if kv_args.kv_data_num_groups
+                else 0
+            )
+            logger.warning(
+                "[decode_pool_layout] target_pool=%s target_layer_num=%d "
+                "draft_pool=%s draft_layer_num=%s "
+                "total_ptrs=%d est_target_ptrs=%d est_draft_ptrs=%d "
+                "kv_data_num_groups=%d per_group=%d "
+                "first8_ptrs=%s last8_ptrs=%s",
+                type(self.token_to_kv_pool).__name__,
+                target_layer_num,
+                type(self.draft_token_to_kv_pool).__name__
+                if self.draft_token_to_kv_pool is not None
+                else "None",
+                draft_layer_num,
+                len(kv_data_ptrs),
+                target_ptrs_count,
+                draft_ptrs_count,
+                kv_args.kv_data_num_groups,
+                per_group,
+                [hex(p) for p in kv_data_ptrs[:8]],
+                [hex(p) for p in kv_data_ptrs[-8:]],
+            )
         # HiSparse Host pool has page_size=1; use it when hisparse is enabled
         kv_args.page_size = (
             1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
