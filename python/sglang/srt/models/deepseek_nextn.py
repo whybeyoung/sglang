@@ -151,17 +151,6 @@ class DeepseekModelNextN(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if forward_batch.forward_mode.is_extend():
-            if is_pipeline_last_stage():
-                if input_embeds is None:
-                    hidden_states = self.embed_tokens(input_ids)
-                else:
-                    hidden_states = input_embeds
-                residual = None
-            else:
-                assert pp_proxy_tensors is not None
-                hidden_states = pp_proxy_tensors["hidden_states"]
-                residual = pp_proxy_tensors["residual"]
         if _is_npu and self.quant_config is None:
             os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "1"
             os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
@@ -172,11 +161,10 @@ class DeepseekModelNextN(nn.Module):
                 input_embeds.device if input_embeds is not None else input_ids.device
             ),
         )
-        if forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_draft_extend(include_v2=True):
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
             hidden_states = self.eh_proj(
