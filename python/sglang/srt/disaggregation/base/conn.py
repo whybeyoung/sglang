@@ -39,6 +39,9 @@ class KVArgs:
     system_dp_rank: int
     # for draft
     has_draft_pool: bool = False
+    # Target-model total layer count; used by NPU MLA PP slicer to skip
+    # decode-side draft pool tail when computing per-group stride.
+    total_target_layer_num: int = 0
 
 
 class KVPoll:

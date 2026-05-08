@@ -175,6 +175,9 @@ class PrefillBootstrapQueue:
             kv_args.kv_data_num_groups = (
                 len(kv_data_ptrs) // self.token_to_kv_pool.layer_num
             )
+            kv_args.total_target_layer_num = (
+                self.scheduler.model_config.num_hidden_layers
+            )
             # DIAG: dump prefill-side per-PP-stage KV pool composition so the
             # MLA PP slicer can be verified against the real src_kv_ptrs layout.
             target_layer_num = self.token_to_kv_pool.layer_num

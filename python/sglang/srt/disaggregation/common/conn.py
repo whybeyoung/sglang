@@ -427,7 +427,16 @@ class CommonKVManager(BaseKVManager):
             groups = getattr(self.kv_args, "kv_data_num_groups", 1)
             if groups > 1:
                 local_layers = len(src_kv_ptrs) // groups
-                dst_total_layers = len(dst_kv_ptrs) // groups
+                # Use model-level target layer count when available so the
+                # stride skips any decode-side draft pool tail; fall back to
+                # per-group count when unset.
+                total_target = getattr(self.kv_args, "total_target_layer_num", 0)
+                per_group = len(dst_kv_ptrs) // groups
+                dst_total_layers = (
+                    total_target
+                    if total_target and total_target <= per_group
+                    else per_group
+                )
                 end_layer = start_layer + local_layers
                 sliced_dst_kv_ptrs = []
                 for g in range(groups):
