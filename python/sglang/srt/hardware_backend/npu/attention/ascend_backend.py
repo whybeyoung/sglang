@@ -390,16 +390,25 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # Reserve extra columns for replay paths that bump max_len:
+        # target_verify (+speculative_num_draft_tokens) and decode/idle
+        # with spec_info (+speculative_step_id+1).
+        spec_margin = getattr(self, "speculative_num_draft_tokens", 0) or 0
+        if spec_margin > 0:
+            spec_margin = max(spec_margin, self.speculative_step_id + 1)
+        max_pages = (
+            self.max_context_len + spec_margin + self.page_size - 1
+        ) // self.page_size
         self.graph_metadata = {
             "block_tables": torch.empty(
-                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                (max_bs, max_pages),
                 dtype=torch.int32,
                 device=self.device,
             ),
         }
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
-                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                (max_bs, max_pages),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -518,6 +527,18 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        # Fail loudly if the captured buffer is too narrow; never silently truncate.
+        buf_pages = metadata.block_tables.shape[1]
+        if max_seq_pages > buf_pages:
+            raise RuntimeError(
+                "NPU graph block_tables buffer too small: "
+                f"required_pages={max_seq_pages}, buffer_pages={buf_pages}, "
+                f"max_len={max_len}, page_size={self.page_size}, "
+                f"max_context_len={self.max_context_len}, "
+                f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
+                f"speculative_step_id={self.speculative_step_id}, "
+                f"forward_mode={forward_mode}"
+            )
 
         if self.is_hybrid_swa:
             metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
