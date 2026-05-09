@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -202,6 +202,11 @@ class MooncakeKVManager(CommonKVManager):
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            # Track who first put a session into failed_sessions so subsequent
+            # cascading failures (other rooms hitting the blacklist) can point
+            # back to the original first-failure event for debugging.
+            # session_id -> (first_room, first_fail_ts, origin_rank_str, ret)
+            self.first_failed_room: Dict[str, Tuple[int, float, str, int]] = {}
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -599,9 +604,23 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
+        t0 = time.time()
+        ret = self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
+        if ret != 0:
+            # Surface the actual mooncake-level failure (real first-line root cause).
+            # Without this, downstream observers only see "decode dead" / "prefill dead"
+            # cascading messages and have no way to know the underlying RDMA error.
+            logger.error(
+                f"[KV-XFER-FAIL] session={mooncake_session_id} ret={ret} "
+                f"blocks={len(transfer_blocks)} total_bytes={sum(lengths)} "
+                f"first_src=0x{src_addrs[0]:x} first_dst=0x{dst_addrs[0]:x} "
+                f"elapsed={time.time() - t0:.3f}s "
+                f"prefill_rank={self.kv_args.engine_rank} "
+                f"pp={self.pp_rank} cp={self.attn_cp_rank}"
+            )
+        return ret
 
     def _send_kvcache_generic(
         self,
@@ -1208,9 +1227,22 @@ class MooncakeKVManager(CommonKVManager):
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
+                                origin = self.first_failed_room.get(
+                                    req.mooncake_session_id,
+                                    (None, 0.0, "unknown", 0),
+                                )
+                                cascade_reason = (
+                                    f"Decode instance could be dead, remote mooncake session "
+                                    f"{req.mooncake_session_id} is not alive; "
+                                    f"first_failed_room={origin[0]} first_fail_ts={origin[1]:.3f} "
+                                    f"origin={origin[2]} origin_ret={origin[3]}"
+                                )
+                                logger.error(
+                                    f"[CASCADE-FAIL] room={kv_chunk.room} {cascade_reason}"
+                                )
                                 self.record_failure(
                                     kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                    cascade_reason,
                                 )
                                 self.update_status(kv_chunk.room, KVPoll.Failed)
                                 self.sync_status_to_decode_endpoint(
@@ -1295,10 +1327,36 @@ class MooncakeKVManager(CommonKVManager):
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
+                                    is_first = (
+                                        req.mooncake_session_id
+                                        not in self.failed_sessions
                                     )
+                                    self.failed_sessions.add(req.mooncake_session_id)
+                                    if is_first:
+                                        # Remember the very first room/rank that
+                                        # observed this session failing, so any
+                                        # subsequent room hitting the blacklist
+                                        # can attribute the cascade to it.
+                                        self.first_failed_room[
+                                            req.mooncake_session_id
+                                        ] = (
+                                            kv_chunk.room,
+                                            time.time(),
+                                            f"prefill_rank={self.kv_args.engine_rank} "
+                                            f"pp={self.pp_rank} cp={self.attn_cp_rank}",
+                                            ret,
+                                        )
+                                        logger.error(
+                                            f"[FIRST-FAIL] session={req.mooncake_session_id} "
+                                            f"first_room={kv_chunk.room} ret={ret} "
+                                            f"endpoint={req.endpoint}:{req.dst_port} "
+                                            f"prefill_rank={self.kv_args.engine_rank} "
+                                            f"pp={self.pp_rank} cp={self.attn_cp_rank}"
+                                        )
+                                    else:
+                                        logger.error(
+                                            f"Session {req.mooncake_session_id} failed (room={kv_chunk.room}, ret={ret})."
+                                        )
                             self.record_failure(
                                 kv_chunk.room,
                                 f"Failed to send kv chunk of {kv_chunk.room} to "
@@ -1515,9 +1573,17 @@ class MooncakeKVManager(CommonKVManager):
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
+                    # Capture which prefill rank reported Failed so we can correlate
+                    # this with the prefill-side [FIRST-FAIL] / [KV-XFER-FAIL] log on
+                    # that exact rank. Without this the decode log alone is useless.
+                    logger.error(
+                        f"[DECODE-RECV-FAIL] room={bootstrap_room} "
+                        f"from_prefill_rank={prefill_rank} ts={time.time():.3f}"
+                    )
                     self.record_failure(
                         bootstrap_room,
-                        "Failed to get kvcache from prefill instance, it might be dead",
+                        f"Failed to get kvcache from prefill instance, it might be dead "
+                        f"(reported by prefill_rank={prefill_rank})",
                     )
                     self.update_status(bootstrap_room, status)
 
@@ -1551,19 +1617,25 @@ class MooncakeKVManager(CommonKVManager):
                                         bootstrap_room
                                     )
                         else:
-                            logger.info(
-                                f"Attempting to reconnect to {bootstrap_addr}..."
-                            )
                             self.heartbeat_failures[bootstrap_addr] = (
                                 self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            logger.warning(
+                                f"[HEARTBEAT-BAD] addr={bootstrap_addr} "
+                                f"http_status={response.status_code} "
+                                f"failures={self.heartbeat_failures[bootstrap_addr]}/{self.max_failures}"
                             )
                             with self.session_pool_lock:
                                 if bootstrap_addr in self.session_pool:
                                     del self.session_pool[bootstrap_addr]
-                    except Exception:
-                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                    except Exception as e:
                         self.heartbeat_failures[bootstrap_addr] = (
                             self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+                        logger.warning(
+                            f"[HEARTBEAT-EXC] addr={bootstrap_addr} "
+                            f"failures={self.heartbeat_failures[bootstrap_addr]}/{self.max_failures} "
+                            f"exc={type(e).__name__}: {e}"
                         )
 
                     if (
@@ -1750,8 +1822,19 @@ class MooncakeKVSender(CommonKVSender):
         self.clear()
 
         with self.kv_mgr.failure_lock:
+            had_local_record = self.bootstrap_room in self.kv_mgr.failure_records
             failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, "Failed due to an unknown reason from another rank"
+                self.bootstrap_room,
+                f"Failed due to an unknown reason from another rank "
+                f"(this rank had no local record; status was set Failed externally) "
+                f"ts={time.time():.3f}",
+            )
+        if not had_local_record:
+            # Distinguishes "I am the source of the failure" from "I was told
+            # to fail by another rank but never observed anything wrong locally".
+            logger.error(
+                f"[CROSS-RANK-FAIL] room={self.bootstrap_room} no_local_record=True "
+                f"reason={failure_reason!r}"
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
@@ -1937,8 +2020,19 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.clear()
 
         with self.kv_mgr.failure_lock:
+            had_local_record = self.bootstrap_room in self.kv_mgr.failure_records
             failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, "Failed due to an unknown reason from another rank"
+                self.bootstrap_room,
+                f"Failed due to an unknown reason from another rank "
+                f"(this rank had no local record; status was set Failed externally) "
+                f"ts={time.time():.3f}",
+            )
+        if not had_local_record:
+            # Distinguishes "I am the source of the failure" from "I was told
+            # to fail by another rank but never observed anything wrong locally".
+            logger.error(
+                f"[CROSS-RANK-FAIL] room={self.bootstrap_room} no_local_record=True "
+                f"reason={failure_reason!r}"
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
