@@ -2092,7 +2092,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False
         if self.pp_rank != self.pp_size - 1:
             return False
-        if self.pp_size == 1 and self.tp_size == 1:
+        if self.pp_size == 1:
             return False
         return True
 
