@@ -1457,7 +1457,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         pass
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
-        if not abort_all and rid not in self.rid_to_state:
+        # Empty rid would match every request because scheduler uses
+        # req.rid.startswith(recv_req.rid). Only abort_all may omit rid.
+        if not abort_all and not rid:
+            logger.warning(
+                "Ignore abort_request with empty rid and abort_all=False"
+            )
+            return
+        # In multi-tokenizer-worker mode each worker has its own rid_to_state,
+        # so an abort HTTP request load-balanced to a worker that did not
+        # handle the original /generate would be silently dropped here.
+        # Always forward to the scheduler in that mode; the scheduler does
+        # the real prefix matching across its queues.
+        if (
+            not abort_all
+            and self.server_args.tokenizer_worker_num == 1
+            and rid not in self.rid_to_state
+        ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
