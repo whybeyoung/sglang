@@ -3315,6 +3315,14 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        logger.info(
+            f"[abort_request] received: rid={recv_req.rid!r} abort_all={recv_req.abort_all} "
+            f"mode={self.disaggregation_mode} "
+            f"waiting={len(self.waiting_queue)} "
+            f"prealloc={len(self.disagg_decode_prealloc_queue.queue) if self.disaggregation_mode == DisaggregationMode.DECODE else 0} "
+            f"transfer={len(self.disagg_decode_transfer_queue.queue) if self.disaggregation_mode == DisaggregationMode.DECODE else 0} "
+            f"running={len(self.running_batch.reqs)}"
+        )
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -3376,13 +3384,20 @@ class Scheduler(
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                    logger.info(
+                        f"[abort_request] match prealloc rid={decode_req.req.rid!r} "
+                        f"bootstrap_room={decode_req.req.bootstrap_room} "
+                        f"waiting_for_input={decode_req.waiting_for_input}"
+                    )
                     decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                    logger.info(
+                        f"[abort_request] match transfer rid={decode_req.req.rid!r} "
+                        f"bootstrap_room={decode_req.req.bootstrap_room}"
+                    )
                     decode_req.kv_receiver.abort()
 
             # Abort requests already retracted to CPU cache
