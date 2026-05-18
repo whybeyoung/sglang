@@ -887,8 +887,23 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
+        # NOTE(PP): on PP middle ranks (neither first nor last), the
+        # attention-prep substream writes (KV cache / compressor /
+        # indexer ring-buffer state) are released back to the scheduler
+        # loop together with the async PP isend, before they actually
+        # drain. The next microbatch's CUDA graph replay then reads
+        # stale accumulator state -> precision degrades as #middle ranks
+        # grows (observed: PP=2 ok, PP=4/8 wrong). Disable the
+        # multi-stream alt_streams on middle ranks so attention prep
+        # stays on the main stream and the scheduler's stream barriers
+        # cover all writes. First/last ranks keep multi-stream perf.
+        _enable_alt_streams = (_is_cuda or _is_hip) and (
+            self.pp_group.world_size == 1
+            or self.pp_group.is_first_rank
+            or self.pp_group.is_last_rank
+        )
         self.alt_streams = (
-            [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
+            [torch.cuda.Stream() for _ in range(5)] if _enable_alt_streams else None
         )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
