@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.parallel_state import is_pipeline_last_stage
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
@@ -28,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
@@ -69,10 +71,6 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
-
-from sglang.srt.distributed.parallel_state import is_pipeline_last_stage
-
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 _is_npu = is_npu()
 
@@ -282,7 +280,11 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    def forward_batch_generation(self, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors] = None,) -> GenerationBatchResult:
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -319,7 +321,9 @@ class EAGLEWorker(TpModelWorker):
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
             else:
-                batch_result = self.forward_target_extend(batch, pp_proxy_tensors=pp_proxy_tensors)
+                batch_result = self.forward_target_extend(
+                    batch, pp_proxy_tensors=pp_proxy_tensors
+                )
                 return GenerationBatchResult(
                     pp_hidden_states_proxy_tensors=batch_result.pp_hidden_states_proxy_tensors,
                     can_run_cuda_graph=batch_result.can_run_cuda_graph,
@@ -409,7 +413,9 @@ class EAGLEWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch, pp_proxy_tensors=pp_proxy_tensors)
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+        )
         if is_pipeline_last_stage():
             logits_output, next_token_ids = (
                 batch_result.logits_output,

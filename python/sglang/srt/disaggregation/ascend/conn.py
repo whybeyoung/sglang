@@ -5,7 +5,6 @@ from typing import List, Tuple
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.distributed import is_pipeline_last_stage
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
@@ -14,9 +13,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.distributed import is_pipeline_last_stage
 from sglang.srt.utils.network import get_local_ip_auto
-
-from sglang.srt.distributed import get_world_rank
 
 logger = logging.getLogger(__name__)
 
@@ -59,21 +57,26 @@ class AscendKVManager(MooncakeKVManager):
             total_num_layers = len(dst_kv_ptrs) // ptrs_per_layer
 
         if is_pipeline_last_stage() and self.kv_args.has_draft_pool:
-            src_layers = len(src_kv_ptrs) // ptrs_per_layer  - 1
+            src_layers = len(src_kv_ptrs) // ptrs_per_layer - 1
         else:
             src_layers = len(src_kv_ptrs) // ptrs_per_layer
 
         end_layer = start_layer + src_layers
 
-        from sglang.srt.distributed import get_world_rank
         # print(f'==={get_world_rank}======={src_layers=}=={total_num_layers=}==={start_layer=}=={end_layer=}==={len(dst_kv_ptrs)=}==={len(src_kv_ptrs)=}')
         if src_layers == total_num_layers:
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
             k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            v_ptrs = dst_kv_ptrs[total_num_layers + start_layer: total_num_layers + end_layer]
+            v_ptrs = dst_kv_ptrs[
+                total_num_layers + start_layer : total_num_layers + end_layer
+            ]
             if self.kv_args.state_type == "nsa":
-                index_k_ptrs = dst_kv_ptrs[2 * total_num_layers + start_layer: 2 * total_num_layers + end_layer]
+                index_k_ptrs = dst_kv_ptrs[
+                    2 * total_num_layers
+                    + start_layer : 2 * total_num_layers
+                    + end_layer
+                ]
                 sliced_dst_kv_ptrs = k_ptrs + v_ptrs + index_k_ptrs
                 if is_pipeline_last_stage() and self.kv_args.has_draft_pool:
                     sliced_dst_kv_ptrs += dst_kv_ptrs[-ptrs_per_layer:]
@@ -98,7 +101,9 @@ class AscendKVManager(MooncakeKVManager):
 
         if self.pp_size > 1:
             if self.is_mla_backend:
-                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                )
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -109,9 +114,13 @@ class AscendKVManager(MooncakeKVManager):
                 ]
                 # print(f'{get_world_rank()}========{layers_params=}')
             else:
-                src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                    self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-                )
+                (
+                    src_k_ptrs,
+                    src_v_ptrs,
+                    dst_k_ptrs,
+                    dst_v_ptrs,
+                    layers_current_pp_stage,
+                ) = self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
 
                 layers_params = [
                     (

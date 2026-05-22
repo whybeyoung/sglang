@@ -50,13 +50,13 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -352,9 +352,7 @@ class DecodePreallocQueue:
             # DIAG: dump decode-side KV pool composition so prefill PP slicer
             # can be verified against the real dst_kv_ptrs layout.
             target_layer_num = self.token_to_kv_pool.layer_num
-            draft_layer_num = getattr(
-                self.draft_token_to_kv_pool, "layer_num", None
-            )
+            draft_layer_num = getattr(self.draft_token_to_kv_pool, "layer_num", None)
             target_ptrs_count = target_layer_num * kv_args.kv_data_num_groups
             draft_ptrs_count = (
                 len(kv_data_ptrs) - target_ptrs_count
@@ -374,9 +372,11 @@ class DecodePreallocQueue:
                 "first8_ptrs=%s last8_ptrs=%s",
                 type(self.token_to_kv_pool).__name__,
                 target_layer_num,
-                type(self.draft_token_to_kv_pool).__name__
-                if self.draft_token_to_kv_pool is not None
-                else "None",
+                (
+                    type(self.draft_token_to_kv_pool).__name__
+                    if self.draft_token_to_kv_pool is not None
+                    else "None"
+                ),
                 draft_layer_num,
                 len(kv_data_ptrs),
                 target_ptrs_count,

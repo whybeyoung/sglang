@@ -726,9 +726,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.device == "npu":
             disable_cuda_graph_bk = self.server_args.disable_cuda_graph
             use_npu_zero_buffer = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
-            capture_dalay_enable = (self.server_args.disaggregation_mode in ["decode", "null"] and
-                                    (
-                                                use_npu_zero_buffer and self.spec_algorithm.is_eagle() and not disable_cuda_graph_bk))
+            capture_dalay_enable = self.server_args.disaggregation_mode in [
+                "decode",
+                "null",
+            ] and (
+                use_npu_zero_buffer
+                and self.spec_algorithm.is_eagle()
+                and not disable_cuda_graph_bk
+            )
             if capture_dalay_enable:
                 # we will delay main model graph capture until MTP weights already loaded
                 self.server_args.disable_cuda_graph = True
@@ -738,12 +743,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if use_npu_zero_buffer and capture_dalay_enable:
                 pass  # will lazy init zbal till MTP weights loaded
             elif use_npu_zero_buffer and not self.is_draft_worker:
-                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
                 # lazy_init_zbal_gva_mem(self.device, self.gpu_id, self.tp_rank, self.tp_size,
                 #                        get_world_group().cpu_group)
-                from sglang.srt.distributed.parallel_state import get_world_size, get_world_rank
-                lazy_init_zbal_gva_mem(self.device, self.gpu_id, get_world_rank(), get_world_size(),
-                                       get_world_group().cpu_group)
+                from sglang.srt.distributed.parallel_state import (
+                    get_world_rank,
+                    get_world_size,
+                )
+                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
+
+                lazy_init_zbal_gva_mem(
+                    self.device,
+                    self.gpu_id,
+                    get_world_rank(),
+                    get_world_size(),
+                    get_world_group().cpu_group,
+                )
             self.init_device_graphs()
 
             if capture_dalay_enable:

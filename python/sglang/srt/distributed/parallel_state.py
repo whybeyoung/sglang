@@ -2351,6 +2351,8 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parrlel_state, "get_world_group", get_world_group)
 
+
 def is_pipeline_last_stage():
     from sglang.srt.distributed import get_pp_group
+
     return get_pp_group().is_last_rank

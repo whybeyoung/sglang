@@ -431,10 +431,9 @@ class DeepEPMoE(FusedMoE):
                 # model). All quantized layers go through the else branch
                 # untouched, preserving native INT8×INT8 LL performance.
                 if hidden_states.dtype != torch.bfloat16:
-                    hidden_states = (
-                        hidden_states.to(torch.bfloat16)
-                        * hidden_states_scale.to(torch.bfloat16).unsqueeze(-1)
-                    )
+                    hidden_states = hidden_states.to(
+                        torch.bfloat16
+                    ) * hidden_states_scale.to(torch.bfloat16).unsqueeze(-1)
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )

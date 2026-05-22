@@ -28,7 +28,6 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.distributed import is_pipeline_last_stage
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -43,7 +42,9 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
+from sglang.srt.distributed import is_pipeline_last_stage
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -54,8 +55,6 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
-
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -181,9 +180,7 @@ class PrefillBootstrapQueue:
             # DIAG: dump prefill-side per-PP-stage KV pool composition so the
             # MLA PP slicer can be verified against the real src_kv_ptrs layout.
             target_layer_num = self.token_to_kv_pool.layer_num
-            draft_layer_num = getattr(
-                self.draft_token_to_kv_pool, "layer_num", None
-            )
+            draft_layer_num = getattr(self.draft_token_to_kv_pool, "layer_num", None)
             target_ptrs_count = target_layer_num * kv_args.kv_data_num_groups
             draft_ptrs_count = (
                 len(kv_data_ptrs) - target_ptrs_count
@@ -206,9 +203,11 @@ class PrefillBootstrapQueue:
                 kv_args.prefill_start_layer,
                 type(self.token_to_kv_pool).__name__,
                 target_layer_num,
-                type(self.draft_token_to_kv_pool).__name__
-                if self.draft_token_to_kv_pool is not None
-                else "None",
+                (
+                    type(self.draft_token_to_kv_pool).__name__
+                    if self.draft_token_to_kv_pool is not None
+                    else "None"
+                ),
                 draft_layer_num,
                 len(kv_data_ptrs),
                 target_ptrs_count,
@@ -261,7 +260,9 @@ class PrefillBootstrapQueue:
                     kv_args.state_dim_per_tensor = (
                         self.token_to_kv_pool.get_state_dim_per_tensor()
                     )
-            elif isinstance(self.token_to_kv_pool, (NPUMLATokenToKVPool, NSATokenToKVPool)):
+            elif isinstance(
+                self.token_to_kv_pool, (NPUMLATokenToKVPool, NSATokenToKVPool)
+            ):
                 kv_args.state_type = "nsa"
             else:
                 kv_args.state_type = "none"

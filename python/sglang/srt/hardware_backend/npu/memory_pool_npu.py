@@ -6,14 +6,8 @@ import torch_npu
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.alignment import (  # noqa: F401  (re-export)
     ALIGNMENT_BLOCK_2M,
-)
-from sglang.srt.hardware_backend.npu.alignment import (  # noqa: F401  (re-export)
     assert_2m_aligned_kv_args,
-)
-from sglang.srt.hardware_backend.npu.alignment import (  # noqa: F401  (re-export)
     zeros_2m_aligned,
-)
-from sglang.srt.hardware_backend.npu.alignment import (
     zeros_2m_aligned_segments,
 )
 from sglang.srt.mem_cache.memory_pool import (

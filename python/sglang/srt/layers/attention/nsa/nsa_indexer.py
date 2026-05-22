@@ -1444,10 +1444,14 @@ class Indexer(MultiPlatformOp):
                 )
 
                 if sum(forward_batch.extend_prefix_lens_cpu) > 0:
-                    total_kv_len_prev_tensor = (forward_batch.nsa_cp_metadata.kv_len_prev_tensor +
-                        forward_batch.extend_prefix_lens.squeeze())
-                    total_kv_len_next_tensor = (forward_batch.nsa_cp_metadata.kv_len_next_tensor +
-                        forward_batch.extend_prefix_lens.squeeze())
+                    total_kv_len_prev_tensor = (
+                        forward_batch.nsa_cp_metadata.kv_len_prev_tensor
+                        + forward_batch.extend_prefix_lens.squeeze()
+                    )
+                    total_kv_len_next_tensor = (
+                        forward_batch.nsa_cp_metadata.kv_len_next_tensor
+                        + forward_batch.extend_prefix_lens.squeeze()
+                    )
                     forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = (
                         total_kv_len_prev_tensor,
                         total_kv_len_next_tensor,

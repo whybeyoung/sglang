@@ -1460,9 +1460,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Empty rid would match every request because scheduler uses
         # req.rid.startswith(recv_req.rid). Only abort_all may omit rid.
         if not abort_all and not rid:
-            logger.warning(
-                "Ignore abort_request with empty rid and abort_all=False"
-            )
+            logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         # In multi-tokenizer-worker mode each worker has its own rid_to_state,
         # so an abort HTTP request load-balanced to a worker that did not

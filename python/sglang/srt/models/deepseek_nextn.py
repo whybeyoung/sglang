@@ -21,9 +21,6 @@ from typing import Iterable, Optional, Tuple
 import torch
 from safetensors.torch import load_file
 from torch import nn
-
-from sglang.srt.distributed.parallel_state import is_pipeline_last_stage
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -52,7 +49,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -279,7 +276,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-        hidden_states = self.model(input_ids, positions, forward_batch, pp_proxy_tensors)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, pp_proxy_tensors
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
