@@ -4,7 +4,6 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.disaggregation import _npu_align
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -51,42 +50,37 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # [size, head_num, head_dim] for each layer.
+            # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Each per-layer slice MUST start at a 2 MB boundary so HCCL IPC RMA
-            # registration succeeds (Mooncake registers each layer ptr separately).
-            # zeros_aligned_segments uses one contiguous owner allocation with
-            # stride padded up to 2 MB between segments, preserving the
-            # "continuous memory" property the original Ascend layout aimed for.
-            segment_shape = (
-                self.size // self.page_size + 1,
-                self.page_size,
-                self.head_num,
-                self.head_dim,
-            )
-            self._kv_buffer_owner, segments = _npu_align.zeros_aligned_segments(
-                num_segments=2 * self.layer_num,
-                segment_shape=segment_shape,
+            # Continuous memory improves the efficiency of Ascend`s transmission backend,
+            # while other backends remain unchanged.
+            self.kv_buffer = torch.zeros(
+                (
+                    2,
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            # NOTE: do NOT expose self.kv_buffer as a logical KV tensor.
-            # The owner is a flat 1-D padded backing allocation; the only
-            # logically valid KV tensors are the per-layer 2 MB-aligned
-            # views below. self._kv_buffer_owner is kept on the instance
-            # purely to keep the storage alive.
-            self.k_buffer = segments[: self.layer_num]
-            self.v_buffer = segments[self.layer_num :]
+            self.k_buffer = self.kv_buffer[0]
+            self.v_buffer = self.kv_buffer[1]
 
             if self.use_fia:
-                self.k_buffer = [
-                    s.view(-1, 1, self.head_num, self.head_dim)
-                    for s in self.k_buffer
-                ]
-                self.v_buffer = [
-                    s.view(-1, 1, self.head_num, self.head_dim)
-                    for s in self.v_buffer
-                ]
+                self.k_buffer = []
+                self.v_buffer = []
+                for i in range(self.layer_num):
+                    k_buffer_layer = self.kv_buffer[0][i].view(
+                        -1, 1, self.head_num, self.head_dim
+                    )
+                    v_buffer_layer = self.kv_buffer[1][i].view(
+                        -1, 1, self.head_num, self.head_dim
+                    )
+                    self.k_buffer.append(k_buffer_layer)
+                    self.v_buffer.append(v_buffer_layer)
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -265,52 +259,40 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Each per-layer slice MUST start at a 2 MB boundary for HCCL IPC RMA
-            # registration; zeros_aligned_segments returns a list of per-layer
-            # views from one owner allocation with 2 MB-padded stride between them.
-            num_pages = self.size // self.page_size + 1
-
-            self._k_buffer_owner, self.k_buffer = (
-                _npu_align.zeros_aligned_segments(
-                    num_segments=layer_num,
-                    segment_shape=(
-                        num_pages,
-                        self.page_size,
-                        1,
-                        self.kv_lora_rank,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
+            self.k_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    1,
+                    self.kv_lora_rank,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
             )
-            self._v_buffer_owner, self.v_buffer = (
-                _npu_align.zeros_aligned_segments(
-                    num_segments=layer_num,
-                    segment_shape=(
-                        num_pages,
-                        self.page_size,
-                        1,
-                        self.qk_rope_head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
+            self.v_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    1,
+                    self.qk_rope_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
             )
-            self._index_k_buffer_owner = None
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                self._index_k_buffer_owner, self.index_k_buffer = (
-                    _npu_align.zeros_aligned_segments(
-                        num_segments=layer_num,
-                        segment_shape=(
-                            num_pages,
-                            self.page_size,
-                            1,
-                            self.index_head_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
+                self.index_k_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.index_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
                 )
 
         self._finalize_allocation_log(size)
@@ -387,8 +369,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # NPU MLA / NSA layout. Unlike the upstream MLATokenToKVPool which
         # packs K and V into a single combined kv_buffer per layer, the NPU
         # variant exposes K and V (and, for NSA, index_k) as INDEPENDENT
-        # per-layer buffers — each with its own 2 MB-aligned base pointer.
-        # The returned lists are GROUP-ORDERED:
+        # per-layer buffers. The returned lists are GROUP-ORDERED:
         #     kv_data_ptrs = [K_0..K_{N-1}, V_0..V_{N-1}, IK_0..IK_{N-1}]
         #     kv_item_lens = [k_il...,      v_il...,      ik_il...      ]
         # where each *_il may differ (head dims differ for K/V/IK in NSA).
