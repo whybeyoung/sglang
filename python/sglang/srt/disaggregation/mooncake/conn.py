@@ -258,33 +258,6 @@ class MooncakeKVManager(CommonKVManager):
         self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
-        # NPU-only: hard-assert every registered ptr is 2 MB aligned. CANN
-        # HCCL IPC RMA (halShmemCreateHandle / rtsIpcMemGetExportKey) rejects
-        # any unaligned start address with status 503900, and that surfaces
-        # only later as a connect failure between prefill and decode. Failing
-        # fast at registration time pins the regression to the offending
-        # source list (kv / aux / state) instead. Non-NPU paths skip this.
-        from sglang.srt.utils import is_npu as _is_npu
-
-        if _is_npu():
-            _ALIGN = 2 * 1024 * 1024
-
-            def _assert_aligned(name, ptrs):
-                bad = [(i, p, p % _ALIGN) for i, p in enumerate(ptrs) if p % _ALIGN]
-                if bad:
-                    raise RuntimeError(
-                        f"NPU Mooncake registration: {name} has "
-                        f"{len(bad)}/{len(ptrs)} ptrs not 2MB aligned, "
-                        f"first offenders (idx, ptr, offset) = {bad[:8]}"
-                    )
-
-            _assert_aligned("kv_data_ptrs", self.kv_args.kv_data_ptrs or [])
-            _assert_aligned("aux_data_ptrs", self.kv_args.aux_data_ptrs or [])
-            _assert_aligned(
-                "state_data_ptrs",
-                getattr(self.kv_args, "state_data_ptrs", []) or [],
-            )
-
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
             self.engine.batch_register(
