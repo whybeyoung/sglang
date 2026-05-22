@@ -4,7 +4,18 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.disaggregation import _npu_align
+from sglang.srt.hardware_backend.npu.alignment import (  # noqa: F401  (re-export)
+    ALIGNMENT_BLOCK_2M,
+)
+from sglang.srt.hardware_backend.npu.alignment import (  # noqa: F401  (re-export)
+    assert_2m_aligned_kv_args,
+)
+from sglang.srt.hardware_backend.npu.alignment import (  # noqa: F401  (re-export)
+    zeros_2m_aligned,
+)
+from sglang.srt.hardware_backend.npu.alignment import (
+    zeros_2m_aligned_segments,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -51,41 +62,29 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # [size, head_num, head_dim] for each layer.
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Each per-layer slice MUST start at a 2 MB boundary so HCCL IPC RMA
-            # registration succeeds (Mooncake registers each layer ptr separately).
-            # zeros_aligned_segments uses one contiguous owner allocation with
-            # stride padded up to 2 MB between segments, preserving the
-            # "continuous memory" property the original Ascend layout aimed for.
+            # Per-layer 2 MB-aligned K/V (each segment is an independent
+            # allocation; slot 0 reserved for padded tokens).
             segment_shape = (
                 self.size // self.page_size + 1,
                 self.page_size,
                 self.head_num,
                 self.head_dim,
             )
-            self._kv_buffer_owner, segments = _npu_align.zeros_aligned_segments(
+            self._kv_buffer_owner, segments = zeros_2m_aligned_segments(
                 num_segments=2 * self.layer_num,
                 segment_shape=segment_shape,
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            # NOTE: do NOT expose self.kv_buffer as a logical KV tensor.
-            # The owner is a flat 1-D padded backing allocation; the only
-            # logically valid KV tensors are the per-layer 2 MB-aligned
-            # views below. self._kv_buffer_owner is kept on the instance
-            # purely to keep the storage alive.
             self.k_buffer = segments[: self.layer_num]
             self.v_buffer = segments[self.layer_num :]
 
             if self.use_fia:
                 self.k_buffer = [
-                    s.view(-1, 1, self.head_num, self.head_dim)
-                    for s in self.k_buffer
+                    s.view(-1, 1, self.head_num, self.head_dim) for s in self.k_buffer
                 ]
                 self.v_buffer = [
-                    s.view(-1, 1, self.head_num, self.head_dim)
-                    for s in self.v_buffer
+                    s.view(-1, 1, self.head_num, self.head_dim) for s in self.v_buffer
                 ]
 
     # for disagg
@@ -167,12 +166,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 chunk = kv_cache_cpu[local_layer_id][i // chunk_size]
                 k_cpu, v_cpu = chunk[0], chunk[1]
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
-                k_layer[chunk_indices] = k_cpu.to(
-                    k_layer.device, non_blocking=True
-                )
-                v_layer[chunk_indices] = v_cpu.to(
-                    v_layer.device, non_blocking=True
-                )
+                k_layer[chunk_indices] = k_cpu.to(k_layer.device, non_blocking=True)
+                v_layer[chunk_indices] = v_cpu.to(v_layer.device, non_blocking=True)
         torch.npu.synchronize()
 
     def set_kv_buffer(
@@ -264,43 +259,37 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Each per-layer slice MUST start at a 2 MB boundary for HCCL IPC RMA
-            # registration; zeros_aligned_segments returns a list of per-layer
-            # views from one owner allocation with 2 MB-padded stride between them.
+            # Per-layer 2 MB-aligned K/V (each segment is an independent
+            # allocation; slot 0 reserved for padded tokens).
             num_pages = self.size // self.page_size + 1
 
-            self._k_buffer_owner, self.k_buffer = (
-                _npu_align.zeros_aligned_segments(
-                    num_segments=layer_num,
-                    segment_shape=(
-                        num_pages,
-                        self.page_size,
-                        1,
-                        self.kv_lora_rank,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
+            self._k_buffer_owner, self.k_buffer = zeros_2m_aligned_segments(
+                num_segments=layer_num,
+                segment_shape=(
+                    num_pages,
+                    self.page_size,
+                    1,
+                    self.kv_lora_rank,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
             )
-            self._v_buffer_owner, self.v_buffer = (
-                _npu_align.zeros_aligned_segments(
-                    num_segments=layer_num,
-                    segment_shape=(
-                        num_pages,
-                        self.page_size,
-                        1,
-                        self.qk_rope_head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
+            self._v_buffer_owner, self.v_buffer = zeros_2m_aligned_segments(
+                num_segments=layer_num,
+                segment_shape=(
+                    num_pages,
+                    self.page_size,
+                    1,
+                    self.qk_rope_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
             )
             self._index_k_buffer_owner = None
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 self._index_k_buffer_owner, self.index_k_buffer = (
-                    _npu_align.zeros_aligned_segments(
+                    zeros_2m_aligned_segments(
                         num_segments=layer_num,
                         segment_shape=(
                             num_pages,
@@ -346,17 +335,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # leave the underlying ADXL/HIXL engine in an inconsistent state,
         # surfacing later as connect status 503900). This method is kept
         # for non-PD callers that want to introspect the indexer cache.
-        data_ptrs = [
-            self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
-        ]
-        data_lens = [
-            self.index_k_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        item_lens = [
-            self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
+        data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
+        data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
         return data_ptrs, data_lens, item_lens
-
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -485,16 +467,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(
-                -1, 1, self.kv_lora_rank
-            )
-            v_layer = self.v_buffer[local_layer_id].view(
-                -1, 1, self.qk_rope_head_dim
-            )
+            k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
+            v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
             ik_layer = (
-                self.index_k_buffer[local_layer_id].view(
-                    -1, 1, self.index_head_dim
-                )
+                self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
                 if has_ik
                 else None
             )
@@ -504,9 +480,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 k_cpu = k_layer[chunk_indices].to("cpu", non_blocking=True)
                 v_cpu = v_layer[chunk_indices].to("cpu", non_blocking=True)
                 if has_ik:
-                    ik_cpu = ik_layer[chunk_indices].to(
-                        "cpu", non_blocking=True
-                    )
+                    ik_cpu = ik_layer[chunk_indices].to("cpu", non_blocking=True)
                     layer_chunks.append((k_cpu, v_cpu, ik_cpu))
                 else:
                     layer_chunks.append((k_cpu, v_cpu))
@@ -519,16 +493,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(
-                -1, 1, self.kv_lora_rank
-            )
-            v_layer = self.v_buffer[local_layer_id].view(
-                -1, 1, self.qk_rope_head_dim
-            )
+            k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
+            v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
             ik_layer = (
-                self.index_k_buffer[local_layer_id].view(
-                    -1, 1, self.index_head_dim
-                )
+                self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
                 if has_ik
                 else None
             )
@@ -537,12 +505,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 chunk = kv_cache_cpu[local_layer_id][i // chunk_size]
                 k_cpu, v_cpu = chunk[0], chunk[1]
                 assert k_cpu.shape[0] == len(chunk_indices)
-                k_layer[chunk_indices] = k_cpu.to(
-                    k_layer.device, non_blocking=True
-                )
-                v_layer[chunk_indices] = v_cpu.to(
-                    v_layer.device, non_blocking=True
-                )
+                k_layer[chunk_indices] = k_cpu.to(k_layer.device, non_blocking=True)
+                v_layer[chunk_indices] = v_cpu.to(v_layer.device, non_blocking=True)
                 if has_ik:
                     ik_cpu = chunk[2]
                     ik_layer[chunk_indices] = ik_cpu.to(
