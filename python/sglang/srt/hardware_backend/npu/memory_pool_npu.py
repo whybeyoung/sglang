@@ -4,6 +4,9 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation.mooncake.utils import (
+    use_custom_mem_pool_for_device,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -49,7 +52,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_KV_CACHE
+        ), use_custom_mem_pool_for_device(self.custom_mem_pool, self.device):
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
@@ -255,9 +260,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
 
-        self.custom_mem_pool = None
+        # NOTE: self.custom_mem_pool is initialized by KVCache.__init__ via
+        # maybe_init_custom_mem_pool(device=self.device). For NPU + ASCEND
+        # disagg this resolves to a torch_npu.npu.MemPool backed by mooncake's
+        # ascend_allocator.so so the torch.zeros calls below come back
+        # 2 MB-aligned; for non-disagg / non-NPU paths the pool is None and
+        # use_custom_mem_pool_for_device collapses to nullcontext().
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_KV_CACHE
+        ), use_custom_mem_pool_for_device(self.custom_mem_pool, self.device):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = torch.zeros(
                 (

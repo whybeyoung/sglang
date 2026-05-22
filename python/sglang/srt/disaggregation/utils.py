@@ -154,11 +154,11 @@ class MetadataBuffers:
             device = "cpu"
         elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
             device = "cuda"
-        with (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.custom_mem_pool
-            else nullcontext()
-        ):
+        from sglang.srt.disaggregation.mooncake.utils import (
+            use_custom_mem_pool_for_device,
+        )
+
+        with use_custom_mem_pool_for_device(self.custom_mem_pool, device):
             # TODO: abort top_logprobs_num > 128 in PD
 
             # We transfer the metadata of first output token to decode
