@@ -444,6 +444,7 @@ class Scheduler(
             ps=self.ps,
             tp_group=self.tp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            pp_cpu_group=self.pp_group.cpu_group,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -2231,8 +2232,6 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
-                elif self.enable_hierarchical_cache:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
