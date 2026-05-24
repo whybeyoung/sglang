@@ -4,12 +4,6 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.alignment import (  # noqa: F401  (re-export)
-    ALIGNMENT_BLOCK_2M,
-    assert_2m_aligned_kv_args,
-    zeros_2m_aligned,
-    zeros_2m_aligned_segments,
-)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -56,22 +50,28 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # Per-layer 2 MB-aligned K/V (each segment is an independent
-            # allocation; slot 0 reserved for padded tokens).
+            # Per-layer K/V buffers (slot 0 reserved for padded tokens).
+            # 2 MiB alignment is provided process-wide by torch_npu (see
+            # init_npu_backend() in hardware_backend/npu/utils.py), so
+            # plain torch.zeros already satisfies CANN HCCL IPC RMA.
             segment_shape = (
                 self.size // self.page_size + 1,
                 self.page_size,
                 self.head_num,
                 self.head_dim,
             )
-            self._kv_buffer_owner, segments = zeros_2m_aligned_segments(
-                num_segments=2 * self.layer_num,
-                segment_shape=segment_shape,
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.k_buffer = segments[: self.layer_num]
-            self.v_buffer = segments[self.layer_num :]
+            self.k_buffer = [
+                torch.zeros(
+                    segment_shape, dtype=self.store_dtype, device=self.device
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    segment_shape, dtype=self.store_dtype, device=self.device
+                )
+                for _ in range(self.layer_num)
+            ]
 
             if self.use_fia:
                 self.k_buffer = [
@@ -253,48 +253,38 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # Per-layer 2 MB-aligned K/V (each segment is an independent
-            # allocation; slot 0 reserved for padded tokens).
+            # Per-layer K/V buffers (slot 0 reserved for padded tokens).
+            # 2 MiB alignment is provided process-wide by torch_npu (see
+            # init_npu_backend() in hardware_backend/npu/utils.py), so
+            # plain torch.zeros already satisfies CANN HCCL IPC RMA.
             num_pages = self.size // self.page_size + 1
 
-            self._k_buffer_owner, self.k_buffer = zeros_2m_aligned_segments(
-                num_segments=layer_num,
-                segment_shape=(
-                    num_pages,
-                    self.page_size,
-                    1,
-                    self.kv_lora_rank,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self._v_buffer_owner, self.v_buffer = zeros_2m_aligned_segments(
-                num_segments=layer_num,
-                segment_shape=(
-                    num_pages,
-                    self.page_size,
-                    1,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self._index_k_buffer_owner = None
+            self.k_buffer = [
+                torch.zeros(
+                    (num_pages, self.page_size, 1, self.kv_lora_rank),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (num_pages, self.page_size, 1, self.qk_rope_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(layer_num)
+            ]
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                self._index_k_buffer_owner, self.index_k_buffer = (
-                    zeros_2m_aligned_segments(
-                        num_segments=layer_num,
-                        segment_shape=(
-                            num_pages,
-                            self.page_size,
-                            1,
-                            self.index_head_dim,
-                        ),
+                self.index_k_buffer = [
+                    torch.zeros(
+                        (num_pages, self.page_size, 1, self.index_head_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                )
+                    for _ in range(layer_num)
+                ]
 
         self._finalize_allocation_log(size)
 

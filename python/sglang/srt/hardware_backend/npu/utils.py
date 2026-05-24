@@ -108,6 +108,28 @@ def init_npu_backend():
     torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
+    # Bind a process-wide 2 MiB sub-block alignment on the NPUCachingAllocator
+    # so every torch.zeros / empty / Parameter on NPU is automatically
+    # 2 MiB-aligned (address + huge-page backing). This satisfies CANN HCCL
+    # IPC RMA registration (Mooncake AscendDirectTransport / SGLang PD) with
+    # zero call-site changes — no zeros_2m_aligned wrapper, no use_mem_pool
+    # context needed. Requires a torch_npu build that supports the
+    # `sub_block_alignment_kb` setting key.
+    try:
+        torch_npu.npu.memory.set_per_process_sub_block_alignment(2 * 1024 * 1024)
+    except (AttributeError, RuntimeError) as e:
+        # Older torch_npu without process-wide sub_block_alignment support:
+        # PD with HCCL IPC RMA will fail later at register-time via
+        # assert_2m_aligned_kv_args, surfacing a clear error.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "torch_npu does not support per-process sub_block_alignment "
+            "(%s). NPU PD / Mooncake AscendDirectTransport will require an "
+            "upgraded torch_npu build for HCCL IPC RMA registration to work.",
+            e,
+        )
+
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
