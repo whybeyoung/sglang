@@ -77,37 +77,29 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # [size, head_num, head_dim] for each layer
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Continuous memory improves the efficiency of Ascend`s transmission backend,
-            # while other backends remain unchanged.
-            self.kv_buffer = torch.zeros(
-                (
-                    2,
-                    self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
+            # 2 MiB alignment guaranteed by torch_npu sub_block_alignment.
+            segment_shape = (
+                self.size // self.page_size + 1,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
             )
-            self.k_buffer = self.kv_buffer[0]
-            self.v_buffer = self.kv_buffer[1]
+            self.k_buffer = [
+                torch.zeros(segment_shape, dtype=self.store_dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(segment_shape, dtype=self.store_dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
 
             if self.use_fia:
-                self.k_buffer = []
-                self.v_buffer = []
-                for i in range(self.layer_num):
-                    k_buffer_layer = self.kv_buffer[0][i].view(
-                        -1, 1, self.head_num, self.head_dim
-                    )
-                    v_buffer_layer = self.kv_buffer[1][i].view(
-                        -1, 1, self.head_num, self.head_dim
-                    )
-                    self.k_buffer.append(k_buffer_layer)
-                    self.v_buffer.append(v_buffer_layer)
+                self.k_buffer = [
+                    s.view(-1, 1, self.head_num, self.head_dim) for s in self.k_buffer
+                ]
+                self.v_buffer = [
+                    s.view(-1, 1, self.head_num, self.head_dim) for s in self.v_buffer
+                ]
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -292,42 +284,35 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.kv_lora_rank,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.v_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.index_k_buffer = None
-            if self.index_head_dim is not None:
-                self.index_k_buffer = torch.zeros(
-                    (
-                        layer_num,
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        1,
-                        self.index_head_dim,
-                    ),
+            # 2 MiB alignment guaranteed by torch_npu sub_block_alignment.
+            num_pages = self.size // self.page_size + 1
+
+            self.k_buffer = [
+                torch.zeros(
+                    (num_pages, self.page_size, 1, self.kv_lora_rank),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
+                for _ in range(layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (num_pages, self.page_size, 1, self.qk_rope_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(layer_num)
+            ]
+            self.index_k_buffer = None
+            if self.index_head_dim is not None:
+                self.index_k_buffer = [
+                    torch.zeros(
+                        (num_pages, self.page_size, 1, self.index_head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(layer_num)
+                ]
 
         self._finalize_allocation_log(size)
 

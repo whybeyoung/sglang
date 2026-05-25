@@ -108,6 +108,20 @@ def init_npu_backend():
     torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
+    # Bind 2 MiB sub-block alignment process-wide for HCCL IPC RMA (PD).
+    # AttributeError -> stock torch_npu without the patch: tolerate so non-PD
+    #   workloads still run; PD will fail later via assert_2m_aligned_kv_args.
+    # RuntimeError   -> API exists but allocator refused (e.g. HUGE_ONLY
+    #   unavailable): propagate, fail fast at startup.
+    try:
+        torch_npu.npu.memory.set_per_process_sub_block_alignment(2 * 1024 * 1024)
+    except AttributeError as e:
+        logger.error(
+            "torch_npu missing set_per_process_sub_block_alignment (%s); "
+            "NPU PD will fail at HCCL IPC RMA registration. Upgrade torch_npu.",
+            e,
+        )
+
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.

@@ -269,6 +269,16 @@ class MooncakeKVManager(CommonKVManager):
         self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
+        # NPU: enforce 2 MB alignment for HCCL IPC RMA. No-op elsewhere.
+        from sglang.srt.utils import is_npu
+
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.alignment import (
+                assert_2m_aligned_kv_args,
+            )
+
+            assert_2m_aligned_kv_args(self.kv_args)
+
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
             self.engine.batch_register(
