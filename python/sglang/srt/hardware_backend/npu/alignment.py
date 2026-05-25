@@ -4,21 +4,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Registration-time 2 MB alignment safety net for CANN HCCL IPC RMA.
+"""Fail-fast 2 MiB alignment check for CANN HCCL IPC RMA.
 
-The 2 MiB alignment guarantee itself is now provided by torch_npu's
-process-wide ``sub_block_alignment`` setting (bound in
-``init_npu_backend()`` in ``utils.py``). After that, plain
-``torch.zeros(..., device='npu:0')`` already returns a 2 MiB-aligned,
-huge-page-backed tensor — there is no longer any allocator helper here.
-
-This module only keeps a cheap fail-fast assertion that is invoked at
-HCCL IPC RMA registration time (see
-``disaggregation/mooncake/conn.py::register_buffer_to_engine``). It
-catches mis-configured deployments — e.g. running on a torch_npu build
-without process-wide sub_block_alignment support — and surfaces a
-clear error pointing at the misaligned ptr, instead of an opaque
-``ADXL Connect 503900`` from the driver.
+Alignment is provided process-wide by torch_npu's sub_block_alignment
+(see init_npu_backend). This assert is the safety net invoked at
+register-time (mooncake/conn.py::register_buffer_to_engine) to surface
+a clear pointer error instead of an opaque ADXL 503900.
 """
 
 from __future__ import annotations
@@ -43,8 +34,6 @@ def assert_2m_aligned_kv_args(kv_args) -> None:
     if misaligned:
         details = ", ".join(f"{name}[{i}]=0x{ptr:x}" for name, i, ptr in misaligned[:8])
         raise RuntimeError(
-            f"NPU PD: {len(misaligned)} buffer(s) not 2 MB-aligned. First: {details}. "
-            "Expected torch_npu to provide process-wide sub_block_alignment via "
-            "init_npu_backend(); verify the torch_npu build supports the "
-            "`sub_block_alignment_kb` allocator setting."
+            f"NPU PD: {len(misaligned)} buffer(s) not 2 MiB-aligned. First: {details}. "
+            "Upgrade torch_npu to a build with sub_block_alignment_kb support."
         )
