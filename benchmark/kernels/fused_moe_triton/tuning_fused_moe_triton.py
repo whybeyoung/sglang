@@ -404,6 +404,27 @@ def main(args: argparse.Namespace):
     dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
 
+    # Manual shape overrides for tuning a specific MoE layer that differs from
+    # what is auto-detected from model_config (e.g. shared-expert / MTP layers
+    # with a different (E, N) than the routed experts).
+    if args.override_e is not None:
+        print(f"[override] E: {E} -> {args.override_e}")
+        E = args.override_e
+    if args.override_n is not None:
+        # file name uses N = shard_intermediate_size // 2
+        new_sis = args.override_n * 2
+        print(
+            f"[override] shard_intermediate_size: {shard_intermediate_size} "
+            f"-> {new_sis} (N={args.override_n})"
+        )
+        shard_intermediate_size = new_sis
+    if args.override_k is not None:
+        print(f"[override] hidden_size (K): {hidden_size} -> {args.override_k}")
+        hidden_size = args.override_k
+    if args.override_topk is not None:
+        print(f"[override] topk: {topk} -> {args.override_topk}")
+        topk = args.override_topk
+
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
@@ -545,6 +566,16 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
+    # Manual shape overrides (use when the auto-detected (E, N) does not match
+    # the MoE layer you want to tune, e.g. MTP / shared-expert variants).
+    parser.add_argument("--override-e", type=int, default=None,
+                        help="override num_experts E")
+    parser.add_argument("--override-n", type=int, default=None,
+                        help="override per-expert intermediate N (file name N)")
+    parser.add_argument("--override-k", type=int, default=None,
+                        help="override hidden_size K")
+    parser.add_argument("--override-topk", type=int, default=None,
+                        help="override topk")
     args = parser.parse_args()
 
     main(args)
