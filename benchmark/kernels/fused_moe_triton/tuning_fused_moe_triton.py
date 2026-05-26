@@ -338,6 +338,7 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
+        first_err_printed = False
         with (
             torch.get_device_module().device(self.device_id)
             if _is_xpu or _is_hip
@@ -361,8 +362,16 @@ class BenchmarkWorker:
                         block_shape,
                         num_iters=10,
                     )
-                except (triton.runtime.autotuner.OutOfResources, RuntimeError):
+                except (triton.runtime.autotuner.OutOfResources, RuntimeError) as e:
                     # Some configurations may be invalid and fail to compile.
+                    if not first_err_printed:
+                        import traceback
+                        print(
+                            f"[DEBUG] first failure on bs={num_tokens} cfg={config}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        traceback.print_exc()
+                        first_err_printed = True
                     continue
 
                 if kernel_time < best_time:
