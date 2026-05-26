@@ -370,7 +370,12 @@ class BenchmarkWorker:
                     best_config = config
         now = datetime.now()
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
-        assert best_config is not None
+        if best_config is None:
+            print(
+                f"[{now.ctime()}] WARN: no valid config for bs={num_tokens}, "
+                f"fallback to search_space[0]"
+            )
+            best_config = search_space[0]
         return best_config
 
 
@@ -426,6 +431,15 @@ def main(args: argparse.Namespace):
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
 
+        def _ss_for_bs(bs):
+            """big-M OOM-safe subset for large batch sizes."""
+            if bs >= 4096:
+                return [
+                    c for c in search_space
+                    if c["BLOCK_SIZE_M"] <= 64 and c["BLOCK_SIZE_N"] <= 128
+                ]
+            return search_space
+
         filename = get_config_filename(
             E,
             shard_intermediate_size,
@@ -460,7 +474,7 @@ def main(args: argparse.Namespace):
                     use_int4_w4a16,
                     per_channel_quant,
                     block_shape,
-                    search_space,
+                    _ss_for_bs(batch_size),
                 )
                 for batch_size in batch_sizes
             ],

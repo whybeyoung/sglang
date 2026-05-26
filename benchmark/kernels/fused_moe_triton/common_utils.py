@@ -299,4 +299,6 @@ def get_default_batch_sizes() -> List[int]:
         2048,
         3072,
         4096,
+        6144,
+        8192,
     ]
