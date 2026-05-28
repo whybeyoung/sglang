@@ -2310,41 +2310,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
-        self._pp_parallel_deep_gemm_warmup()
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and self.pp_size > 1
+            and not self.spec_algorithm.is_speculative()
+        ):
+            self._pp_parallel_deep_gemm_warmup()
 
     def _pp_parallel_deep_gemm_warmup(self):
         """Per-PP-rank local dummy forward so DeepGEMM JIT compiles in
         parallel across PP stages instead of serially via the warmup
         ``/generate`` request flowing through the pipeline.
         """
-        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            return
-        if self.pp_size <= 1:
-            return
-        # Speculative target-verify has its own metadata; rely on serving warmup.
-        if self.spec_algorithm.is_speculative():
-            return
+        # n_splits ~= n_sms // ceil(bs/64); pick bs to cover 4 brackets.
+        n_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        block_m = 64
+        batch_sizes = sorted(
+            {
+                1,
+                2 * block_m,
+                max(n_sms // 8, 2) * block_m,
+                max(n_sms // 4, 4) * block_m,
+            }
+        )
 
         logger.info(
-            "PP-parallel DeepGEMM warmup start (pp_rank=%d, tp_rank=%d).",
+            "PP-parallel DeepGEMM warmup start (pp_rank=%d, tp_rank=%d, batch_sizes=%s).",
             self.pp_rank,
             self.tp_rank,
+            batch_sizes,
         )
         t0 = time.perf_counter()
-        try:
-            with torch.inference_mode():
+        with torch.inference_mode():
+            for bs in batch_sizes:
                 if self.is_generation:
                     self._dummy_run(
-                        batch_size=1,
+                        batch_size=bs,
                         forward_mode_override=ForwardMode.DECODE,
                     )
                 self._dummy_run(
-                    batch_size=1,
+                    batch_size=bs,
                     forward_mode_override=ForwardMode.EXTEND,
                 )
-        except Exception as e:
-            logger.warning("PP-parallel DeepGEMM warmup skipped: %r", e)
-            return
 
         logger.info(
             "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
