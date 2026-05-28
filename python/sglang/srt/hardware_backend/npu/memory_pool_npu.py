@@ -50,10 +50,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # Per-layer K/V buffers (slot 0 reserved for padded tokens).
-            # 2 MiB alignment is provided process-wide by torch_npu (see
-            # init_npu_backend() in hardware_backend/npu/utils.py), so
-            # plain torch.zeros already satisfies CANN HCCL IPC RMA.
+            # 2 MiB aligned via base_addr_aligned_kb=2048.
             segment_shape = (
                 self.size // self.page_size + 1,
                 self.page_size,
@@ -61,15 +58,11 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 self.head_dim,
             )
             self.k_buffer = [
-                torch.zeros(
-                    segment_shape, dtype=self.store_dtype, device=self.device
-                )
+                torch.zeros(segment_shape, dtype=self.store_dtype, device=self.device)
                 for _ in range(self.layer_num)
             ]
             self.v_buffer = [
-                torch.zeros(
-                    segment_shape, dtype=self.store_dtype, device=self.device
-                )
+                torch.zeros(segment_shape, dtype=self.store_dtype, device=self.device)
                 for _ in range(self.layer_num)
             ]
 
@@ -253,10 +246,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # Per-layer K/V buffers (slot 0 reserved for padded tokens).
-            # 2 MiB alignment is provided process-wide by torch_npu (see
-            # init_npu_backend() in hardware_backend/npu/utils.py), so
-            # plain torch.zeros already satisfies CANN HCCL IPC RMA.
+            # 2 MiB aligned via base_addr_aligned_kb=2048.
             num_pages = self.size // self.page_size + 1
 
             self.k_buffer = [
