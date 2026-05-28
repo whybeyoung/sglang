@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ConfigureLoggingReq,
     FreezeGCReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
@@ -139,6 +140,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (FreezeGCReq, self.handle_freeze_gc_req),
+                (ConfigureLoggingReq, self.handle_configure_logging_req),
             ]
         )
 
@@ -405,6 +407,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         freeze_gc("Detokenizer Manager")
         return None
 
+    def handle_configure_logging_req(self, recv_req: ConfigureLoggingReq):
+        if recv_req.log_level is not None:
+            logging.getLogger().setLevel(recv_req.log_level.upper())
 
 def is_health_check_request(rid: Optional[str]) -> bool:
     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
