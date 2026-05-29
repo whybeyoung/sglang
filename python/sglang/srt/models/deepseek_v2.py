@@ -67,6 +67,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
+    gather_hidden_states_and_residual_for_pp,
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
@@ -2118,6 +2119,11 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            hidden_states, residual = gather_hidden_states_and_residual_for_pp(
+                hidden_states,
+                residual,
+                self.layers[self.end_layer - 1].layer_scatter_modes,
+            )
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
@@ -2172,7 +2178,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # checkpoint's source layer names.
         if quant_config is not None:
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
-
 
         self.pp_group = get_pp_group()
         self.config = config
