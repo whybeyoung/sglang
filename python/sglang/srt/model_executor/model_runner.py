@@ -2338,21 +2338,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             }
         )
 
+        # Skip DECODE on prefill nodes (indexer would OOM) and EXTEND on decode nodes.
+        disagg_mode = self.server_args.disaggregation_mode
+        run_decode = self.is_generation and disagg_mode != "prefill"
+        run_extend = disagg_mode != "decode"
+
         logger.info(
-            "PP-parallel DeepGEMM warmup start (pp_rank=%d, tp_rank=%d, per_rank_M=%s).",
+            "PP-parallel DeepGEMM warmup start "
+            "(pp_rank=%d, tp_rank=%d, per_rank_M=%s, "
+            "disagg=%s, run_decode=%s, run_extend=%s).",
             self.pp_rank,
             self.tp_rank,
             per_rank_M_values,
+            disagg_mode,
+            run_decode,
+            run_extend,
         )
         t0 = time.perf_counter()
         with torch.inference_mode():
             for M in per_rank_M_values:
-                if self.is_generation:
+                if run_decode:
                     self._dummy_run(
                         batch_size=M,
                         forward_mode_override=ForwardMode.DECODE,
                     )
-                self._pp_extend_warmup_one(per_rank_M=M)
+                if run_extend:
+                    self._pp_extend_warmup_one(per_rank_M=M)
                 # Release fragmented pool before cuda graph capture.
                 torch.cuda.empty_cache()
 
