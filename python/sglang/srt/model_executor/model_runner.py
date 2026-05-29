@@ -2318,15 +2318,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._pp_parallel_deep_gemm_warmup()
 
     def _pp_parallel_deep_gemm_warmup(self):
-        """Per-PP-rank local dummy forward so DeepGEMM JIT compiles in
-        parallel across PP stages instead of serially via the warmup
-        ``/generate`` request flowing through the pipeline.
-        """
-        # n_splits ~= n_sms // ceil(bs/64); pick bs to cover 5 brackets.
+        """Parallel DeepGEMM JIT across PP stages via per-rank dummy
+        forwards. EXTEND uses a dedicated 1-seq prefill shape to match
+        what ``init_forward_metadata_prefill`` expects."""
+        # Align per_rank_M to cp_size: can_dsa_cp_split asserts divisibility.
         n_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         block_m = 64
         cp = max(self.attn_cp_size, 1)
-        batch_sizes = sorted(
+        per_rank_M_values = sorted(
             {
                 ceil_align(bs, cp)
                 for bs in (
@@ -2340,29 +2339,120 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         logger.info(
-            "PP-parallel DeepGEMM warmup start (pp_rank=%d, tp_rank=%d, batch_sizes=%s).",
+            "PP-parallel DeepGEMM warmup start (pp_rank=%d, tp_rank=%d, per_rank_M=%s).",
             self.pp_rank,
             self.tp_rank,
-            batch_sizes,
+            per_rank_M_values,
         )
         t0 = time.perf_counter()
         with torch.inference_mode():
-            for bs in batch_sizes:
+            for M in per_rank_M_values:
                 if self.is_generation:
                     self._dummy_run(
-                        batch_size=bs,
+                        batch_size=M,
                         forward_mode_override=ForwardMode.DECODE,
                     )
-                self._dummy_run(
-                    batch_size=bs,
-                    forward_mode_override=ForwardMode.EXTEND,
-                )
+                self._pp_extend_warmup_one(per_rank_M=M)
+                # Release fragmented pool before cuda graph capture.
+                torch.cuda.empty_cache()
 
         logger.info(
             "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
             time.perf_counter() - t0,
             self.pp_rank,
         )
+
+    def _pp_extend_warmup_one(self, per_rank_M: int):
+        """One 1-seq EXTEND dummy forward (num_tokens_global tokens),
+        mirrors PiecewiseCudaGraphRunner.warmup_compile. With DSA prefill
+        CP active, model.forward splits per rank; pp_proxy is per-rank."""
+        cp_size = max(self.attn_cp_size, 1)
+        cp_active = cp_size > 1 and is_dsa_enable_prefill_cp()
+        num_tokens_global = per_rank_M * cp_size if cp_active else per_rank_M
+
+        device = self.device
+        with torch.device(device):
+            input_ids = torch.zeros((num_tokens_global,), dtype=torch.int64)
+            positions = torch.zeros((num_tokens_global,), dtype=torch.int64)
+            out_cache_loc = torch.zeros((num_tokens_global,), dtype=torch.int64)
+            req_pool_indices = torch.arange(1, dtype=torch.int64)
+            seq_lens = torch.tensor([num_tokens_global], dtype=torch.int32)
+            extend_seq_lens = torch.tensor([num_tokens_global], dtype=torch.int32)
+            extend_prefix_lens = torch.tensor([0], dtype=torch.int32)
+            extend_start_loc = torch.tensor([0], dtype=torch.int32)
+
+        seq_lens_cpu = torch.tensor(
+            [num_tokens_global], dtype=torch.int32, device="cpu"
+        )
+        extend_seq_lens_cpu = [num_tokens_global]
+        extend_prefix_lens_cpu = [0]
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            orig_seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=num_tokens_global,
+            return_logprob=False,
+            positions=positions,
+            extend_num_tokens=num_tokens_global,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            spec_algorithm=self.spec_algorithm,
+            spec_info=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_forward_mode=ForwardMode.EXTEND,
+            lora_ids=None,
+        )
+
+        # PP rank > 0: receive already-CP-split hidden_states.
+        pp_proxy_tensors: Optional[PPProxyTensors] = None
+        if self.pp_size > 1 and self.pp_rank != 0:
+            hidden_size = self.model_config.hidden_size
+            hc_hidden_size = getattr(self.model_config, "hc_hidden_size", None)
+            is_mhc = hc_hidden_size is not None
+            hs = hc_hidden_size if is_mhc else hidden_size
+            tensors = {
+                "hidden_states": torch.zeros(
+                    (per_rank_M, hs), dtype=self.dtype, device=device
+                ),
+            }
+            if not is_mhc:
+                tensors["residual"] = torch.zeros(
+                    (per_rank_M, hidden_size), dtype=self.dtype, device=device
+                )
+            pp_proxy_tensors = PPProxyTensors(tensors)
+
+        self.attn_backend.init_forward_metadata(forward_batch)
+
+        torch.get_device_module(self.device).synchronize()
+        self.tp_group.barrier()
+        with forward_context(ForwardContext(attn_backend=self.attn_backend)):
+            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(
+                None, num_tokens_global, forward_batch.dp_padding_mode.is_max_len()
+            )
+            set_is_extend_in_batch(False)
+
+            kwargs = {}
+            if (
+                pp_proxy_tensors is not None
+                and "pp_proxy_tensors"
+                in inspect.signature(self.model.forward).parameters
+            ):
+                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            if not self.is_generation:
+                kwargs["get_embedding"] = True
+
+            self.model.forward(input_ids, positions, forward_batch, **kwargs)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
