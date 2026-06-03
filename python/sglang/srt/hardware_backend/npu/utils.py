@@ -108,6 +108,12 @@ def init_npu_backend():
     torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
+    # 2 MiB align for HCCL IPC RMA; tolerate stock torch_npu.
+    try:
+        torch_npu.npu.memory.set_per_process_base_addr_alignment_kb(2048)
+    except AttributeError as e:
+        logger.error("torch_npu missing set_per_process_base_addr_alignment_kb (%s)", e)
+
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
