@@ -251,6 +251,26 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # EAGLE doesn't use stream_idx / lora variants.
         return ShapeKey(size=bs)
 
+    def _attach_hisparse_coordinator(
+        self, forward_batch: ForwardBatch, num_real_reqs: int
+    ) -> None:
+        target_worker = getattr(self.eagle_worker, "target_worker", None)
+        target_model_runner = getattr(target_worker, "model_runner", None)
+        coordinator = getattr(target_model_runner, "hisparse_coordinator", None)
+        if coordinator is None:
+            return
+        if not callable(
+            getattr(
+                self.model_runner.token_to_kv_pool,
+                "translate_loc_to_hisparse_device",
+                None,
+            )
+        ):
+            return
+        forward_batch.hisparse_coordinator = coordinator
+        coordinator.wait_for_pending_backup()
+        coordinator.num_real_reqs.fill_(num_real_reqs)
+
     # -----------------------------------------------------------------
     # can_run
     # -----------------------------------------------------------------
@@ -374,6 +394,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
         )
+
+        self._attach_hisparse_coordinator(forward_batch, num_seqs)
 
         def run_once():
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -521,6 +543,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
         # forward_batch.batch_size was overwritten to bs above when padding.
+        self._attach_hisparse_coordinator(forward_batch, raw_bs)
         self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         self.raw_bs = raw_bs
         self.bs = bs

@@ -167,13 +167,13 @@ class DecodeReqToTokenPool:
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
-                r.req_pool_idx = select_index[offset]
+                r.req_pool_idx = int(select_index[offset])
                 offset += 1
-        return [r.req_pool_idx for r in reqs]
+        return [int(r.req_pool_idx) for r in reqs]
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        self.free_slots.append(int(req.req_pool_idx))
         req.req_pool_idx = None
 
     def clear(self):
@@ -408,7 +408,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
-        if self.draft_token_to_kv_pool is not None:
+        kv_args.target_kv_data_ptr_count = len(kv_data_ptrs)
+        # HiSparse direct-to-host uses host-pool indices for target KV transfer.
+        # Draft KV remains device-indexed and cannot share that destination list.
+        if (
+            self.draft_token_to_kv_pool is not None
+            and not self.scheduler.enable_hisparse
+        ):
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -593,6 +599,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False
             )
+        hisparse_host_allocatable_tokens = (
+            self._hisparse_host_allocatable_token_budget(count_retracted=False)
+            if self.scheduler.enable_hisparse
+            else int(1e18)
+        )
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
@@ -606,17 +617,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
+            if self.scheduler.enable_hisparse:
+                host_required = self._hisparse_host_required_tokens(req)
+                if host_required > hisparse_host_allocatable_tokens:
+                    break
 
+            if self._pre_alloc(req) is None:
+                break
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
-            self._pre_alloc(req)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens -= swa_required
+            if self.scheduler.enable_hisparse:
+                hisparse_host_allocatable_tokens -= host_required
 
-            # load from cpu, release the cpu copy
-            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+            if self.scheduler.enable_hisparse:
+                self.scheduler.hisparse_coordinator.admit_request_direct(req)
+            else:
+                # load from cpu, release the cpu copy
+                req.load_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
 
         self.retracted_queue = [
             entry
@@ -808,18 +831,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
         # First, remove all failed requests from the queue
+        aborted_rids = set()
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                decode_req.kv_receiver.abort()
+                if hasattr(decode_req.kv_receiver, "clear"):
+                    decode_req.kv_receiver.clear()
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
+                aborted_rids.add(decode_req.req.rid)
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
@@ -835,6 +862,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
                 - len(self.transfer_queue.queue),
             )
+            hisparse_host_allocatable_tokens = (
+                self._hisparse_host_allocatable_token_budget(count_retracted=True)
+            )
+        else:
+            hisparse_host_allocatable_tokens = int(1e18)
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -934,12 +966,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            if self.scheduler.enable_hisparse:
+                hisparse_host_required = self._hisparse_host_required_tokens(
+                    decode_req.req
+                )
+                if hisparse_host_required > hisparse_host_allocatable_tokens:
+                    logger.debug(
+                        "HiSparse host prealloc budget blocked req %s: need=%d, allocatable=%d, available=%d",
+                        decode_req.req.rid,
+                        hisparse_host_required,
+                        hisparse_host_allocatable_tokens,
+                        self.scheduler.hisparse_coordinator.mem_pool_host.available_size(),
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    break
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
+            if dst_kv_indices is None:
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                break
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -958,6 +1010,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
+            if self.scheduler.enable_hisparse:
+                hisparse_host_allocatable_tokens -= hisparse_host_required
             decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
@@ -1075,6 +1129,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        if aborted_rids:
+            self.pending_reqs = [
+                decode_req
+                for decode_req in self.pending_reqs
+                if decode_req.req.rid not in aborted_rids
+            ]
 
         return preallocated_reqs, failed_reqs
 
@@ -1114,6 +1174,89 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
         return self.num_reserved_decode_tokens * n_active
+
+    def _req_prealloc_full_len(self, req: Req) -> int:
+        return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
+    def _req_committed_full_len(self, req: Req) -> int:
+        full_len = getattr(req, "kv_committed_len", None)
+        if full_len is None or full_len <= 0:
+            return self._req_prealloc_full_len(req)
+        return int(full_len)
+
+    def _req_remaining_decode_tokens(self, req: Req) -> int:
+        committed_output_len = max(
+            0, self._req_committed_full_len(req) - len(req.origin_input_ids)
+        )
+        max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+        return max(0, max_new_tokens - committed_output_len)
+
+    def _hisparse_host_decode_reserve_len(
+        self, req: Req, num_decode_tokens: Optional[int] = None
+    ) -> int:
+        coordinator = self.scheduler.hisparse_coordinator
+        if num_decode_tokens is None:
+            num_decode_tokens = self.num_reserved_decode_tokens
+        return coordinator.host_decode_reserve_len(
+            self._req_committed_full_len(req), num_decode_tokens
+        )
+
+    def _hisparse_host_remaining_decode_reserve_len(self, req: Req) -> int:
+        return self._hisparse_host_decode_reserve_len(
+            req, self._req_remaining_decode_tokens(req)
+        )
+
+    def _hisparse_retracted_host_len(self, req: Req) -> int:
+        host_len = getattr(req, "hisparse_retracted_host_len", None)
+        if host_len is not None:
+            return int(host_len)
+        host_indices = getattr(req, "hisparse_retracted_host_indices", None)
+        return int(host_indices.numel()) if host_indices is not None else 0
+
+    def _hisparse_host_required_tokens(self, req: Req) -> int:
+        coordinator = self.scheduler.hisparse_coordinator
+        fill_len = self._req_prealloc_full_len(req)
+        host_len = coordinator.compressed_host_len(fill_len)
+        preserved_host_len = self._hisparse_retracted_host_len(req)
+        prompt_need = max(0, host_len - preserved_host_len)
+        return prompt_need + self._hisparse_host_remaining_decode_reserve_len(req)
+
+    def _hisparse_host_reserved_tokens(self, extra_reserved_reqs: int = 0) -> int:
+        coordinator = self.scheduler.hisparse_coordinator
+        reserved = 0
+
+        for req in self.scheduler.running_batch.reqs:
+            reserved += self._hisparse_host_remaining_decode_reserve_len(req)
+        for decode_req in self.transfer_queue.queue:
+            reserved += self._hisparse_host_remaining_decode_reserve_len(decode_req.req)
+        for req in self.scheduler.waiting_queue:
+            reserved += self._hisparse_host_remaining_decode_reserve_len(req)
+
+        last_batch = self.scheduler.last_batch
+        if last_batch and last_batch.forward_mode.is_prebuilt():
+            for req in last_batch.reqs:
+                reserved += self._hisparse_host_remaining_decode_reserve_len(req)
+
+        extra_reserve = coordinator.host_decode_reserve_len(
+            0, self.num_reserved_decode_tokens
+        )
+        return reserved + extra_reserve * extra_reserved_reqs
+
+    def _hisparse_host_allocatable_token_budget(
+        self, count_retracted: bool = True, extra_reserved_reqs: int = 0
+    ) -> int:
+        if not self.scheduler.enable_hisparse:
+            return int(1e18)
+
+        coordinator = self.scheduler.hisparse_coordinator
+        allocatable_tokens = (
+            coordinator.mem_pool_host.available_size()
+            - self._hisparse_host_reserved_tokens(extra_reserved_reqs)
+        )
+        if count_retracted:
+            for req in self.retracted_queue:
+                allocatable_tokens -= self._hisparse_host_required_tokens(req)
+        return allocatable_tokens
 
     def _swa_aware_allocatable_token_budgets(
         self,
@@ -1271,7 +1414,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
         ``prefix_len`` is the L1 device-resident prefix length (already
@@ -1347,15 +1490,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            host_len = coordinator.compressed_host_len(fill_len)
+            host_indices = coordinator.pop_retracted_host_indices(req, host_len)
+            if host_indices is None:
+                # Allocate host indices for the RDMA transfer target.
+                try:
+                    host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                        coordinator.req_to_host_pool,
+                        coordinator.req_to_host_pool_allocated_len,
+                        req.req_pool_idx,
+                        0,
+                        host_len,
+                    )
+                except RuntimeError:
+                    logger.warning(
+                        "HiSparse host prealloc skipped for req %s: need=%d, available=%d",
+                        req.rid,
+                        host_len,
+                        coordinator.mem_pool_host.available_size(),
+                    )
+                    self.token_to_kv_pool_allocator.logical_attn_allocator.free(kv_loc)
+                    self.req_to_token_pool.free(req)
+                    req.kv_allocated_len = 0
+                    req.kv_committed_len = 0
+                    return None
+            else:
+                host_indices = host_indices.to(device=coordinator.device)
+                coordinator.req_to_host_pool[req.req_pool_idx, :host_len] = host_indices
+                coordinator.req_to_host_pool_allocated_len[req.req_pool_idx] = host_len
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:

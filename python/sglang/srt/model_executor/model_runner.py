@@ -898,6 +898,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
+            # Init hisparse coordinator (must happen before CUDA graph capture).
+            # Only the target runner owns scheduler-populated staging state.
+            if self.enable_hisparse and not self.is_draft_worker:
+                from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                hisparse_cfg = parse_hisparse_config(self.server_args)
+                hisparse_top_k = getattr(
+                    self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
+                )
+                hisparse_host_allocator_type = (
+                    "mooncake"
+                    if (
+                        self.server_args.disaggregation_mode == "decode"
+                        and self.server_args.disaggregation_transfer_backend
+                        == "mooncake"
+                    )
+                    else "default"
+                )
+                self.hisparse_coordinator = HiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=(
+                        self.attention_tp_group.cpu_group
+                        if self.server_args.enable_dp_attention
+                        else self.tp_group.cpu_group
+                    ),
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                    host_allocator_type=hisparse_host_allocator_type,
+                )
             self._pre_initialize_flashinfer_allreduce_workspace()
             if not disable_cuda_graph:
                 self.init_decode_cuda_graph()
@@ -3597,6 +3630,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            active_hisparse_coordinator = self.hisparse_coordinator
+            if (
+                active_hisparse_coordinator is None
+                and forward_batch.hisparse_coordinator is not None
+                and callable(
+                    getattr(
+                        self.token_to_kv_pool,
+                        "translate_loc_to_hisparse_device",
+                        None,
+                    )
+                )
+            ):
+                active_hisparse_coordinator = forward_batch.hisparse_coordinator
+
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
@@ -3610,11 +3657,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if (
                 forward_batch.forward_mode.is_decode()
-                and self.hisparse_coordinator is not None
+                and active_hisparse_coordinator is not None
             ):
-                forward_batch.hisparse_coordinator = self.hisparse_coordinator
-                self.hisparse_coordinator.wait_for_pending_backup()
-                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+                forward_batch.hisparse_coordinator = active_hisparse_coordinator
+                active_hisparse_coordinator.wait_for_pending_backup()
+                active_hisparse_coordinator.num_real_reqs.fill_(
+                    forward_batch.batch_size
+                )
 
             # Replay cuda graph if applicable
             if can_run_graph:
@@ -3648,8 +3697,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
             # Hisparse coordinator — backends now read it from self.model_runner.
-            if self.hisparse_coordinator is not None:
-                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+            forward_batch.hisparse_coordinator = active_hisparse_coordinator
+            if active_hisparse_coordinator is not None:
+                active_hisparse_coordinator.num_real_reqs.fill_(
+                    forward_batch.batch_size
+                )
 
             # Forward without cuda graph
             if forward_batch.forward_mode.is_decode():

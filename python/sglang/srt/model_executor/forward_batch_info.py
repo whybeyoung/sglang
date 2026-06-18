@@ -68,6 +68,7 @@ from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -361,6 +362,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # HiSparse coordinator propagated from ScheduleBatch / target worker.
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
@@ -644,6 +647,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            hisparse_coordinator=batch.hisparse_coordinator,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

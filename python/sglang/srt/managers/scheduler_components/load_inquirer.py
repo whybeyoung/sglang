@@ -106,8 +106,13 @@ class SchedulerLoadInquirer:
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            prefill_pending_queue = (
+                self.get_disagg_prefill_bootstrap_queue().pending_queue
+            )
             prefill_bootstrap_queue = self.get_disagg_prefill_bootstrap_queue().queue
+            waiting_queues.append(prefill_pending_queue)
             waiting_queues.append(prefill_bootstrap_queue)
+            pending_token_queues.append(prefill_pending_queue)
             pending_token_queues.append(prefill_bootstrap_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             decode_prealloc_queue = self.get_disagg_decode_prealloc_queue().queue
@@ -174,6 +179,7 @@ class SchedulerLoadInquirer:
         disaggregation = None
         if include_all or "disagg" in include:
             mode_str = "null"
+            prefill_pending = 0
             prefill_bootstrap = 0
             prefill_inflight = 0
             decode_prealloc = 0
@@ -182,6 +188,9 @@ class SchedulerLoadInquirer:
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 mode_str = "prefill"
+                prefill_pending = len(
+                    self.get_disagg_prefill_bootstrap_queue().pending_queue
+                )
                 prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
                 prefill_inflight = len(self.get_disagg_prefill_inflight_queue())
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -194,6 +203,7 @@ class SchedulerLoadInquirer:
 
             disaggregation = DisaggregationMetrics(
                 mode=mode_str,
+                prefill_pending_queue_reqs=prefill_pending,
                 prefill_bootstrap_queue_reqs=prefill_bootstrap,
                 prefill_inflight_queue_reqs=prefill_inflight,
                 decode_prealloc_queue_reqs=decode_prealloc,

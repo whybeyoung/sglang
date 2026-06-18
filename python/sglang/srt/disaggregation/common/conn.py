@@ -153,6 +153,7 @@ class CommonKVManager(BaseKVManager):
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
+        self.status_lock = threading.RLock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -180,6 +181,10 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            # After KV transfer starts, prefill also needs a bounded wait for
+            # the final transfer status. Otherwise a dead decode session can
+            # leave requests in the prefill inflight queue forever.
+            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -209,24 +214,33 @@ class CommonKVManager(BaseKVManager):
             )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
-        return self.request_status[bootstrap_room]
+        with self.status_lock:
+            return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
-                return
-            self.request_status[bootstrap_room] = status
-        else:
-            if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
+        with self.status_lock:
+            if bootstrap_room not in self.request_status:
+                # Do not resurrect a cleared entry with Failed: once clear() has
+                # popped the room from request_status, any late update_status(Failed)
+                # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
+                # pollute a future request that reuses the same bootstrap_room.
+                if status == KVPoll.Failed:
+                    return
+                self.request_status[bootstrap_room] = status
             else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
+                if status == KVPoll.Failed:
+                    self.request_status[bootstrap_room] = KVPoll.Failed
+                else:
+                    self.request_status[bootstrap_room] = max(
+                        self.request_status[bootstrap_room], status
+                    )
+
+    def update_status_if_present(self, bootstrap_room: int, status: KVPoll) -> bool:
+        with self.status_lock:
+            if bootstrap_room not in self.request_status:
+                return False
+            self.update_status(bootstrap_room, status)
+            return True
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
@@ -910,11 +924,12 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
-            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "transfer_infos"):
-            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        with self.kv_mgr.status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+                self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "transfer_infos"):
+                self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1155,9 +1170,12 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
-        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        with self.kv_mgr.status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr.required_prefill_response_num_table.pop(
+                self.bootstrap_room, None
+            )
+            self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(

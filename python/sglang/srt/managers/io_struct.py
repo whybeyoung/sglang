@@ -2042,6 +2042,9 @@ class DisaggregationMetrics:
     """PD disaggregation metrics."""
 
     mode: str  # "prefill", "decode", or "null" - not a metric
+    prefill_pending_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill pending queue requests")}
+    )
     prefill_bootstrap_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Prefill bootstrap queue requests")}
     )

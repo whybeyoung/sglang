@@ -175,6 +175,17 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _stash_hisparse_spec_info(
+        self, batch: ScheduleBatch, batch_index: int, req: Req
+    ) -> None:
+        if not self.server_args.enable_hisparse or batch.spec_info is None:
+            return
+        if not hasattr(batch.spec_info, "slice_single"):
+            raise RuntimeError(
+                f"HiSparse cannot stash speculative state for {type(batch.spec_info).__name__}"
+            )
+        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -203,6 +214,12 @@ class SchedulerBatchResultProcessor:
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
             )
+            if (
+                self.server_args.enable_hisparse
+                and batch.spec_info is None
+                and result.next_draft_input is not None
+            ):
+                batch.spec_info = result.next_draft_input
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -237,6 +254,7 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
+                            self._stash_hisparse_spec_info(batch, i, req)
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
@@ -815,6 +833,16 @@ class SchedulerBatchResultProcessor:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
+            elif req.req_pool_idx is None:
+                if getattr(req, "mamba_pool_idx", None) is not None:
+                    release_kv_cache(req, self.tree_cache)
+                logger.warning(
+                    "Skip KV release for finished req %s because req_pool_idx is "
+                    "already None (kv_committed_freed=%s, kv_overallocated_freed=%s)",
+                    req.rid,
+                    req.kv_committed_freed,
+                    req.kv_overallocated_freed,
+                )
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)

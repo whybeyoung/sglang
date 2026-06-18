@@ -263,13 +263,13 @@ class ReqToTokenPool:
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
-                r.req_pool_idx = select_index[offset]
+                r.req_pool_idx = int(select_index[offset])
                 offset += 1
-        return [r.req_pool_idx for r in reqs]
+        return [int(r.req_pool_idx) for r in reqs]
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        self.free_slots.append(int(req.req_pool_idx))
         req.req_pool_idx = None
 
     def clear(self):

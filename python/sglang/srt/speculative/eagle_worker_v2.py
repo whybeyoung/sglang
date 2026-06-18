@@ -1420,6 +1420,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+            and not batch.forward_mode.is_idle()
+        ):
+            hisparse_coordinator.finalize_accepted_tokens_spec_v2(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                verify_cache_locs=batch.out_cache_loc,
+                accept_index=accept_index,
+            )
+
         # Update mamba state for hybrid GDN models after verification
         commit_mamba_states_after_verify(
             self.target_worker,

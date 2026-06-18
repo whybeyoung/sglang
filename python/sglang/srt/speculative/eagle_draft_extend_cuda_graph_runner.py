@@ -254,7 +254,49 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
+    def _uses_target_hisparse_coordinator(self, forward_batch: ForwardBatch) -> bool:
+        target_worker = getattr(self.eagle_worker, "target_worker", None)
+        target_model_runner = getattr(target_worker, "model_runner", None)
+        coordinator = getattr(target_model_runner, "hisparse_coordinator", None)
+        if coordinator is None:
+            return False
+        token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        return callable(
+            getattr(
+                token_to_kv_pool,
+                "translate_loc_to_hisparse_device",
+                None,
+            )
+        )
+
+    def _attach_hisparse_coordinator(
+        self, forward_batch: ForwardBatch, num_real_reqs: int
+    ) -> None:
+        target_worker = getattr(self.eagle_worker, "target_worker", None)
+        target_model_runner = getattr(target_worker, "model_runner", None)
+        coordinator = getattr(target_model_runner, "hisparse_coordinator", None)
+        if coordinator is None:
+            return
+        token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if not callable(
+            getattr(
+                token_to_kv_pool,
+                "translate_loc_to_hisparse_device",
+                None,
+            )
+        ):
+            return
+        forward_batch.hisparse_coordinator = coordinator
+        coordinator.wait_for_pending_backup()
+        coordinator.num_real_reqs.fill_(num_real_reqs)
+
     def can_run(self, forward_batch: ForwardBatch):
+        if self._uses_target_hisparse_coordinator(forward_batch):
+            # HiSparse draft-extend uses per-request variable accepted-token
+            # counts. The captured graph has a fixed full-row layout, so replay
+            # can reinterpret packed rows incorrectly after verify.
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -365,6 +407,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             capture_hidden_mode=CaptureHiddenMode.LAST,
             padded_static_len=self.padded_static_len,
         )
+
+        self._attach_hisparse_coordinator(forward_batch, bs)
 
         def run_once():
             # Clean intermediate result cache for DP attention
@@ -514,6 +558,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         seq_lens_sum = forward_batch.seq_lens_sum
         if seq_lens_sum is not None:
             seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        self._attach_hisparse_coordinator(forward_batch, raw_bs)
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=self.forward_mode,
@@ -525,6 +570,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             out_cache_loc=forward_batch.out_cache_loc,
             spec_info=forward_batch.spec_info,
+            hisparse_coordinator=forward_batch.hisparse_coordinator,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 

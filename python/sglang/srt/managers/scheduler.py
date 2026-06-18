@@ -2335,6 +2335,10 @@ class Scheduler(
                     ),
                     req,
                 )
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.request_finished(req)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -2459,7 +2463,40 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
+
+        if not batch.spec_algorithm.is_none():
+            missing_spec_info_rids = [
+                req.rid
+                for req in reqs
+                if getattr(req, "hisparse_spec_info", None) is None
+            ]
+            if missing_spec_info_rids:
+                raise RuntimeError(
+                    "HiSparse decode batch is missing speculative draft state for requests: "
+                    + ", ".join(missing_spec_info_rids)
+                )
+
+            batch.spec_info = reqs[0].hisparse_spec_info
+            reqs[0].hisparse_spec_info = None
+            for req in reqs[1:]:
+                batch.spec_info.merge_batch(req.hisparse_spec_info)
+                req.hisparse_spec_info = None
+
+            if not batch.spec_algorithm.is_none():
+                if batch.spec_info.new_seq_lens is None:
+                    raise RuntimeError(
+                        "HiSparse spec-v2 decode batch is missing new_seq_lens for draft state rebuild."
+                    )
+                future_indices = self.future_map.alloc_future_indices(len(reqs))
+                self.future_map.store_to_map_for_new_batch(
+                    future_indices, batch.spec_info
+                )
+                batch.spec_info.future_indices = future_indices
+                batch.spec_info.verify_done = None
+                batch.seq_lens = batch.spec_info.new_seq_lens
+                batch.seq_lens_cpu = batch.seq_lens.cpu()
+                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+                batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
@@ -3186,6 +3223,12 @@ class Scheduler(
                     )
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
+                if (
+                    self.enable_hisparse
+                    and not batch.spec_algorithm.is_none()
+                    and batch_result.next_draft_input is not None
+                ):
+                    batch.spec_info = batch_result.next_draft_input
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -3418,6 +3461,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= len(self.disagg_prefill_bootstrap_queue.pending_queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -3681,7 +3725,6 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
-        # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -3700,6 +3743,8 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if self.enable_hisparse:
+                    self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3731,40 +3776,126 @@ class Scheduler(
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Abort requests that are queued before KV sender admission.
+            remaining_pending = deque()
+            for req in self.disagg_prefill_bootstrap_queue.pending_queue:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort pending bootstrap request. {req.rid=}")
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        AbortReq(rid=req.rid), req
+                    )
+                else:
+                    remaining_pending.append(req)
+            self.disagg_prefill_bootstrap_queue.pending_queue = remaining_pending
+
             # Abort requests that have not yet been bootstrapped
+            remaining_bootstrap = []
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        AbortReq(rid=req.rid), req
+                    )
+                else:
+                    remaining_bootstrap.append(req)
+            self.disagg_prefill_bootstrap_queue.queue = remaining_bootstrap
 
             # Abort in-flight requests
+            remaining_inflight = []
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_req_to_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        AbortReq(rid=req.rid), req
+                    )
+                else:
+                    remaining_inflight.append(req)
+            self.disagg_prefill_inflight_queue = remaining_inflight
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
+            aborted_prealloc_rids = set()
+            remaining_prealloc = []
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if hasattr(decode_req.kv_receiver, "clear"):
+                        decode_req.kv_receiver.clear()
+                    aborted_prealloc_rids.add(decode_req.req.rid)
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        AbortReq(rid=decode_req.req.rid), decode_req.req
+                    )
+                else:
+                    remaining_prealloc.append(decode_req)
+            self.disagg_decode_prealloc_queue.queue = remaining_prealloc
+            if aborted_prealloc_rids:
+                self.disagg_decode_prealloc_queue.pending_reqs = [
+                    decode_req
+                    for decode_req in self.disagg_decode_prealloc_queue.pending_reqs
+                    if decode_req.req.rid not in aborted_prealloc_rids
+                ]
 
             # Abort requests waiting for kvcache to release tree cache
+            transfer_queue = self.disagg_decode_transfer_queue
+            remaining_transfer = []
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if (
+                        transfer_queue.enable_staging
+                        and transfer_queue.staging_handler is not None
+                        and transfer_queue.staging_handler.is_staging_room(
+                            decode_req.req.bootstrap_room
+                        )
+                    ):
+                        transfer_queue.staging_handler.unregister_decode_req(
+                            decode_req.req.bootstrap_room
+                        )
+                    if decode_req.metadata_buffer_index != -1:
+                        transfer_queue.req_to_metadata_buffer_idx_allocator.free(
+                            decode_req.metadata_buffer_index
+                        )
+                        decode_req.metadata_buffer_index = -1
+                    if hasattr(decode_req.kv_receiver, "clear"):
+                        decode_req.kv_receiver.clear()
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.request_finished(decode_req.req)
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        AbortReq(rid=decode_req.req.rid), decode_req.req
+                    )
+                else:
+                    remaining_transfer.append(decode_req)
+            self.disagg_decode_transfer_queue.queue = remaining_transfer
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        assert hasattr(decode_req, "kv_cache_cpu")
-                        del decode_req.kv_cache_cpu
+                        if self.enable_hisparse:
+                            self.hisparse_coordinator.release_retracted_req(decode_req)
+                        else:
+                            assert hasattr(decode_req, "kv_cache_cpu")
+                            del decode_req.kv_cache_cpu
                         self.ipc_channels.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )

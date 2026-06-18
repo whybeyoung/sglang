@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Deque, List, Optional
 
 import numpy as np
 import torch
@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -133,6 +134,7 @@ class PrefillBootstrapQueue:
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
+        self.pending_queue: Deque[Req] = deque()
         self.gloo_group = gloo_group
         self.scheduler = scheduler
         self.max_total_num_tokens = (
@@ -158,6 +160,7 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.target_kv_data_ptr_count = len(kv_data_ptrs)
 
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -225,12 +228,37 @@ class PrefillBootstrapQueue:
                 )
         return kv_manager
 
-    def create_sender(self, req: Req, num_kv_heads: int) -> bool:
-        """Create a KV sender for the request without enqueuing it.
-        Returns False if the request exceeds KV capacity."""
-        if self._check_if_req_exceed_kv_capacity(req):
-            return False
+    def _active_sender_req_count(self) -> int:
+        """Count requests that already own a prefill KV sender.
 
+        Requests without a sender have not entered Mooncake's bootstrapping
+        state yet, so they do not consume metadata buffers and cannot hit the
+        fixed bootstrap timeout.
+        """
+        active_rids = set()
+        queues = [
+            self.queue,
+            self.scheduler.waiting_queue,
+            getattr(self.scheduler, "disagg_prefill_inflight_queue", []),
+        ]
+        for batch_name in ("cur_batch", "last_batch", "running_batch"):
+            batch = getattr(self.scheduler, batch_name, None)
+            if batch is not None:
+                queues.append(getattr(batch, "reqs", []))
+
+        for reqs in queues:
+            for req in reqs:
+                if getattr(req, "disagg_kv_sender", None) is not None:
+                    active_rids.add(req.rid)
+        return len(active_rids)
+
+    def _max_active_sender_reqs(self) -> int:
+        return self.req_to_metadata_buffer_idx_allocator.size
+
+    def _can_admit_sender(self) -> bool:
+        return self._active_sender_req_count() < self._max_active_sender_reqs()
+
+    def _create_kv_sender(self, req: Req, num_kv_heads: int) -> None:
         backend = (
             TransferBackend.FAKE
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -247,9 +275,8 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
         )
-        self._process_req(req)
         req.pending_bootstrap = True
-        return True
+        self.queue.append(req)
 
     def ensure_metadata_buffer(self, req: Req) -> bool:
         if req.metadata_buffer_index >= 0:
@@ -281,10 +308,21 @@ class PrefillBootstrapQueue:
         req.pending_bootstrap = False
         return True
 
+    def _admit_pending(self, num_kv_heads: int) -> None:
+        while self.pending_queue and self._can_admit_sender():
+            req = self.pending_queue.popleft()
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                continue
+            self._create_kv_sender(req, num_kv_heads)
+
     def add(self, req: Req, num_kv_heads: int) -> None:
-        if not self.create_sender(req, num_kv_heads):
+        if self._check_if_req_exceed_kv_capacity(req):
             return
-        self.queue.append(req)
+
+        self._process_req(req)
+        self.pending_queue.append(req)
+        self._admit_pending(num_kv_heads)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -321,6 +359,8 @@ class PrefillBootstrapQueue:
         bootstrapped_reqs = []
         failed_reqs = []
         indices_to_remove = set()
+
+        self._admit_pending(self.scheduler.model_config.num_key_value_heads)
 
         if len(self.queue) == 0:
             if return_failed_reqs is False:
@@ -579,6 +619,22 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if isinstance(getattr(req, "to_finish", None), FINISH_ABORT) or isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                if hasattr(req.disagg_kv_sender, "abort"):
+                    req.disagg_kv_sender.abort()
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+                continue
+
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 

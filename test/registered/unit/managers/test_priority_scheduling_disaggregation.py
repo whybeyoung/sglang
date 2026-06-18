@@ -187,6 +187,57 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         )
         self.assertEqual(failed, [])
 
+    def test_hisparse_host_budget_blocks_prealloc_before_host_alloc(self):
+        decode_req = self._new_decode_req("blocked", 1)
+        queue = self._new_queue([decode_req])
+        queue.num_reserved_decode_tokens = 2
+        queue.scheduler.enable_hisparse = True
+        queue.scheduler.hisparse_coordinator = SimpleNamespace(
+            padded_buffer_size=1,
+            compressed_host_len=lambda full_len: full_len,
+            host_decode_reserve_len=lambda full_len, num_decode_tokens: num_decode_tokens,
+            mem_pool_host=SimpleNamespace(available_size=MagicMock(return_value=4)),
+        )
+        queue.token_to_kv_pool_allocator.logical_attn_allocator.available_size.return_value = (
+            100
+        )
+        queue.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size.return_value = (
+            100
+        )
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        queue._pre_alloc.assert_not_called()
+
+    def test_hisparse_host_budget_reserves_outputs_to_completion(self):
+        decode_req = self._new_decode_req("blocked-by-output-reserve", 1)
+        running_req = self._new_decode_req("running", 2).req
+        running_req.kv_committed_len = len(running_req.origin_input_ids)
+        queue = self._new_queue([decode_req])
+        queue.num_reserved_decode_tokens = 2
+        queue.scheduler.running_batch.reqs = [running_req]
+        queue.scheduler.enable_hisparse = True
+        queue.scheduler.hisparse_coordinator = SimpleNamespace(
+            padded_buffer_size=1,
+            compressed_host_len=lambda full_len: full_len,
+            host_decode_reserve_len=lambda full_len, num_decode_tokens: num_decode_tokens,
+            mem_pool_host=SimpleNamespace(available_size=MagicMock(return_value=15)),
+        )
+        queue.token_to_kv_pool_allocator.logical_attn_allocator.available_size.return_value = (
+            100
+        )
+        queue.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size.return_value = (
+            100
+        )
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        queue._pre_alloc.assert_not_called()
+
     def test_failed_request_indices_stay_valid_after_priority_sort(self):
         failed_low = self._new_decode_req("failed-low", 1, failed=True)
         healthy_high = self._new_decode_req("healthy-high", 10)

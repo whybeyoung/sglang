@@ -9,6 +9,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
@@ -105,15 +106,40 @@ class EagleDraftInputV2Mixin:
                 batch.req_pool_indices,
                 cur_kv_lens_device,
             )
-            out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                cur_kv_lens_device,
-                cur_kv_lens_cpu,
-                nxt_kv_lens_device,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-            )
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                evict_from_tree_cache(
+                    batch.tree_cache,
+                    num_needed_tokens + len(cur_kv_lens_cpu) * allocator.page_size,
+                )
+                device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                    batch.req_pool_indices,
+                    nxt_kv_lens_cpu - cur_kv_lens_cpu,
+                    cur_kv_lens_cpu,
+                )
+                out_cache_loc = allocator.alloc_extend_with_device_mapping(
+                    cur_kv_lens_device,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens_device,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    device_slots,
+                )
+            else:
+                out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    cur_kv_lens_device,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens_device,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
 
         assign_req_to_token_pool_func(
             batch.req_pool_indices,

@@ -76,6 +76,32 @@ struct PDRequestContext<'a> {
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerDispatchOutcome {
+    Http(StatusCode),
+    TransportError,
+}
+
+impl WorkerDispatchOutcome {
+    fn from_result(result: &Result<reqwest::Response, reqwest::Error>) -> Self {
+        match result {
+            Ok(response) => Self::Http(response.status()),
+            Err(_) => Self::TransportError,
+        }
+    }
+
+    fn is_server_or_transport_error(self) -> bool {
+        match self {
+            Self::Http(status) => status.is_server_error(),
+            Self::TransportError => true,
+        }
+    }
+
+    fn is_success(self) -> bool {
+        matches!(self, Self::Http(status) if status.is_success())
+    }
+}
+
 impl PDRouter {
     async fn proxy_to_first_prefill_worker(
         &self,
@@ -190,6 +216,75 @@ impl PDRouter {
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
         error::internal_error("serialization_failed", "Failed to serialize request")
+    }
+
+    fn record_worker_http_status(
+        worker: &Arc<dyn Worker>,
+        worker_label: &'static str,
+        status: StatusCode,
+    ) {
+        let not_error = status.is_success() || status.is_client_error();
+        worker.record_outcome(not_error);
+
+        if status.is_server_error() {
+            Metrics::record_worker_error(
+                worker_label,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
+        }
+    }
+
+    fn record_worker_transport_error(worker: &Arc<dyn Worker>, worker_label: &'static str) {
+        worker.record_outcome(false);
+        Metrics::record_worker_error(
+            worker_label,
+            metrics_labels::CONNECTION_HTTP,
+            error_type_from_status(StatusCode::BAD_GATEWAY),
+        );
+    }
+
+    fn record_worker_dispatch_outcome(
+        worker: &Arc<dyn Worker>,
+        worker_label: &'static str,
+        outcome: WorkerDispatchOutcome,
+    ) {
+        match outcome {
+            WorkerDispatchOutcome::Http(status) => {
+                Self::record_worker_http_status(worker, worker_label, status)
+            }
+            WorkerDispatchOutcome::TransportError => {
+                Self::record_worker_transport_error(worker, worker_label)
+            }
+        }
+    }
+
+    fn record_pd_worker_outcomes(
+        prefill: &Arc<dyn Worker>,
+        decode: &Arc<dyn Worker>,
+        prefill_outcome: WorkerDispatchOutcome,
+        decode_outcome: WorkerDispatchOutcome,
+    ) {
+        Self::record_worker_dispatch_outcome(decode, metrics_labels::WORKER_DECODE, decode_outcome);
+
+        if decode_outcome.is_server_or_transport_error()
+            && prefill_outcome.is_server_or_transport_error()
+        {
+            debug!(
+                prefill_url = prefill.url(),
+                decode_url = decode.url(),
+                ?prefill_outcome,
+                ?decode_outcome,
+                "Skipping prefill circuit failure because decode request already failed"
+            );
+            return;
+        }
+
+        Self::record_worker_dispatch_outcome(
+            prefill,
+            metrics_labels::WORKER_PREFILL,
+            prefill_outcome,
+        );
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
@@ -593,7 +688,7 @@ impl PDRouter {
             context.route,
             &json_request,
             headers,
-            false,
+            true,
         );
         let decode_request = self.build_post_with_headers(
             &self.client,
@@ -601,19 +696,109 @@ impl PDRouter {
             context.route,
             &json_request,
             headers,
-            false,
+            true,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Send both requests concurrently. Prefill is the dependency that can
+        // unblock decode KV transfer, so fail fast on prefill send/status errors
+        // instead of waiting for decode to time out with no KV cache.
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        let prefill_task = tokio::spawn(prefill_request.send());
+        let decode_task = tokio::spawn(decode_request.send());
+
+        let prefill_result = match prefill_task.await {
+            Ok(result) => result,
+            Err(e) => {
+                decode_task.abort();
+                let _ = decode_task.await;
+                Self::record_worker_dispatch_outcome(
+                    &prefill,
+                    metrics_labels::WORKER_PREFILL,
+                    WorkerDispatchOutcome::TransportError,
+                );
+                error!(
+                    prefill_url = %prefill.url(),
+                    error = %e,
+                    "Prefill request task failed"
+                );
+                let mut response = error::bad_gateway(
+                    "prefill_server_error",
+                    format!("Prefill request task failed: {}", e),
+                );
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
+        };
+
+        let prefill_outcome = WorkerDispatchOutcome::from_result(&prefill_result);
+        if !prefill_outcome.is_success() {
+            decode_task.abort();
+            let _ = decode_task.await;
+            Self::record_worker_dispatch_outcome(
+                &prefill,
+                metrics_labels::WORKER_PREFILL,
+                prefill_outcome,
+            );
+            let mut response = match self
+                .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
+                .await
+            {
+                Ok((_, _)) => error::bad_gateway(
+                    "prefill_server_error",
+                    "Prefill request did not complete successfully",
+                ),
+                Err(error_response) => error_response,
+            };
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
+        }
+
+        let prefill_body = match self
+            .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
+            .await
+        {
+            Ok((_, body)) => body,
+            Err(error_response) => {
+                decode_task.abort();
+                let _ = decode_task.await;
+                Self::record_worker_dispatch_outcome(
+                    &prefill,
+                    metrics_labels::WORKER_PREFILL,
+                    prefill_outcome,
+                );
+                let mut response = error_response;
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
+        };
+
+        let decode_result = match decode_task.await {
+            Ok(result) => result,
+            Err(e) => {
+                Self::record_pd_worker_outcomes(
+                    &prefill,
+                    &decode,
+                    prefill_outcome,
+                    WorkerDispatchOutcome::TransportError,
+                );
+                error!(
+                    decode_url = %decode.url(),
+                    error = %e,
+                    "Decode request task failed"
+                );
+                let mut response = error::bad_gateway(
+                    "decode_server_error",
+                    format!("Decode request task failed: {}", e),
+                );
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -631,33 +816,12 @@ impl PDRouter {
                         status
                     );
 
-                    // Per-worker breaker attribution before the synthetic 5xx
-                    // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
-                    // status, not on the decode-driven failure. For
-                    // non-streaming the response carries no tracked stream
-                    // so record decode's outcome here too — but treat 4xx
-                    // as a client fault rather than a worker fault, matching
-                    // the legacy outer-dispatcher rule and the streaming
-                    // `BreakerTrackedStream` pre-mark in
-                    // `create_streaming_response`. For streaming
-                    // `handle_decode_error_response` wraps the synthetic
-                    // error SSE in a `BreakerTrackedStream` that ticks
-                    // decode on drop, so skip to avoid double-counting.
-                    // Mark the response so the outer dispatcher skips its
-                    // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
-                    prefill.record_outcome(prefill_ok);
-                    if !context.is_stream {
-                        let decode_ok = status.is_success() || status.is_client_error();
-                        decode.record_outcome(decode_ok);
-                    }
+                    Self::record_pd_worker_outcomes(
+                        &prefill,
+                        &decode,
+                        prefill_outcome,
+                        WorkerDispatchOutcome::Http(status),
+                    );
 
                     let mut response = self
                         .handle_decode_error_response(res, &context, prefill, decode)
@@ -665,30 +829,6 @@ impl PDRouter {
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
                 }
-
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
 
                 if context.is_stream {
                     // Streaming response
@@ -753,26 +893,12 @@ impl PDRouter {
                     error = %e,
                     "Decode request failed"
                 );
-                // Decode failed at TCP/transport level. No tracked
-                // stream will ever wrap a response (streaming path) and
-                // we shortcut past the outer non-streaming
-                // `record_outcome` too — so record decode failure
-                // directly. Prefill ran concurrently in the
-                // `tokio::join!`: record its real per-worker outcome
-                // (success on a 2xx/4xx send, failure on transport
-                // error) so the decode-driven 502 doesn't penalise a
-                // healthy prefill. Mark the response so the outer
-                // dispatcher skips its status-derived `record_outcome`
-                // and we don't double-count.
-                decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
-                prefill.record_outcome(prefill_ok);
+                Self::record_pd_worker_outcomes(
+                    &prefill,
+                    &decode,
+                    prefill_outcome,
+                    WorkerDispatchOutcome::TransportError,
+                );
 
                 let mut response = error::bad_gateway(
                     "decode_server_error",
@@ -893,10 +1019,30 @@ impl PDRouter {
             .collect();
 
         if available_workers.is_empty() {
-            return Err(format!(
-                "No available {} workers (all circuits open or unhealthy)",
-                worker_type
-            ));
+            let healthy_workers: Vec<Arc<dyn Worker>> =
+                workers.iter().filter(|w| w.is_healthy()).cloned().collect();
+
+            if healthy_workers.is_empty() {
+                return Err(format!(
+                    "No available {} workers (all circuits open or unhealthy)",
+                    worker_type
+                ));
+            }
+
+            warn!(
+                worker_type = worker_type,
+                healthy_worker_count = healthy_workers.len(),
+                "All healthy PD workers are circuit-open; falling back to lowest-load health-only selection"
+            );
+            return healthy_workers
+                .into_iter()
+                .min_by_key(|worker| worker.load())
+                .ok_or_else(|| {
+                    format!(
+                        "No available {} workers (all circuits open or unhealthy)",
+                        worker_type
+                    )
+                });
         }
 
         let selected_idx = policy
@@ -1092,7 +1238,7 @@ impl PDRouter {
             Ok(response) => response,
             Err(e) => {
                 error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
+                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Aborting decode dispatch before it waits for missing KV cache.",
                     prefill_url,
                     e
                 );
@@ -1100,10 +1246,7 @@ impl PDRouter {
                 // Return error immediately - don't wait for decode to timeout
                 return Err(error::bad_gateway(
                     "prefill_server_error",
-                    format!(
-                        "Prefill server error: {}. This will cause decode timeout.",
-                        e
-                    ),
+                    format!("Prefill server error: {}. Decode dispatch was aborted.", e),
                 ));
             }
         };
@@ -1645,6 +1788,144 @@ mod tests {
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[test]
+    fn test_decode_server_error_does_not_open_prefill_circuit() {
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+
+        for _ in 0..12 {
+            PDRouter::record_pd_worker_outcomes(
+                &prefill_worker,
+                &decode_worker,
+                WorkerDispatchOutcome::Http(StatusCode::INTERNAL_SERVER_ERROR),
+                WorkerDispatchOutcome::Http(StatusCode::INTERNAL_SERVER_ERROR),
+            );
+        }
+
+        assert!(prefill_worker.circuit_breaker().can_execute());
+        assert_eq!(prefill_worker.circuit_breaker().consecutive_failures(), 0);
+        assert!(!decode_worker.circuit_breaker().can_execute());
+    }
+
+    #[test]
+    fn test_prefill_server_error_opens_prefill_circuit_when_decode_succeeds() {
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+
+        for _ in 0..12 {
+            PDRouter::record_pd_worker_outcomes(
+                &prefill_worker,
+                &decode_worker,
+                WorkerDispatchOutcome::Http(StatusCode::INTERNAL_SERVER_ERROR),
+                WorkerDispatchOutcome::Http(StatusCode::OK),
+            );
+        }
+
+        assert!(!prefill_worker.circuit_breaker().can_execute());
+        assert!(decode_worker.circuit_breaker().can_execute());
+    }
+
+    #[test]
+    fn test_decode_server_error_records_prefill_success_when_prefill_succeeds() {
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+
+        PDRouter::record_pd_worker_outcomes(
+            &prefill_worker,
+            &decode_worker,
+            WorkerDispatchOutcome::Http(StatusCode::INTERNAL_SERVER_ERROR),
+            WorkerDispatchOutcome::Http(StatusCode::OK),
+        );
+        assert_eq!(prefill_worker.circuit_breaker().consecutive_failures(), 1);
+
+        PDRouter::record_pd_worker_outcomes(
+            &prefill_worker,
+            &decode_worker,
+            WorkerDispatchOutcome::Http(StatusCode::OK),
+            WorkerDispatchOutcome::Http(StatusCode::INTERNAL_SERVER_ERROR),
+        );
+
+        assert!(prefill_worker.circuit_breaker().can_execute());
+        assert_eq!(prefill_worker.circuit_breaker().consecutive_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pick_worker_falls_back_to_healthy_when_circuit_open() {
+        let router = create_test_pd_router();
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+
+        for _ in 0..12 {
+            decode_worker.record_outcome(false);
+        }
+
+        assert!(decode_worker.is_healthy());
+        assert!(!decode_worker.is_available());
+
+        let workers = vec![decode_worker.clone()];
+        let policy = router.policy_registry.get_decode_policy();
+        let selected =
+            PDRouter::pick_worker_by_policy_arc(&workers, &*policy, None, None, None, "decode")
+                .await
+                .unwrap();
+
+        assert_eq!(selected.url(), "http://decode");
+    }
+
+    #[test]
+    fn test_build_post_with_headers_can_close_connection() {
+        let router = create_test_pd_router();
+        let request = router
+            .build_post_with_headers(
+                &router.client,
+                "http://prefill",
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "test"}),
+                None,
+                true,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers().get("connection"),
+            Some(&HeaderValue::from_static("close"))
+        );
     }
 
     #[tokio::test]

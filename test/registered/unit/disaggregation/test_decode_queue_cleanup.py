@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.decode import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,7 +20,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class FakeReceiver:
     def __init__(self):
+        self.abort_called = False
         self.clear_called = False
+
+    def abort(self):
+        self.abort_called = True
 
     def clear(self):
         self.clear_called = True
@@ -145,6 +150,66 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_hierarchical_cache = False
 
         self.assertFalse(scheduler.is_fully_idle())
+
+    @patch("sglang.srt.managers.scheduler.release_kv_cache")
+    def test_abort_decode_queues_sends_through_ipc_channels(
+        self, mock_release_kv_cache
+    ):
+        prealloc_receiver = FakeReceiver()
+        transfer_receiver = FakeReceiver()
+        prealloc_req = SimpleNamespace(rid="abort-prealloc")
+        transfer_req = SimpleNamespace(rid="abort-transfer", bootstrap_room=7)
+        prealloc_decode_req = SimpleNamespace(
+            req=prealloc_req, kv_receiver=prealloc_receiver
+        )
+        transfer_decode_req = SimpleNamespace(
+            req=transfer_req,
+            kv_receiver=transfer_receiver,
+            metadata_buffer_index=3,
+        )
+        metadata_allocator = MagicMock()
+        send_output = MagicMock()
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = MagicMock()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.enable_hisparse = False
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[prealloc_decode_req],
+            pending_reqs=[prealloc_decode_req],
+            retracted_queue=[],
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[transfer_decode_req],
+            enable_staging=False,
+            staging_handler=None,
+            req_to_metadata_buffer_idx_allocator=metadata_allocator,
+        )
+        scheduler.tree_cache = MagicMock()
+        scheduler.running_batch = SimpleNamespace(reqs=[])
+        scheduler.cur_batch = None
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=send_output)
+        )
+
+        scheduler.abort_request(AbortReq(rid="abort"))
+
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.queue, [])
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.pending_reqs, [])
+        self.assertEqual(scheduler.disagg_decode_transfer_queue.queue, [])
+        self.assertTrue(prealloc_receiver.abort_called)
+        self.assertTrue(prealloc_receiver.clear_called)
+        self.assertTrue(transfer_receiver.abort_called)
+        self.assertTrue(transfer_receiver.clear_called)
+        metadata_allocator.free.assert_called_once_with(3)
+        self.assertEqual(transfer_decode_req.metadata_buffer_index, -1)
+        mock_release_kv_cache.assert_called_once_with(
+            transfer_req, scheduler.tree_cache, is_insert=False
+        )
+        self.assertEqual(send_output.call_count, 2)
+        self.assertEqual(send_output.call_args_list[0].args[1], prealloc_req)
+        self.assertEqual(send_output.call_args_list[1].args[1], transfer_req)
 
 
 if __name__ == "__main__":

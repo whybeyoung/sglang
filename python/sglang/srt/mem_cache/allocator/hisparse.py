@@ -1,4 +1,5 @@
 import weakref
+from typing import Tuple
 
 import torch
 
@@ -10,6 +11,27 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
+
+
+def _hisparse_backup_state(
+    logical_allocator, hisparse_allocator, mapping: torch.Tensor
+) -> Tuple:
+    return (
+        logical_allocator.backup_state(),
+        hisparse_allocator.backup_state(),
+        mapping.clone(),
+    )
+
+
+def _hisparse_restore_state(
+    logical_allocator, hisparse_allocator, mapping: torch.Tensor, state: Tuple
+) -> None:
+    logical_state, hisparse_state, mapping_snapshot = state
+    logical_allocator.restore_state(logical_state)
+    hisparse_allocator.restore_state(hisparse_state)
+    mapping[: mapping_snapshot.shape[0]].copy_(mapping_snapshot)
+    if mapping_snapshot.shape[0] < mapping.shape[0]:
+        mapping[mapping_snapshot.shape[0] :] = 0
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -163,6 +185,61 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self._kvcache._translate_loc_to_hisparse_device(last_locs)
 
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical indices and map them to caller-managed HiSparse slots."""
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        if self.logical_attn_allocator.need_sort and num_new_pages > len(
+            self.logical_attn_allocator.free_pages
+        ):
+            self.logical_attn_allocator.merge_and_sort_free()
+        avail_pages = len(self.logical_attn_allocator.free_pages)
+        if num_new_pages > avail_pages:
+            raise RuntimeError(
+                f"HiSparse logical alloc: need {num_new_pages} new pages for "
+                f"{extend_num_tokens} tokens but only {avail_pages} pages are "
+                "available."
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        out = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if out is None:
+            raise RuntimeError(
+                f"HiSparse logical alloc failed for {extend_num_tokens} tokens. "
+                f"Logical pool available: {self.logical_attn_allocator.available_size()}"
+            )
+
+        self.full_to_hisparse_device_index_mapping[out] = device_slots
+        if backup_state:
+            return out, (logical_state, out.clone())
+        return out
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        """Clear mappings for caller-managed slots before freeing logical indices."""
+        self.full_to_hisparse_device_index_mapping[logical_indices] = 0
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -259,6 +336,26 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
+        )
+
+    def backup_state(self):
+        return _hisparse_backup_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+        )
+
+    def restore_state(self, state):
+        if len(state) == 2:
+            # Draft extra-page mappings must stay live until accepted tokens are finalized.
+            self.logical_attn_allocator.restore_state(state[0])
+            return
+
+        _hisparse_restore_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+            state,
         )
 
 
@@ -562,4 +659,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
+        )
+
+    def backup_state(self):
+        return _hisparse_backup_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+        )
+
+    def restore_state(self, state):
+        _hisparse_restore_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+            state,
         )
