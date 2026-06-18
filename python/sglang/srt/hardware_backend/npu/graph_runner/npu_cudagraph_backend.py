@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -27,7 +28,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
-from sglang.srt.utils import empty_context, get_bool_env_var, is_npu
+from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -61,15 +62,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
-        self._is_npu = is_npu()
-
-    def _finalize_replay(self) -> None:
-        # NPUGraph replay leaves the device context in a restricted state
-        # until the replay stream is synchronized. Without this, follow-up
-        # host/device copies on other streams (e.g. speculative plan_stream)
-        # fail with Ascend 107030/507011.
-        if self._is_npu:
-            self._device_module.synchronize()
 
     @contextmanager
     def capture_session(self, stream):
@@ -144,7 +136,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         self._graphs[shape_key].replay()
-        self._finalize_replay()
         return self._outputs[shape_key]
 
     def replay_with_input_update(
@@ -155,12 +146,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_type: Any = None,
         cpu_update_input: list = None,
     ) -> Any:
-        """Rebind seq_lens on the recorded NPU graph, then replay.
-
-        graph.update() issues a synchronous host-to-device memcpy that must
-        run on the owning NPU stream/context thread. Running it from a
-        background thread triggers Ascend error 107030 ("the current capture
-        mode does not support this operation").
+        """Rebind seq_lens on the recorded NPU graph in a background
+        thread, then replay. Used when the model is not deepseek-nsa.
 
         Two calling conventions:
         1. (legacy) seq_lens + attr_name + attr_type:
@@ -174,9 +161,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             cpu_update_input = [{attr_name: seq_lens}]
 
         graph = self._graphs[shape_key]
-        graph.update(cpu_update_input=cpu_update_input)
+
+        def _update():
+            graph.update(cpu_update_input=cpu_update_input)
+
+        thread = threading.Thread(target=_update)
+        thread.start()
         graph.replay()
-        self._finalize_replay()
+        thread.join()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
