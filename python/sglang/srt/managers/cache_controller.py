@@ -956,6 +956,10 @@ class HiCacheController:
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
+            if self.mem_pool_host.layout == "page_first_kv_split":
+                self.mem_pool_host.scatter_l3_page_to_kv_split(
+                    int(host_indices[i * self.page_size].item())
+                )
             inc += self.page_size
         operation.increment(inc)
 

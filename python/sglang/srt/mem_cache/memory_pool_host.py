@@ -1360,6 +1360,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
                 )
+            # Contiguous merged pages for Mooncake L3 zero-copy on Ascend.
+            self.kv_l3_buffer = alloc_func(
+                (
+                    self.page_num,
+                    self.layer_num,
+                    self.page_size,
+                    1,
+                    self.kv_cache_dim,
+                ),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
             return self.k_buffer
@@ -1565,6 +1579,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _page_idx_from_token_index(self, token_index: int) -> int:
+        return token_index // self.page_size
+
+    def pack_kv_split_page_to_l3(self, token_index: int) -> None:
+        page_idx = self._page_idx_from_token_index(token_index)
+        l3_page = self.kv_l3_buffer[page_idx]
+        l3_page[..., : self.kv_lora_rank].copy_(self.k_buffer[page_idx])
+        l3_page[..., self.kv_lora_rank :].copy_(self.v_buffer[page_idx])
+
+    def scatter_l3_page_to_kv_split(self, token_index: int) -> None:
+        page_idx = self._page_idx_from_token_index(token_index)
+        l3_page = self.kv_l3_buffer[page_idx]
+        self.k_buffer[page_idx].copy_(l3_page[..., : self.kv_lora_rank])
+        self.v_buffer[page_idx].copy_(l3_page[..., self.kv_lora_rank :])
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
@@ -1573,6 +1602,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
             data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :]
+        elif self.layout == "page_first_kv_split":
+            self.pack_kv_split_page_to_l3(index)
+            page_idx = self._page_idx_from_token_index(index)
+            data_page = self.kv_l3_buffer[page_idx : page_idx + 1, :, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         if flat:
@@ -1616,6 +1649,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 1,
                 self.kv_cache_dim,
             )
+        elif self.layout == "page_first_kv_split":
+            page_idx = self._page_idx_from_token_index(index)
+            self.kv_l3_buffer[page_idx : page_idx + 1, :, :, :, :] = data_page.reshape(
+                1,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.kv_cache_dim,
+            )
+            self.scatter_l3_page_to_kv_split(index)
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
@@ -1655,6 +1698,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * self.kv_cache_dim
             )
             element_size_list = [element_size] * len(ptr_list)
+        elif self.layout == "page_first_kv_split":
+            l3_buffer_data_ptr = self.kv_l3_buffer.data_ptr()
+            for index in range(0, len(indices), self.page_size):
+                token_index = indices[index]
+                self.pack_kv_split_page_to_l3(token_index)
+                k_ptr = (
+                    l3_buffer_data_ptr
+                    + token_index
+                    * self.layer_num
+                    * self.kv_cache_dim
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+            element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.kv_cache_dim
+            )
+            element_size_list = [element_size] * len(ptr_list)
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
@@ -1671,8 +1734,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
         stride must itself be a multiple of the OS page size.
         """
-        if self.layout not in ("page_first", "page_first_direct"):
+        if self.layout not in (
+            "page_first",
+            "page_first_direct",
+            "page_first_kv_split",
+        ):
             return False
+        if self.layout == "page_first_kv_split":
+            stride = (
+                self.page_size
+                * self.layer_num
+                * self.kv_cache_dim
+                * self.dtype.itemsize
+            )
+            base_aligned = self.kv_l3_buffer.data_ptr() % page_size_bytes == 0
+            return base_aligned and stride % page_size_bytes == 0
         stride = (
             self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
         )

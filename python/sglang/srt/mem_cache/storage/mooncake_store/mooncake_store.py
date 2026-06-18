@@ -328,6 +328,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Always include the anchor KV buffer if present.
         _add_tensor(getattr(mem_pool, "kv_buffer", None))
+        _add_tensor(getattr(mem_pool, "kv_l3_buffer", None))
 
         # HostPoolGroup: include each pool's hybrid buffers when available.
         entries = getattr(mem_pool, "entries", None)
@@ -338,6 +339,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     continue
                 # KV pool anchor memory is already covered, but harmless if added twice.
                 _add_tensor(getattr(host_pool, "kv_buffer", None))
+                _add_tensor(getattr(host_pool, "kv_l3_buffer", None))
                 for buf in getattr(host_pool, "get_hybrid_pool_buffer", lambda: [])():
                     _add_tensor(buf)
             return total
@@ -617,9 +619,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
             return
+        assert self.mem_pool_host.layout in [
+            "page_first",
+            "page_first_direct",
+            "page_head",
+            "page_first_kv_split",
+        ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_split layout"
         try:
-            for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
-                super().register_buffer(buffer)
+            if self.mem_pool_host.layout == "page_first_kv_split":
+                super().register_buffer(self.mem_pool_host.kv_l3_buffer)
+            else:
+                for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
+                    super().register_buffer(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -882,9 +893,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_list = []
         for key_ in keys:
             key_list.append(f"{key_}_{self.mla_suffix}_k")
-        ptr_list, element_size_list = self._pack_multi_buffer_meta(
-            key_list, ptr_list, element_size_list
-        )
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
