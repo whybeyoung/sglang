@@ -942,6 +942,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.backend.cleanup()
             self.capture()
 
+    def padded_bs_for(self, forward_batch: ForwardBatch) -> int:
+        """Return the cuda-graph bucket-padded batch size for forward_batch."""
+        raw_bs = forward_batch.batch_size
+        if self.require_mlp_tp_gather:
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_batch_size = (
+                max_num_tokens / self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_dflash()
+                else max_num_tokens
+            )
+            return self._pad_to_bucket(int(max_batch_size), self.capture_bs)
+        return self._pad_to_bucket(raw_bs, self.capture_bs)
+
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
@@ -974,19 +989,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
-
-        if self.require_mlp_tp_gather:
-            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
-                else max_num_tokens
-            )
-            bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
-        else:
-            bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+        bs = self.padded_bs_for(forward_batch)
 
         self.buffer_registry.fill_from(
             forward_batch,
