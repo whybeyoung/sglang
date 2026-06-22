@@ -1667,11 +1667,27 @@ def add_prometheus_track_response_middleware(app):
 def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     from starlette.routing import Match
 
-    for route in request.app.routes:
-        match, child_scope = route.matches(request.scope)
-        if match == Match.FULL:
-            return route.path, True
+    try:
+        from fastapi.routing import iter_route_contexts
+    except ImportError:
+        print_warning_once(
+            "Please upgrade fastapi to >=0.137.2 for correct Prometheus route "
+            "metrics with include_router(). "
+            "See https://github.com/fastapi/fastapi/pull/15785"
+        )
+        return request.url.path, False
 
+    # https://github.com/fastapi/fastapi/pull/15785
+    for ctx in iter_route_contexts(request.app.routes):
+        route_context = ctx._route_context
+        if route_context is not None:
+            match, _ = route_context.matches(request.scope)
+        else:
+            match, _ = ctx.route.matches(request.scope)
+        if match == Match.FULL:
+            path = ctx.path
+            if path:
+                return path, True
     return request.url.path, False
 
 
