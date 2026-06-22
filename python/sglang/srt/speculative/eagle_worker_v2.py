@@ -1332,6 +1332,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
+        if _is_npu:
+            torch.get_device_module(self.device).synchronize()
+
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(

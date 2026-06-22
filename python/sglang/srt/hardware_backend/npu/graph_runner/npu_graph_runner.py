@@ -224,6 +224,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # DSA models use backend.replay() (no graph.update). Drain any prior
+        # NPUGraph replay before buffer copy_ / replay_prepare memcpy.
+        if is_npu:
+            self.device_module.synchronize()
+
         if forward_batch.needs_forward_metadata_init():
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:

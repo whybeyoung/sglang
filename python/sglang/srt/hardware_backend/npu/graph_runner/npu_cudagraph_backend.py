@@ -148,6 +148,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        self._prepare_replay()
         self._graphs[shape_key].replay()
         self._finalize_replay()
         return self._outputs[shape_key]
