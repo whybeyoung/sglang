@@ -111,12 +111,14 @@ logger = logging.getLogger(__name__)
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
-    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream = torch.get_device_module(device).Stream()
-        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
-        return plan_stream, plan_stream_ctx
-    else:
+    # Side-stream plan overlap issues H2D / copy_ while Ascend is still in a
+    # restricted NPUGraph replay context (107030). Keep all MTP prep on the
+    # forward stream on NPU.
+    if _is_npu or not envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
         return None, contextlib.nullcontext()
+    plan_stream = torch.get_device_module(device).Stream()
+    plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
+    return plan_stream, plan_stream_ctx
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -752,6 +754,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # synchronization issues with .to() inside the plan stream context.
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
+        if _is_npu:
+            torch.get_device_module(self.device).synchronize()
+
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = self.prepare_for_draft_extend(
@@ -1031,6 +1036,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+            if _is_npu:
+                torch.get_device_module(self.device).synchronize()
             batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
@@ -1041,6 +1048,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
+                if _is_npu:
+                    torch.get_device_module(self.device).synchronize()
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
@@ -1352,6 +1361,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+        if self.plan_stream or _is_npu:
             if (
                 _is_npu
                 and self._target_worker.model_runner.model_is_mrope

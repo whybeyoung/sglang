@@ -251,6 +251,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
+        if is_npu:
+            self.device_module.synchronize()
+
         graph_key = self._make_graph_key(self.bs)
 
         if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
