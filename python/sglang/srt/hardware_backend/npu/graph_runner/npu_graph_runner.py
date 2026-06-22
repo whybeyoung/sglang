@@ -202,6 +202,23 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # for NPU, profile data will be saved to disk for further analysis.
         pass
 
+    def _padded_seq_lens_for_replay(self, forward_batch: ForwardBatch) -> list:
+        """Build seq_lens for NPUGraph.update without a device sync when possible."""
+        pad = [0] * (self.bs - self.raw_bs)
+        cpu_lens = forward_batch.seq_lens_cpu
+        if cpu_lens is not None:
+            if isinstance(cpu_lens, torch.Tensor):
+                base = cpu_lens[: self.raw_bs].tolist()
+            else:
+                base = list(cpu_lens[: self.raw_bs])
+        else:
+            base = forward_batch.seq_lens[: self.raw_bs].cpu().tolist()
+
+        if forward_batch.forward_mode.is_target_verify():
+            offset = self.num_tokens_per_bs
+            return [int(x) + offset for x in base] + pad
+        return base + pad
+
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -232,13 +249,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         graph_key = self._make_graph_key(self.bs)
 
         if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
-            if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
-            else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+            seq_lens = self._padded_seq_lens_for_replay(forward_batch)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

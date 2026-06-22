@@ -681,14 +681,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if batch.extend_input_logprob_token_ids is not None:
-            ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+            ret.extend_input_logprob_token_ids_gpu = _tensor_to_device(
+                batch.extend_input_logprob_token_ids, device
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
+            ret.num_token_non_padded = _host_data_to_device_tensor(
+                num_tokens, dtype=torch.int32, device=device
             )
         ret.num_token_non_padded_cpu = num_tokens
 
@@ -708,14 +708,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
-            ).to(device, non_blocking=True)
+            ret.global_num_tokens_gpu = _host_data_to_device_tensor(
+                global_num_tokens, dtype=torch.int64, device=device
+            )
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
-            ).to(device, non_blocking=True)
+            ret.global_num_tokens_for_logprob_gpu = _host_data_to_device_tensor(
+                global_num_tokens_for_logprob, dtype=torch.int64, device=device
+            )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -726,14 +726,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
+            ret.positions = _host_data_to_device_tensor(
                 [
                     i
                     for block_offset in (req.dllm_block_offset for req in batch.reqs)
                     for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+                device=device,
+            )
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
@@ -748,12 +749,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
-                ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32
-                ).to(device, non_blocking=True)
-                ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32
-                ).to(device, non_blocking=True)
+                ret.extend_seq_lens = _host_data_to_device_tensor(
+                    extend_seq_lens, dtype=torch.int32, device=device
+                )
+                ret.extend_prefix_lens = _host_data_to_device_tensor(
+                    extend_prefix_lens, dtype=torch.int32, device=device
+                )
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
             else:
@@ -1360,6 +1361,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 def enable_num_token_non_padded():
     return get_moe_expert_parallel_world_size() > 1
+
+
+def _host_data_to_device_tensor(
+    data,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    non_blocking: bool = True,
+) -> torch.Tensor:
+    """Materialize host-side data on device.
+
+    On NPU, avoid async CPU->device staging (``.to(device, non_blocking=True)``)
+    from a freshly created CPU tensor. That path can fail with Ascend 107030 when
+    issued from a side stream right after NPUGraph replay.
+    """
+    if _is_npu:
+        return torch.tensor(data, dtype=dtype, device=device)
+    return torch.tensor(data, dtype=dtype).to(device, non_blocking=non_blocking)
+
+
+def _tensor_to_device(
+    tensor: torch.Tensor,
+    device: torch.device,
+    *,
+    non_blocking: bool = True,
+) -> torch.Tensor:
+    if _is_npu:
+        return tensor.to(device)
+    return tensor.to(device, non_blocking=non_blocking)
 
 
 def build_inner_fb_view(
