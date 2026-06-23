@@ -718,6 +718,20 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         buffer = self._get_buffer()
+        # Guard: the low-latency dispatch buffer is sized for at most
+        # `num_max_dispatch_tokens_per_rank` tokens per rank. If the actual
+        # per-rank token count exceeds it (e.g. spec/MTP inflating the batch),
+        # the underlying kernel writes out of bounds, which on NPU surfaces as a
+        # silent AICore/MTE trap (`the model stream execute failed`). Fail loud
+        # here with the real numbers instead so the budget can be sized correctly.
+        num_tokens = hidden_states.shape[0]
+        assert num_tokens <= self.num_max_dispatch_tokens_per_rank, (
+            f"deepep low_latency dispatch overflow: got {num_tokens} tokens/rank "
+            f"but buffer budget num_max_dispatch_tokens_per_rank="
+            f"{self.num_max_dispatch_tokens_per_rank}. Raise "
+            f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK (<=1024) to at least "
+            f"{num_tokens}, or reduce the per-rank batch/spec token count."
+        )
         _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
