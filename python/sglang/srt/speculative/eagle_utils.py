@@ -342,11 +342,14 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
-    if can_run_cuda_graph:
+    if can_run_cuda_graph and not _is_npu:
         target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
             verify_forward_batch
         )
         verify_forward_batch.mark_forward_metadata_ready()
+    # NPU: defer replay_prepare to npu_graph_runner.replay() after
+    # _prepare_replay(). Early replay_prepare here can H2D while Ascend is
+    # still in a restricted NPUGraph context after draft replay (107030).
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.

@@ -448,6 +448,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens = (
                     self.cuda_graph_runner.replay(forward_batch)
                 )
+                if _is_npu:
+                    torch.get_device_module(self.device).synchronize()
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
@@ -1388,6 +1390,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
+        if _is_npu and can_run_cuda_graph:
+            torch.get_device_module(self.device).synchronize()
+
         # Prepare grammar data on CPU if needed
         if batch.has_grammar:
             retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
@@ -1397,10 +1402,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute).
-        # Metadata init is skipped iff cuda-graph already ran replay_prepare —
-        # eagle_prepare_for_verify marked the batch in exactly that case; the
-        # non-cuda-graph path stays unmarked and gets forward_extend's init
-        # (post-pad).
+        # Metadata init is skipped iff cuda-graph replay_prepare already ran —
+        # eagle_prepare_for_verify marks the batch on non-NPU; on NPU,
+        # replay_prepare runs inside npu_graph_runner.replay() after sync.
+        # The non-cuda-graph path stays unmarked and gets forward_extend init.
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,

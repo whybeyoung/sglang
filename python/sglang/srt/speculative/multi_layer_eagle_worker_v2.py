@@ -810,6 +810,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
+        if _is_npu:
+            torch.get_device_module(self.device).synchronize()
+
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
@@ -840,14 +843,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     else None
                 ),
             )
-        # NOTE: metadata init is skipped here unconditionally, although
-        # eagle_prepare_for_verify only plans when cuda-graph replay_prepare ran.
-        # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
-        # worker has not adopted that fix, so preserve its behavior verbatim.
-        # On NPU with --disable-cuda-graph, non-graph verify needs metadata init
-        # in forward_extend (post-pad); only mark ready for the cuda-graph path.
-        if not _is_npu or can_run_cuda_graph:
+        # Non-NPU: mark metadata ready so verify skips forward_extend init.
+        # NPU cuda-graph defers replay_prepare to npu_graph_runner.replay().
+        if not _is_npu:
             verify_forward_batch.mark_forward_metadata_ready()
+        elif _is_npu and can_run_cuda_graph:
+            torch.get_device_module(self.device).synchronize()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
