@@ -3818,7 +3818,7 @@ class Scheduler(
                     if hasattr(req.disagg_kv_sender, "clear"):
                         req.disagg_kv_sender.clear()
                     release_kv_cache(req, self.tree_cache, is_insert=False)
-                    release_req_to_metadata_buffer(
+                    maybe_release_metadata_buffer(
                         req, self.req_to_metadata_buffer_idx_allocator
                     )
                     self.ipc_channels.send_to_tokenizer.send_output(
