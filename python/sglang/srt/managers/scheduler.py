@@ -3817,7 +3817,11 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
                     if hasattr(req.disagg_kv_sender, "clear"):
                         req.disagg_kv_sender.clear()
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    # The same req may also be marked to_finish=FINISH_ABORT on
+                    # its still-referenced (deferred) microbatch and released by
+                    # process_batch_result_disagg_prefill. Guard the double free.
+                    if not req.kv_committed_freed:
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
                     release_req_to_metadata_buffer(
                         req, self.req_to_metadata_buffer_idx_allocator
                     )

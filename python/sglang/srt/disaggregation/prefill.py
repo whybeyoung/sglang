@@ -626,7 +626,12 @@ class SchedulerDisaggregationPrefillMixin:
                     req.disagg_kv_sender.abort()
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                # A finished-prefill req can be aborted while it is still
+                # referenced by this (deferred/overlapped) microbatch AND already
+                # released via the inflight-queue abort path in abort_request.
+                # Guard against the resulting double free (#committed KV).
+                if not req.kv_committed_freed:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
