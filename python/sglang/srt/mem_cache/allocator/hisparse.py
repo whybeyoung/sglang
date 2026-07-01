@@ -304,6 +304,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_hisparse(self, free_indices: torch.Tensor):
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        # Dedup before freeing: the coordinator deliberately maps many distinct
+        # logical locs to the SAME physical HiSparse device slot (the shared
+        # newest-token reserved slot, hot-buffer slots, etc.). Freeing a
+        # request's full logical index set therefore yields duplicate physical
+        # slots; without dedup the same physical slot is pushed onto the free
+        # list twice, over-freeing so available_size() > size and tripping the
+        # assert in free(). A physical slot is allocated once and must be freed
+        # once.
+        hisparse_indices = torch.unique(hisparse_indices)
         self.free_hisparse_indices(hisparse_indices)
         self.full_to_hisparse_device_index_mapping[free_indices] = 0
 
