@@ -1097,6 +1097,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
+                if hasattr(device_pool, "sync_shared_index_k_for_indices"):
+                    device_pool.sync_shared_index_k_for_indices(device_indices)
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
                     transfer_kv_dim_exchange(
@@ -1184,6 +1186,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
+                if hasattr(device_pool, "sync_shared_index_k_for_indices"):
+                    device_pool.sync_shared_index_k_for_indices(device_indices)
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,

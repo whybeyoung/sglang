@@ -161,6 +161,59 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def is_dsa_shared_indexer_layer(
+    config, layer_id: int, *, is_nextn: bool = False
+) -> bool:
+    """True when layer_id reuses a prior full indexer's top-k / index_k cache."""
+    if not is_deepseek_dsa(config) or is_nextn:
+        return False
+    return (
+        get_dsa_indexer_source_layer_id(config, layer_id, is_nextn=is_nextn) != layer_id
+    )
+
+
+def get_dsa_indexer_source_layer_id(
+    config, layer_id: int, *, is_nextn: bool = False
+) -> int:
+    """Global layer id of the full indexer that owns index_k for layer_id."""
+    if not is_deepseek_dsa(config):
+        return layer_id
+    if is_nextn:
+        return layer_id
+
+    index_topk_freq = getattr(config, "index_topk_freq", 1)
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    index_skip_topk_offset = getattr(config, "index_skip_topk_offset", None)
+
+    def _is_full_indexer(lid: int) -> bool:
+        if index_topk_pattern is not None:
+            if lid >= len(index_topk_pattern):
+                return True
+            return index_topk_pattern[lid] != "S"
+        if index_skip_topk_offset is not None:
+            return (max(lid - index_skip_topk_offset + 1, 0) % index_topk_freq) == 0
+        return (max(lid - 1, 0) % index_topk_freq) == 0
+
+    if _is_full_indexer(layer_id):
+        return layer_id
+    for lid in range(layer_id - 1, -1, -1):
+        if _is_full_indexer(lid):
+            return lid
+    return 0
+
+
+def build_dsa_indexer_source_layer_map(
+    config,
+    layer_num: int,
+    start_layer: int = 0,
+) -> list[int]:
+    """Per-local-layer source local index for index_k mirroring (HiCache / NPU)."""
+    return [
+        get_dsa_indexer_source_layer_id(config, start_layer + i) - start_layer
+        for i in range(layer_num)
+    ]
+
+
 class ModelConfig:
     def __init__(
         self,

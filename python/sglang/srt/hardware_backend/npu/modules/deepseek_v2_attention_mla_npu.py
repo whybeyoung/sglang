@@ -5,6 +5,7 @@ import torch
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
+from sglang.srt.configs.model_config import get_dsa_indexer_source_layer_id
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
@@ -17,6 +18,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -418,7 +420,25 @@ def forward_dsa_prepare_npu(
             dynamic_scale,
         )
     else:
-        topk_indices = prev_topk_indices
+        topk_indices = maybe_capture_indexer_topk(m.layer_id, prev_topk_indices)
+        if topk_indices is None:
+            raise RuntimeError(
+                f"Layer {m.layer_id} is skip_topk (shared indexer) but "
+                "prev_topk_indices is missing. With PP, ensure topk_indices is "
+                "propagated via PPProxyTensors from the previous PP stage."
+            )
+        kv_pool = get_token_to_kv_pool()
+        if hasattr(kv_pool, "mirror_index_k_at_loc"):
+            from sglang.srt.server_args import get_global_server_args
+
+            hf_config = get_global_server_args().get_model_config().hf_config
+            src_layer = get_dsa_indexer_source_layer_id(
+                hf_config, m.layer_id, is_nextn=m.is_nextn
+            )
+            if src_layer != m.layer_id:
+                kv_pool.mirror_index_k_at_loc(
+                    src_layer, m.layer_id, forward_batch.out_cache_loc
+                )
 
     return (
         q_pe,

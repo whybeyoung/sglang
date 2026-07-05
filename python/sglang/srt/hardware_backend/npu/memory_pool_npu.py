@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -308,6 +308,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.dsa_indexer_source_layers: Optional[List[int]] = None
 
         self.custom_mem_pool = None
 
@@ -458,6 +459,38 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
+
+    def set_dsa_indexer_source_layers(self, source_layers: List[int]) -> None:
+        self.dsa_indexer_source_layers = source_layers
+
+    def mirror_index_k_at_loc(
+        self, src_layer_id: int, dst_layer_id: int, loc: torch.Tensor
+    ):
+        if self.index_head_dim is None:
+            return
+        src_local = src_layer_id - self.start_layer
+        dst_local = dst_layer_id - self.start_layer
+        loc_flat = loc.view(-1).long()
+        self.index_k_buffer[dst_local][loc_flat] = self.index_k_buffer[src_local][
+            loc_flat
+        ]
+
+    def sync_shared_index_k_for_indices(self, loc: torch.Tensor) -> None:
+        """Copy index_k from full indexer layers to shared-indexer layers (GLM-5.2)."""
+        if (
+            self.index_head_dim is None
+            or self.dsa_indexer_source_layers is None
+            or loc is None
+            or loc.numel() == 0
+        ):
+            return
+        loc_flat = loc.view(-1).long()
+        for dst_local, src_local in enumerate(self.dsa_indexer_source_layers):
+            if src_local == dst_local:
+                continue
+            self.index_k_buffer[dst_local][loc_flat] = self.index_k_buffer[src_local][
+                loc_flat
+            ]
 
     def set_index_k_buffer(
         self,

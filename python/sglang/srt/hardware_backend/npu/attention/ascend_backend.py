@@ -883,6 +883,46 @@ class AscendAttnBackend(AttentionBackend):
         )
         return torch.cat([attn_out_prev, attn_out_next], dim=0)
 
+    def _resolve_dsa_cp_sparse_seq_lens(
+        self,
+        forward_batch: ForwardBatch,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
+        """Build zigzag (prev, next) seq-len tensors for DSA sparse CP attention.
+
+        Full indexer layers set these on forward_metadata; shared-indexer
+        (skip_topk) layers skip the indexer and must derive them from
+        attn_cp_metadata instead.
+        """
+        cp_meta = forward_batch.attn_cp_metadata
+        if not isinstance(actual_seq_qlen, tuple):
+            actual_seq_qlen = (
+                cp_meta.actual_seq_q_prev_tensor,
+                cp_meta.actual_seq_q_next_tensor,
+            )
+        if not isinstance(actual_seq_lengths_kv, tuple):
+            if (
+                forward_batch.extend_prefix_lens_cpu is not None
+                and sum(forward_batch.extend_prefix_lens_cpu) > 0
+            ):
+                prefix_lens = forward_batch.extend_prefix_lens.squeeze()
+                actual_seq_lengths_kv = (
+                    cp_meta.kv_len_prev_tensor + prefix_lens,
+                    cp_meta.kv_len_next_tensor + prefix_lens,
+                )
+            else:
+                actual_seq_lengths_kv = (
+                    cp_meta.kv_len_prev_tensor,
+                    cp_meta.kv_len_next_tensor,
+                )
+        return actual_seq_qlen, actual_seq_lengths_kv
+
+    @staticmethod
+    def _split_cp_topk_indices(topk_indices: torch.Tensor):
+        split_len = (topk_indices.shape[0] + 1) // 2
+        return torch.split(topk_indices, split_len, dim=0)
+
     def do_cp_attn_fia(
         self,
         q: torch.Tensor,
@@ -1039,6 +1079,13 @@ class AscendAttnBackend(AttentionBackend):
             and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
+            actual_seq_qlen, actual_seq_lengths_kv = (
+                self._resolve_dsa_cp_sparse_seq_lens(
+                    forward_batch, actual_seq_qlen, actual_seq_lengths_kv
+                )
+            )
+            if topk_indices is not None and not isinstance(topk_indices, tuple):
+                topk_indices = self._split_cp_topk_indices(topk_indices)
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,

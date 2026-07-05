@@ -533,6 +533,18 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+                if is_dsa_model:
+                    from sglang.srt.configs.model_config import (
+                        build_dsa_indexer_source_layer_map,
+                    )
+
+                    self.token_to_kv_pool.set_dsa_indexer_source_layers(
+                        build_dsa_indexer_source_layer_map(
+                            self.model_config.hf_config,
+                            self.num_effective_layers,
+                            self.start_layer,
+                        )
+                    )
             else:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
