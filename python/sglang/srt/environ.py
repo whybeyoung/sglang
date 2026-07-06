@@ -385,6 +385,8 @@ class Envs:
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+    # Log every PD/Mooncake buffer registration for 2MB IPC alignment (NPU).
+    SGLANG_NPU_IPC_ALIGN_DEBUG = EnvBool(True)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
