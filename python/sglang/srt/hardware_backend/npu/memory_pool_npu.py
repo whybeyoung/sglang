@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.alignment import zeros_2m_aligned_segments
+from sglang.srt.hardware_backend.npu.alignment import zeros_2m_aligned
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -87,21 +87,23 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # [size, head_num, head_dim] for each layer
-            # Per-layer 2 MB-aligned K/V (each segment is an independent
-            # allocation; slot 0 reserved for padded tokens). Independent
-            # aligned segments are required for Ascend HCCL IPC RMA
-            # registration, while other backends pass through to torch.zeros.
+            # Contiguous [layer, page, ...] buffer (slot 0 = padded tokens);
+            # required by HiCache L2, 2 MB-aligned base for HCCL IPC registration.
             num_pages = self.size // self.page_size + 1
-            self._k_buffer_owner, self.k_buffer = zeros_2m_aligned_segments(
-                num_segments=self.layer_num,
-                segment_shape=(num_pages, self.page_size, self.head_num, self.head_dim),
+            self.k_buffer = zeros_2m_aligned(
+                (
+                    self.layer_num,
+                    num_pages,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            self._v_buffer_owner, self.v_buffer = zeros_2m_aligned_segments(
-                num_segments=self.layer_num,
-                segment_shape=(
+            self.v_buffer = zeros_2m_aligned(
+                (
+                    self.layer_num,
                     num_pages,
                     self.page_size,
                     self.head_num,
@@ -112,15 +114,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             )
 
             if self.use_fia:
-                # Each layer view: [P*ps, 1, H, D], sharing its own aligned
-                # per-layer allocation.
+                # Per-layer views [P*ps, 1, H, D] into the contiguous storage;
+                # keeps torch.compile from capturing the whole multi-layer tensor.
                 self.k_buffer = [
-                    s.view(-1, 1, self.head_num, self.head_dim)
-                    for s in self.k_buffer
+                    self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
+                    for i in range(self.layer_num)
                 ]
                 self.v_buffer = [
-                    s.view(-1, 1, self.head_num, self.v_head_dim)
-                    for s in self.v_buffer
+                    self.v_buffer[i].view(-1, 1, self.head_num, self.v_head_dim)
+                    for i in range(self.layer_num)
                 ]
 
     def _init_kv_copy_and_warmup(self):
@@ -313,36 +315,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # Per-layer 2 MB-aligned K/V (each segment is an independent
-            # allocation; slot 0 reserved for padded tokens).
+            # Contiguous [layer, page, ...] K/V/index_k (slot 0 = padded tokens);
+            # required by HiCache L2, 2 MB-aligned base for HCCL IPC registration.
             num_pages = self.size // self.page_size + 1
 
-            self._k_buffer_owner, self.k_buffer = zeros_2m_aligned_segments(
-                num_segments=layer_num,
-                segment_shape=(num_pages, self.page_size, 1, self.kv_lora_rank),
+            self.k_buffer = zeros_2m_aligned(
+                (layer_num, num_pages, self.page_size, 1, self.kv_lora_rank),
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            self._v_buffer_owner, self.v_buffer = zeros_2m_aligned_segments(
-                num_segments=layer_num,
-                segment_shape=(num_pages, self.page_size, 1, self.qk_rope_head_dim),
+            self.v_buffer = zeros_2m_aligned(
+                (layer_num, num_pages, self.page_size, 1, self.qk_rope_head_dim),
                 dtype=self.store_dtype,
                 device=self.device,
             )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                self._index_k_buffer_owner, self.index_k_buffer = (
-                    zeros_2m_aligned_segments(
-                        num_segments=layer_num,
-                        segment_shape=(
-                            num_pages,
-                            self.page_size,
-                            1,
-                            self.index_head_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
+                self.index_k_buffer = zeros_2m_aligned(
+                    (layer_num, num_pages, self.page_size, 1, self.index_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
                 )
 
         self._finalize_allocation_log(size)

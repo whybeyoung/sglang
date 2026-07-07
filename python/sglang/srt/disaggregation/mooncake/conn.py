@@ -238,35 +238,59 @@ class MooncakeKVManager(CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
+    def _reg_regions(self, ptrs, lens):
+        # NPU: contiguous KV pool -> merge into 2 MB-aligned HCCL IPC regions.
+        # Non-NPU: register ptrs/lens as-is.
+        from sglang.srt.utils import is_npu
+
+        if not is_npu():
+            return ptrs, lens
+        from sglang.srt.hardware_backend.npu.alignment import ipc_register_regions
+
+        return ipc_register_regions(ptrs, lens)
+
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
             self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+                *self._reg_regions(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
             )
 
         # Batch register auxiliary data buffers
         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
             self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+                *self._reg_regions(
+                    self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+                )
             )
 
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
             if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+                self.engine.batch_register(*self._reg_regions(ptrs, lens))
 
     def deregister_buffer_to_engine(self):
+        # Deregister the same (merged) base ptrs used at registration.
         if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+            reg_ptrs, _ = self._reg_regions(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            )
+            self.engine.batch_deregister(reg_ptrs)
 
         if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+            reg_ptrs, _ = self._reg_regions(
+                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            )
+            self.engine.batch_deregister(reg_ptrs)
 
-        for ptrs in self.kv_args.state_data_ptrs or []:
+        for ptrs, lens in zip(
+            self.kv_args.state_data_ptrs or [],
+            self.kv_args.state_data_lens or [],
+        ):
             if ptrs:
-                self.engine.batch_deregister(ptrs)
+                reg_ptrs, _ = self._reg_regions(ptrs, lens)
+                self.engine.batch_deregister(reg_ptrs)
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:

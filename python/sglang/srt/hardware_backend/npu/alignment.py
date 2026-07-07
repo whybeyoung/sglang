@@ -6,23 +6,24 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """2 MB alignment helpers for CANN HCCL IPC RMA registration.
 
-torch_npu's caching allocator can split 2 MB-aligned raw blocks into
-misaligned sub-blocks; we over-allocate by one alignment block and return
-a view starting at the next 2 MB boundary. Non-NPU devices pass through
-to ``torch.zeros``. This module deliberately does NOT import ``torch_npu``
-so it stays cheap to import from any platform.
+HCCL IPC RMA needs every registered ``(ptr, len)`` to be 2 MB-aligned (base and
+length). Non-NPU devices pass through to ``torch.zeros``.
 """
 
 from __future__ import annotations
 
 from numbers import Integral
-from typing import Any, List, Tuple, Union
+from typing import Any, List, Sequence, Tuple, Union
 
 import torch
 
 from sglang.srt.utils import is_npu
 
 ALIGNMENT_BLOCK_2M = 2 * 1024 * 1024
+
+# One block absorbs the base-align shift, the other lets a region's length round
+# up to 2 MB while staying inside the (tensor-owned) allocation.
+_OVERALLOC_2M = 2 * ALIGNMENT_BLOCK_2M
 
 
 def _device_type(device: Union[str, torch.device, None]) -> str:
@@ -55,10 +56,11 @@ def zeros_2m_aligned(shape, dtype, device) -> torch.Tensor:
     if ALIGNMENT_BLOCK_2M % elem_size != 0:
         raise RuntimeError(f"ALIGNMENT_BLOCK_2M not divisible by elem_size={elem_size}")
 
-    # Over-allocate 2 MB so a forward shift up to (2 MB - 1) bytes still
-    # leaves >= requested_bytes of aligned region.
+    # Over-allocate two 2 MB blocks so that after the forward shift to a
+    # 2 MB-aligned base there is still >= requested_bytes rounded up to the
+    # next 2 MB boundary of valid memory (see _OVERALLOC_2M).
     requested_bytes = n_elems * elem_size
-    mem_size = requested_bytes + ALIGNMENT_BLOCK_2M
+    mem_size = requested_bytes + _OVERALLOC_2M
     flat = torch.zeros(mem_size // elem_size, dtype=dtype, device=device)
 
     addr = flat.data_ptr()
@@ -90,56 +92,41 @@ def zeros_2m_aligned(shape, dtype, device) -> torch.Tensor:
     return out
 
 
-def zeros_2m_aligned_segments(
-    num_segments: int,
-    segment_shape,
-    dtype: torch.dtype,
-    device,
-) -> Tuple[None, List[torch.Tensor]]:
-    """N independent 2 MB-aligned tensors (one per layer for KV registration).
+def ipc_register_regions(
+    ptrs: Sequence[int], lengths: Sequence[int]
+) -> Tuple[List[int], List[int]]:
+    """Per-layer ``(ptr, len)`` -> 2 MB-aligned HCCL IPC registration regions.
 
-    Each segment owns its own underlying allocation. The returned ``owner``
-    is ``None`` and exists only for API symmetry with earlier shared-owner
-    variants.
+    The KV pool is one contiguous ``[layer, ...]`` tensor, so per-layer ptrs are
+    not 2 MB-aligned. Merge the adjacent per-layer runs back into their parent
+    allocation (2 MB-aligned base) and round each length up to 2 MB; transfers
+    still address sub-ranges inside these regions.
     """
-    if not _is_npu_device(device):
-        return None, [
-            torch.zeros(segment_shape, dtype=dtype, device=device)
-            for _ in range(num_segments)
-        ]
+    if not ptrs:
+        return [], []
 
-    if isinstance(segment_shape, Integral):
-        segment_shape = (int(segment_shape),)
-    else:
-        segment_shape = tuple(int(s) for s in segment_shape)
+    order = sorted(range(len(ptrs)), key=lambda i: int(ptrs[i]))
+    merged: List[List[int]] = []  # [start, end)
+    for i in order:
+        start = int(ptrs[i])
+        end = start + int(lengths[i])
+        if merged and start == merged[-1][1]:
+            merged[-1][1] = end
+        else:
+            merged.append([start, end])
 
-    segments: List[torch.Tensor] = []
-    for i in range(num_segments):
-        seg = zeros_2m_aligned(segment_shape, dtype, device)
-        if seg.data_ptr() % ALIGNMENT_BLOCK_2M != 0:
-            raise RuntimeError(f"segment {i} not aligned: ptr=0x{seg.data_ptr():x}")
-        if not seg.is_contiguous():
-            raise RuntimeError(f"segment {i} unexpectedly non-contiguous")
-        segments.append(seg)
-    return None, segments
-
-
-def assert_2m_aligned_kv_args(kv_args) -> None:
-    """Fail fast on misaligned kv/aux/state ptrs before HCCL IPC RMA registration."""
-    groups = (
-        ("kv_data_ptrs", getattr(kv_args, "kv_data_ptrs", None)),
-        ("aux_data_ptrs", getattr(kv_args, "aux_data_ptrs", None)),
-        ("state_data_ptrs", getattr(kv_args, "state_data_ptrs", None)),
-    )
-    misaligned = [
-        (name, i, ptr)
-        for name, ptrs in groups
-        if ptrs
-        for i, ptr in enumerate(ptrs)
-        if ptr % ALIGNMENT_BLOCK_2M != 0
-    ]
-    if misaligned:
-        details = ", ".join(f"{name}[{i}]=0x{ptr:x}" for name, i, ptr in misaligned[:8])
-        raise RuntimeError(
-            f"NPU PD: {len(misaligned)} buffer(s) not 2 MB-aligned. First: {details}."
-        )
+    reg_ptrs: List[int] = []
+    reg_lens: List[int] = []
+    for start, end in merged:
+        if start % ALIGNMENT_BLOCK_2M != 0:
+            raise RuntimeError(
+                f"NPU IPC region base 0x{start:x} is not 2 MB-aligned; "
+                f"buffer must be allocated via zeros_2m_aligned."
+            )
+        length = end - start
+        aligned_len = (
+            (length + ALIGNMENT_BLOCK_2M - 1) // ALIGNMENT_BLOCK_2M
+        ) * ALIGNMENT_BLOCK_2M
+        reg_ptrs.append(start)
+        reg_lens.append(aligned_len)
+    return reg_ptrs, reg_lens

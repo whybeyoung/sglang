@@ -29,26 +29,26 @@ class AscendKVManager(MooncakeKVManager):
         )
 
     def register_buffer_to_engine(self):
-        # HCCL IPC RMA requires every registered (ptr, len) to start at a 2 MB
-        # page boundary; fail fast with the offending source list instead of
-        # surfacing later as an opaque ADXL Connect 503900 once a peer dials in.
-        from sglang.srt.hardware_backend.npu.alignment import (
-            assert_2m_aligned_kv_args,
+        # Contiguous KV pool -> merge into 2 MB-aligned HCCL IPC regions.
+        from sglang.srt.hardware_backend.npu.alignment import ipc_register_regions
+
+        self.engine.batch_register(
+            *ipc_register_regions(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
         )
-
-        assert_2m_aligned_kv_args(self.kv_args)
-
-        self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
         # The Ascend backend optimize batch registration for small memory blocks.
         self.engine.batch_register(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            *ipc_register_regions(
+                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            )
         )
         # Batch register state/extra pool data buffers
         for component_ptrs, component_lens in zip(
             self.kv_args.state_data_ptrs or [],
             self.kv_args.state_data_lens or [],
         ):
-            self.engine.batch_register(component_ptrs, component_lens)
+            self.engine.batch_register(
+                *ipc_register_regions(component_ptrs, component_lens)
+            )
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
