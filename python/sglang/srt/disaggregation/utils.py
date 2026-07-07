@@ -12,9 +12,13 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.npu_ipc_utils import log_ipc_regions
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.alignment import zeros_2m_aligned as _zeros
+else:
+    _zeros = torch.zeros
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -226,34 +230,30 @@ class MetadataBuffers:
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
-            self.cached_tokens = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
-            )
-            self.output_token_logprobs_val = torch.zeros(
+            self.output_ids = _zeros((size, 16), dtype=torch.int32, device=device)
+            self.cached_tokens = _zeros((size, 16), dtype=torch.int32, device=device)
+            self.output_token_logprobs_val = _zeros(
                 (size, 16), dtype=torch.float32, device=device
             )
-            self.output_token_logprobs_idx = torch.zeros(
+            self.output_token_logprobs_idx = _zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
-            self.output_top_logprobs_val = torch.zeros(
+            self.output_top_logprobs_val = _zeros(
                 (size, max_top_logprobs_num), dtype=torch.float32, device=device
             )
-            self.output_top_logprobs_idx = torch.zeros(
+            self.output_top_logprobs_idx = _zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
             # For PD + spec decode
-            self.output_topk_p = torch.zeros(
-                (size, 16), dtype=torch.float32, device=device
-            )
-            self.output_topk_index = torch.zeros(
+            self.output_topk_p = _zeros((size, 16), dtype=torch.float32, device=device)
+            self.output_topk_index = _zeros(
                 (size, 16), dtype=torch.int64, device=device
             )
-            self.output_hidden_states = torch.zeros(
+            self.output_hidden_states = _zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
             # Request validation: store bootstrap_room to detect metadata corruption
-            self.bootstrap_room = torch.zeros(
+            self.bootstrap_room = _zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
@@ -294,19 +294,6 @@ class MetadataBuffers:
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
-        aux_labels = [
-            "aux.output_ids",
-            "aux.cached_tokens",
-            "aux.output_token_logprobs_val",
-            "aux.output_token_logprobs_idx",
-            "aux.output_top_logprobs_val",
-            "aux.output_top_logprobs_idx",
-            "aux.output_topk_p",
-            "aux.output_topk_index",
-            "aux.output_hidden_states",
-            "aux.bootstrap_room",
-        ]
-        log_ipc_regions("MetadataBuffers.get_buf_infos", ptrs, data_lens, aux_labels)
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):

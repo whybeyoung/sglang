@@ -239,60 +239,34 @@ class MooncakeKVManager(CommonKVManager):
         self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
-        kv_labels = [f"kv[{i}]" for i in range(len(self.kv_args.kv_data_ptrs or []))]
-        aux_labels = [
-            "aux.output_ids",
-            "aux.cached_tokens",
-            "aux.output_token_logprobs_val",
-            "aux.output_token_logprobs_idx",
-            "aux.output_top_logprobs_val",
-            "aux.output_top_logprobs_idx",
-            "aux.output_topk_p",
-            "aux.output_topk_index",
-            "aux.output_hidden_states",
-            "aux.bootstrap_room",
-        ]
-
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
             self.engine.batch_register(
-                self.kv_args.kv_data_ptrs,
-                self.kv_args.kv_data_lens,
-                kv_labels,
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
             )
 
         # Batch register auxiliary data buffers
         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
             self.engine.batch_register(
-                self.kv_args.aux_data_ptrs,
-                self.kv_args.aux_data_lens,
-                aux_labels[: len(self.kv_args.aux_data_ptrs)],
-            )
-
-        for idx, (ptrs, lens) in enumerate(
-            zip(self.kv_args.state_data_ptrs, self.kv_args.state_data_lens)
-        ):
-            if ptrs and lens:
-                state_labels = [f"state[{idx}][{i}]" for i in range(len(ptrs))]
-                self.engine.batch_register(ptrs, lens, state_labels)
-
-    def deregister_buffer_to_engine(self):
-        if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-            )
-
-        if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(
                 self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
             )
 
         for ptrs, lens in zip(
-            self.kv_args.state_data_ptrs or [],
-            self.kv_args.state_data_lens or [],
+            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
+            if ptrs and lens:
+                self.engine.batch_register(ptrs, lens)
+
+    def deregister_buffer_to_engine(self):
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+
+        for ptrs in self.kv_args.state_data_ptrs or []:
             if ptrs:
-                self.engine.batch_deregister(ptrs, lens)
+                self.engine.batch_deregister(ptrs)
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
