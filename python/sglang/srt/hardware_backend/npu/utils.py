@@ -85,6 +85,7 @@ def set_default_server_args(args: "ServerArgs"):
     # handles hierarchical cache configs
     if args.enable_hierarchical_cache:
         args.hicache_io_backend = "kernel_ascend"
+        # MLA/DSA index_k must ride with k/v; page_first_direct omits it.
         if args.use_mla_backend():
             args.hicache_mem_layout = "page_first_kv_split"
         else:
