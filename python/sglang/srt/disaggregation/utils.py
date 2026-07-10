@@ -230,32 +230,71 @@ class MetadataBuffers:
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = _zeros((size, 16), dtype=torch.int32, device=device)
-            self.cached_tokens = _zeros((size, 16), dtype=torch.int32, device=device)
-            self.output_token_logprobs_val = _zeros(
-                (size, 16), dtype=torch.float32, device=device
-            )
-            self.output_token_logprobs_idx = _zeros(
-                (size, 16), dtype=torch.int32, device=device
-            )
-            self.output_top_logprobs_val = _zeros(
-                (size, max_top_logprobs_num), dtype=torch.float32, device=device
-            )
-            self.output_top_logprobs_idx = _zeros(
-                (size, max_top_logprobs_num), dtype=torch.int32, device=device
-            )
-            # For PD + spec decode
-            self.output_topk_p = _zeros((size, 16), dtype=torch.float32, device=device)
-            self.output_topk_index = _zeros(
-                (size, 16), dtype=torch.int64, device=device
-            )
-            self.output_hidden_states = _zeros(
-                (size, hidden_size), dtype=hidden_states_dtype, device=device
-            )
-            # Request validation: store bootstrap_room to detect metadata corruption
-            self.bootstrap_room = _zeros(
-                (size, 8), dtype=bootstrap_room_dtype, device=device
-            )
+            #
+            # NPU: pack all fields into ONE 2 MB-aligned backing buffer so their
+            # per-field ptrs are back-to-back and collapse into a single HCCL
+            # IPC region via ipc_register_regions (avoids 10 × 4 MB over-alloc
+            # from independent zeros_2m_aligned calls). Non-NPU falls back to
+            # per-field torch.zeros exactly as before.
+            _fields = [
+                ("output_ids", (size, 16), torch.int32),
+                ("cached_tokens", (size, 16), torch.int32),
+                ("output_token_logprobs_val", (size, 16), torch.float32),
+                ("output_token_logprobs_idx", (size, 16), torch.int32),
+                (
+                    "output_top_logprobs_val",
+                    (size, max_top_logprobs_num),
+                    torch.float32,
+                ),
+                (
+                    "output_top_logprobs_idx",
+                    (size, max_top_logprobs_num),
+                    torch.int32,
+                ),
+                # For PD + spec decode
+                ("output_topk_p", (size, 16), torch.float32),
+                ("output_topk_index", (size, 16), torch.int64),
+                ("output_hidden_states", (size, hidden_size), hidden_states_dtype),
+                # Request validation: bootstrap_room detects metadata corruption
+                ("bootstrap_room", (size, 8), bootstrap_room_dtype),
+            ]
+            if is_npu():
+                offset, plan = 0, []
+                for _, shape, dtype in _fields:
+                    offset = (offset + 7) & ~7  # 8B align for any dtype view
+                    n = 1
+                    for s in shape:
+                        n *= int(s)
+                    nbytes = n * torch.empty(0, dtype=dtype).element_size()
+                    plan.append((offset, nbytes))
+                    offset += nbytes
+                # ipc_register_regions merges only strictly adjacent runs
+                # (start == prev.end). Any 8B padding gap here would split the
+                # packed layout into multiple HCCL IPC regions, and the split
+                # region's base would fail the 2 MB-alignment assertion. All
+                # current field byte sizes are multiples of 8, so there is no
+                # gap; guard against future field additions regressing this.
+                for (prev_o, prev_n), (next_o, _n) in zip(plan, plan[1:]):
+                    if next_o != prev_o + prev_n:
+                        raise RuntimeError(
+                            "Packed MetadataBuffers fields must be gap-free for "
+                            f"NPU HCCL IPC registration; gap between "
+                            f"{prev_o}+{prev_n} and {next_o}."
+                        )
+                self._metadata_backing = _zeros(
+                    (offset,), dtype=torch.uint8, device=device
+                )
+                for (name, shape, dtype), (o, n) in zip(_fields, plan):
+                    setattr(
+                        self,
+                        name,
+                        self._metadata_backing[o : o + n].view(dtype).view(shape),
+                    )
+            else:
+                for name, shape, dtype in _fields:
+                    setattr(
+                        self, name, _zeros(shape, dtype=dtype, device=device)
+                    )
 
     def get_buf_infos(self):
         ptrs = [
