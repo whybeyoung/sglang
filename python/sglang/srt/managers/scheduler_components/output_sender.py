@@ -17,12 +17,11 @@ class SenderWrapper:
         if self.socket is None:
             return
 
-        if (
-            isinstance(recv_obj, BaseReq)
-            and recv_obj.http_worker_ipc is not None
-            and output.http_worker_ipc is None
-        ):
-            # handle communicator reqs for multi-http worker case
-            output.http_worker_ipc = recv_obj.http_worker_ipc
+        # handle communicator reqs for multi-http worker case; recv_obj may be
+        # an io_struct BaseReq or a scheduler Req (e.g. abort paths pass the
+        # scheduler's Req) — both carry http_worker_ipc
+        recv_ipc = getattr(recv_obj, "http_worker_ipc", None)
+        if recv_ipc is not None and output.http_worker_ipc is None:
+            output.http_worker_ipc = recv_ipc
 
         self.socket.send_pyobj(output)
