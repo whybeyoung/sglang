@@ -257,6 +257,18 @@ async def health_generate():
     return Response(status_code=200)
 
 
+@app.post("/abort_request")
+async def abort_request(request_data: dict):
+    async with aiohttp.ClientSession() as session:
+        # Broadcast the abort to every server; each ignores unknown rids
+        tasks = []
+        for server in chain(lb.prefill_urls, lb.decode_urls):
+            tasks.append(session.post(f"{server}/abort_request", json=request_data))
+        for i, response in enumerate(asyncio.as_completed(tasks)):
+            await response
+    return Response(status_code=200)
+
+
 @app.post("/flush_cache")
 async def flush_cache():
     async with aiohttp.ClientSession() as session:
