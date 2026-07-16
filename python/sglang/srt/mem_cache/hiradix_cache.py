@@ -956,8 +956,14 @@ class HiRadixCache(RadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                end_node = self.ongoing_load_back.pop(ack_id)
+                load_back_entry = self.ongoing_load_back.pop(ack_id)
+                if isinstance(load_back_entry, tuple):
+                    end_node, protected_host_nodes = load_back_entry
+                else:
+                    end_node, protected_host_nodes = load_back_entry, []
                 self.dec_lock_ref(end_node)
+                for host_node in protected_host_nodes:
+                    host_node.release_host()
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
@@ -1154,6 +1160,11 @@ class HiRadixCache(RadixCache):
         else:
             ancester_node = node
 
+        # Protect the nodes being loaded from host eviction.
+        for n in nodes_to_load:
+            n.protect_host()
+        protected_host_nodes = list(nodes_to_load)
+
         # protect the ancestor nodes from eviction
         result = self.inc_lock_ref(ancester_node)
         delta = result.delta
@@ -1165,6 +1176,8 @@ class HiRadixCache(RadixCache):
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
+            for host_node in protected_host_nodes:
+                host_node.release_host()
             return None
 
         device_indices = self.cache_controller.load(
@@ -1189,9 +1202,14 @@ class HiRadixCache(RadixCache):
                 last_hit_node.id,
                 self.evictable_size_,
             )
+            for host_node in protected_host_nodes:
+                host_node.release_host()
             return None
 
-        self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        self.ongoing_load_back[last_hit_node.id] = (
+            last_hit_node,
+            protected_host_nodes,
+        )
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
