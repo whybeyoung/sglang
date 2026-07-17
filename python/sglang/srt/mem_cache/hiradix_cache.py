@@ -946,9 +946,9 @@ class HiRadixCache(RadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
+                for ack in self.cache_controller.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    for ack_id in ack.node_ids:
                         self._finish_write_through_ack(ack_id, release_lock=False)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
@@ -960,8 +960,8 @@ class HiRadixCache(RadixCache):
         # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -971,18 +971,17 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
 
     def loading_check(self):
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-                if not finish_event.query():
-                    # the KV cache loading is still ongoing
+            for ack in self.cache_controller.ack_load_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -992,11 +991,19 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                if ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                    self.metrics_collector.observe_load_back_duration(
+                        duration_ms / 1000.0
+                    )
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
@@ -1252,7 +1259,6 @@ class HiRadixCache(RadixCache):
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
 
-        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -1319,12 +1325,6 @@ class HiRadixCache(RadixCache):
             self._record_store_event(node, medium=StorageMedium.GPU)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
-
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
         return device_indices
 
@@ -1495,28 +1495,73 @@ class HiRadixCache(RadixCache):
 
     def handle_prefetch_result(self, operation: PrefetchOperation):
         req_id = operation.request_id
-        completed_tokens = operation.completed_tokens
-        logger.debug(
-            f"Terminate prefetch {req_id} and {operation.completed_tokens} tokens are completed"
-        )
         last_host_node, prefetch_key, host_indices, operation = (
             self.ongoing_prefetch.pop(req_id)
         )
-        fetched_key = prefetch_key[:completed_tokens]
-        written_indices = host_indices[:completed_tokens]
+        completed_tokens = operation.completed_tokens
+        hash_value = operation.hash_value
+        logger.debug(
+            f"Terminate prefetch {req_id} and {completed_tokens} tokens are completed"
+        )
+
+        pool_transfers = getattr(operation, "pool_transfers", None) or []
+        hit_pages = (
+            operation.pool_storage_result.extra_pool_hit_pages
+            if pool_transfers
+            else {}
+        )
+        pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
+        packed = torch.tensor(
+            [completed_tokens, *pool_hit_pages],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+        for transfer, count in zip(pool_transfers, pool_hit_pages):
+            hit_pages[transfer.name] = count
+
+        expected_tokens = len(hash_value) * self.page_size
+        # Hybrid cache state is all-or-nothing: every pool must cover the same
+        # fetched prefix, otherwise the whole prefetch result is unusable.
+        all_succeeded = min_completed_tokens == expected_tokens and all(
+            transfer.keys is not None and count == len(transfer.keys)
+            for transfer, count in zip(pool_transfers, pool_hit_pages)
+        )
+        if pool_transfers and not all_succeeded:
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=pool_transfers,
+            )
+            last_host_node.release_host()
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            logger.warning(
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                req_id,
+                completed_tokens,
+                expected_tokens,
+            )
+            return
+
+        fetched_key = prefetch_key[:min_completed_tokens]
+        written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
             last_host_node,
             fetched_key,
             written_indices,
-            operation.hash_value[: completed_tokens // self.page_size],
+            hash_value[: min_completed_tokens // self.page_size],
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.append_host_mem_release(
+            host_indices[min_completed_tokens:completed_tokens]
+        )
         last_host_node.release_host()
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         # Track tokens actually loaded from storage for this request (L3 hits)
-        loaded_from_storage = completed_tokens - matched_length
+        loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
         if self.enable_storage_metrics:

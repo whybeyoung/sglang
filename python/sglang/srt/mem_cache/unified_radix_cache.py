@@ -1668,7 +1668,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None:
             return False
 
-        start_time = time.perf_counter()
         host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
@@ -1752,12 +1751,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.inc_lock_ref(best_match_node).to_dec_params(),
             host_anchor_params,
         )
-
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
         return True
 
@@ -2018,12 +2011,54 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         ) = self.ongoing_prefetch.pop(req_id)
 
-        fetched_key = prefetch_key[:completed_tokens]
+        hash_value = operation.hash_value
+
+        # Synchronize the completed tokens and extra pool hit pages across ATTN groups
+        min_completed_tokens = completed_tokens
+        pool_transfers = operation.pool_transfers or []
+        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+        pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
+        packed = torch.tensor(
+            [completed_tokens, *pool_hit_pages],
+            dtype=torch.int,
+        )
+
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+        for transfer, count in zip(pool_transfers, pool_hit_pages):
+            hit_pages[transfer.name] = count
+
+        # For hybrid models, if either the extra pool (SWA or Mamba ...) prefetch fails, the entire prefix becomes unusable.
+        # To simplify lifecycle management, we initially adopt an all-or-nothing strategy:
+        # if any pool fails to fetch successfully, we abort the entire prefetch.
+        expected_tokens = len(hash_value) * self.page_size
+        all_succeeded = min_completed_tokens == expected_tokens and all(
+            transfer.keys is not None and count == len(transfer.keys)
+            for transfer, count in zip(pool_transfers, pool_hit_pages)
+        )
+        if pool_transfers and not all_succeeded:
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=pool_transfers,
+            )
+            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            logger.warning(
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                req_id,
+                completed_tokens,
+                expected_tokens,
+            )
+            return
+
+        fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
             last_host_node,
             fetched_key,
-            host_indices[:completed_tokens],
-            operation.hash_value[: completed_tokens // self.page_size],
+            host_indices[:min_completed_tokens],
+            hash_value[: min_completed_tokens // self.page_size],
         )
 
         for ct, xfers in comp_xfers.items():
@@ -2038,10 +2073,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.cache_controller.mem_pool_host.free(
             host_indices[: insert_result.prefix_len]
         )
+        self.cache_controller.append_host_mem_release(
+            host_indices[min_completed_tokens:completed_tokens]
+        )
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
-        loaded_from_storage = completed_tokens - insert_result.prefix_len
+        loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
             "HiCache prefetch success req=%s completed=%d matched=%d loaded=%d occupied=%d",
@@ -2336,9 +2374,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:
-                for _, finish_event, ack_list in cc.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
+                for ack in cc.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
                 cc.ack_write_queue.clear()
@@ -2349,8 +2387,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_write_queue:
-                if not finish_event.query():
+            for ack in cc.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
 
@@ -2360,9 +2398,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Process completed acks
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = cc.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
@@ -2375,8 +2413,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # diverge across ranks.
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_load_queue:
-                if not finish_event.query():
+            for ack in cc.ack_load_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -2384,12 +2422,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         finish_count = finish_count_tensor.item()
 
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = cc.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                if ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                    self.metrics_collector.observe_load_back_duration(
+                        duration_ms / 1000.0
+                    )
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
