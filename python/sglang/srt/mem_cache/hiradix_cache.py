@@ -613,6 +613,13 @@ class HiRadixCache(RadixCache):
                         assert operation.completed_tokens <= ack.completed_tokens
                         operation.completed_tokens = ack.completed_tokens
                 if ack.pool_hits is not None:
+                    packed = torch.tensor(
+                        [ack.pool_hits.get(p.value, 0) for p in PoolName],
+                        dtype=torch.int,
+                    )
+                    self._all_reduce(packed, torch.distributed.ReduceOp.MIN)
+                    for i, p in enumerate(PoolName):
+                        ack.pool_hits[p.value] = int(packed[i].item())
                     if operation.request_id in self.ongoing_prefetch:
                         operation.pool_storage_result.update_extra_pool_hit_pages(
                             ack.pool_hits
