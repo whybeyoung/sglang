@@ -612,6 +612,12 @@ class HiRadixCache(RadixCache):
                     if operation.request_id in self.ongoing_prefetch:
                         assert operation.completed_tokens <= ack.completed_tokens
                         operation.completed_tokens = ack.completed_tokens
+                if ack.pool_hits is not None:
+                    if operation.request_id in self.ongoing_prefetch:
+                        operation.pool_storage_result.update_extra_pool_hit_pages(
+                            ack.pool_hits
+                        )
+                        operation.pool_transfers_done = True
                 if ack.completed_req:
                     if operation.request_id in self.ongoing_prefetch:
                         self.handle_prefetch_result(operation)
@@ -1498,7 +1504,9 @@ class HiRadixCache(RadixCache):
         last_host_node, prefetch_key, host_indices, operation = (
             self.ongoing_prefetch.pop(req_id)
         )
-        completed_tokens = operation.completed_tokens
+        # completed_tokens / pool_hits already reduced in prefetch_sync_thread.
+        min_completed_tokens = operation.completed_tokens
+        completed_tokens = min_completed_tokens
         hash_value = operation.hash_value
         logger.debug(
             f"Terminate prefetch {req_id} and {completed_tokens} tokens are completed"
@@ -1511,15 +1519,6 @@ class HiRadixCache(RadixCache):
             else {}
         )
         pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
-        packed = torch.tensor(
-            [completed_tokens, *pool_hit_pages],
-            dtype=torch.int,
-        )
-        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-        min_completed_tokens = int(packed[0].item())
-        pool_hit_pages = list(map(int, packed[1:].tolist()))
-        for transfer, count in zip(pool_transfers, pool_hit_pages):
-            hit_pages[transfer.name] = count
 
         expected_tokens = len(hash_value) * self.page_size
         # Hybrid cache state is all-or-nothing: every pool must cover the same

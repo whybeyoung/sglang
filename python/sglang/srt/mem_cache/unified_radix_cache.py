@@ -2013,21 +2013,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         hash_value = operation.hash_value
 
-        # Synchronize the completed tokens and extra pool hit pages across ATTN groups
+        # completed_tokens / pool_hits already reduced in prefetch_sync_thread.
         min_completed_tokens = completed_tokens
         pool_transfers = operation.pool_transfers or []
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
-        packed = torch.tensor(
-            [completed_tokens, *pool_hit_pages],
-            dtype=torch.int,
-        )
-
-        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-        min_completed_tokens = int(packed[0].item())
-        pool_hit_pages = list(map(int, packed[1:].tolist()))
-        for transfer, count in zip(pool_transfers, pool_hit_pages):
-            hit_pages[transfer.name] = count
 
         # For hybrid models, if either the extra pool (SWA or Mamba ...) prefetch fails, the entire prefix becomes unusable.
         # To simplify lifecycle management, we initially adopt an all-or-nothing strategy:
