@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
+    SocketCacheCapacityError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
@@ -141,8 +142,8 @@ class KVArgsRegisterInfo:
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
             dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
@@ -337,9 +338,9 @@ class MooncakeKVManager(CommonKVManager):
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
         handler = self._staging_handler
-        assert (
-            handler is not None
-        ), "STAGING_REQ received before staging handler initialized"
+        assert handler is not None, (
+            "STAGING_REQ received before staging handler initialized"
+        )
         decode_req = handler._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -383,21 +384,26 @@ class MooncakeKVManager(CommonKVManager):
 
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
-        na = NetworkAddress(req.endpoint, req.dst_port)
-        self._connect(
-            na.to_tcp(),
-            is_ipv6=na.is_ipv6,
-        ).send_multipart(
-            [
-                b"CHUNK_READY",
-                str(req.room).encode("ascii"),
-                str(chunk_idx).encode("ascii"),
-                str(kv_chunk.index_slice.start).encode("ascii"),
-                str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                req.mooncake_session_id.encode("ascii"),
-                str(prefill_unique_rank).encode("ascii"),
-            ]
-        )
+        try:
+            na = NetworkAddress(req.endpoint, req.dst_port)
+            self._connect(
+                na.to_tcp(),
+                is_ipv6=na.is_ipv6,
+            ).send_multipart(
+                [
+                    b"CHUNK_READY",
+                    str(req.room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(kv_chunk.index_slice.start).encode("ascii"),
+                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                    req.mooncake_session_id.encode("ascii"),
+                    str(prefill_unique_rank).encode("ascii"),
+                ]
+            )
+        except SocketCacheCapacityError:
+            raise
+        except Exception:
+            pass
 
     def _do_staging_transfer(
         self,
@@ -1593,6 +1599,18 @@ class MooncakeKVManager(CommonKVManager):
                                 self._staging_ctx.prefetch_requested.discard(key)
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
+            except SocketCacheCapacityError as e:
+                room = kv_chunk.room
+                reason = (
+                    f"Outbound ZMQ endpoint capacity reached while processing "
+                    f"room {room}: {e}"
+                )
+                self.record_failure(room, reason)
+                self.update_status(room, KVPoll.Failed)
+                self.transfer_infos.pop(room, None)
+                self.req_to_decode_prefix_len.pop(room, None)
+                logger.error(reason)
+
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
@@ -1655,6 +1673,12 @@ class MooncakeKVManager(CommonKVManager):
                             f"Sent ABORT_ACK for room {room_to_be_aborted} to "
                             f"{decode_ip}:{decode_port}"
                         )
+                    except SocketCacheCapacityError as e:
+                        logger.warning(
+                            "Failed to send ABORT_ACK for room %s: %s",
+                            room_to_be_aborted,
+                            e,
+                        )
                     except Exception as e:
                         logger.debug(
                             f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
@@ -1714,9 +1738,9 @@ class MooncakeKVManager(CommonKVManager):
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
                     handler = self._staging_handler
-                    assert (
-                        handler is not None
-                    ), "CHUNK_READY received before staging handler initialized"
+                    assert handler is not None, (
+                        "CHUNK_READY received before staging handler initialized"
+                    )
                     handler.handle_chunk_arrived(
                         room,
                         chunk_idx,
@@ -1869,7 +1893,6 @@ class MooncakeKVManager(CommonKVManager):
 
 
 class MooncakeKVSender(CommonKVSender):
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
