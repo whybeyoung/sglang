@@ -2081,37 +2081,44 @@ async def _send_disaggregation_warmup_requests(
     ssl_verify: Union[bool, str],
     timeout: int,
 ) -> List[int]:
+    # Single batched POST (pre-#30748 dispatch shape) so every DP rank
+    # receives its fake req in the same forward step. #30748's fan-out
+    # (dp_size independent POSTs via routed_dp_rank) desynchronizes
+    # ranks and crashes DP-attention + DP-LM-head sampler with a
+    # vectorized_gather_kernel OOB assertion.
     ssl_context = (
         ssl_verify
         if isinstance(ssl_verify, bool)
         else ssl.create_default_context(cafile=ssl_verify)
     )
 
-    async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
-        json_data = {
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": 8,
-                "ignore_eos": True,
-            },
-            "bootstrap_host": FAKE_BOOTSTRAP_HOST,
-            "bootstrap_room": dp_rank,
-            "input_ids": [10, 11, 12, 13],
-            "routed_dp_rank": dp_rank,
-        }
-        async with session.post(
-            url + "/generate", json=json_data, ssl=ssl_context
-        ) as response:
-            await response.read()
-            return response.status
+    dp_size = server_args.dp_size
+    tp_size = server_args.tp_size
+    # Space bootstrap_room ids well apart and skip 0, which
+    # DecodePreallocQueue uses as the "not yet written" reset marker.
+    stride = 2**63 // (max(dp_size, 1) + 1)
+    json_data = {
+        "sampling_params": {
+            "temperature": 0.0,
+            "max_new_tokens": 8,
+            "ignore_eos": True,
+        },
+        "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * dp_size,
+        "bootstrap_room": [
+            (i + 1) * stride + (i % max(tp_size, 1)) for i in range(dp_size)
+        ],
+        "input_ids": [[10, 11, 12, 13]] * dp_size,
+    }
 
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=timeout),
         headers=headers,
     ) as session:
-        return await asyncio.gather(
-            *(send_request(session, dp_rank) for dp_rank in range(server_args.dp_size))
-        )
+        async with session.post(
+            url + "/generate", json=json_data, ssl=ssl_context
+        ) as response:
+            await response.read()
+            return [response.status]
 
 
 def _execute_server_warmup(server_args: ServerArgs):
