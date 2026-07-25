@@ -4138,16 +4138,49 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            debug_oob = envs.SGLANG_DEBUG_DECODE_OOB.get()
+
+            # Snapshot rid → source-queue map before we mutate anything.
+            # Used to detect a rid that lives in both a decode side-queue
+            # (prealloc / transfer / retracted) AND the running/last batch —
+            # the "same Req object aborted in two places" scenario that can
+            # invalidate EAGLE verify-graph input tensors.
+            if debug_oob:
+                running_rids = {
+                    r.rid
+                    for b in (self.running_batch, self.last_batch)
+                    if b is not None
+                    for r in b.reqs
+                }
+            else:
+                running_rids = None
+
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                    if debug_oob and decode_req.req.rid in running_rids:
+                        logger.warning(
+                            "[decode-oob] rid %s aborted in prealloc queue also lives in running/last batch "
+                            "(req_pool_idx=%s finished=%s)",
+                            decode_req.req.rid,
+                            decode_req.req.req_pool_idx,
+                            decode_req.req.finished(),
+                        )
                     decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                    if debug_oob and decode_req.req.rid in running_rids:
+                        logger.warning(
+                            "[decode-oob] rid %s aborted in transfer queue also lives in running/last batch "
+                            "(req_pool_idx=%s finished=%s)",
+                            decode_req.req.rid,
+                            decode_req.req.req_pool_idx,
+                            decode_req.req.finished(),
+                        )
                     decode_req.kv_receiver.abort()
 
             # Abort requests already retracted to CPU cache
@@ -4156,6 +4189,11 @@ class Scheduler(
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
                         assert hasattr(decode_req, "kv_cache_cpu")
+                        if debug_oob and decode_req.rid in running_rids:
+                            logger.warning(
+                                "[decode-oob] rid %s aborted in retracted queue also lives in running/last batch",
+                                decode_req.rid,
+                            )
                         del decode_req.kv_cache_cpu
                         self.ipc_channels.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
@@ -4178,6 +4216,15 @@ class Scheduler(
                 # Skip disagg-decode running reqs: filtering mid-spec-cycle
                 # invalidates EAGLE CUDA graph input tensors (OOB gather).
                 if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    if envs.SGLANG_DEBUG_DECODE_OOB.get():
+                        logger.info(
+                            "[decode-oob] skip running-batch abort rid=%s req_pool_idx=%s "
+                            "to_finish=%s finished_reason=%s",
+                            req.rid,
+                            req.req_pool_idx,
+                            req.to_finish,
+                            req.finished_reason,
+                        )
                     continue
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.

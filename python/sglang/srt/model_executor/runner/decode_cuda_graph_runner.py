@@ -1207,6 +1207,100 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return round_up_grid(total_verify_tokens, self.capture_num_tokens)
 
+    def _debug_check_replay_bounds(self, forward_batch: ForwardBatch) -> None:
+        """Bounds-check the tensors the target-verify graph will gather from
+        before we replay. Any device-side gather OOB (the crash we're
+        hunting) will typically originate from these three.
+
+        This calls ``.item()`` and forces a device sync — do not use in
+        production; gated by ``SGLANG_DEBUG_DECODE_OOB``.
+        """
+        try:
+            # NOTE: use the actual req_to_token tensor's dim-0 as the upper
+            # bound. DecodeReqToTokenPool has `.size` = max_running_requests
+            # but the underlying `req_to_token` is shaped
+            # `[size + pre_alloc_size + 1, max_context_len]`, and slot 0 is
+            # a padding row. Comparing to `.size` would fire false positives.
+            pool = self.model_runner.req_to_token_pool
+            req_pool_alloc_size = (
+                pool.req_to_token.shape[0]
+                if hasattr(pool, "req_to_token") and pool.req_to_token is not None
+                else pool.size
+            )
+            token_pool_size = (
+                self.model_runner.token_to_kv_pool_allocator.size
+                if self.model_runner.token_to_kv_pool_allocator is not None
+                else None
+            )
+            rpi = forward_batch.req_pool_indices
+            ocl = forward_batch.out_cache_loc
+            sl = forward_batch.seq_lens
+
+            def _range(t):
+                if t is None or t.numel() == 0:
+                    return None, None
+                return int(t.min().item()), int(t.max().item())
+
+            rpi_min, rpi_max = _range(rpi)
+            ocl_min, ocl_max = _range(ocl)
+            sl_min, sl_max = _range(sl)
+
+            bad = []
+            if rpi_max is not None and rpi_max >= req_pool_alloc_size:
+                bad.append(
+                    f"req_pool_indices max={rpi_max} >= req_pool_alloc_size={req_pool_alloc_size}"
+                )
+            if rpi_min is not None and rpi_min < 0:
+                bad.append(f"req_pool_indices min={rpi_min} < 0")
+            if (
+                token_pool_size is not None
+                and ocl_max is not None
+                and ocl_max >= token_pool_size
+            ):
+                bad.append(
+                    f"out_cache_loc max={ocl_max} >= token_pool_size={token_pool_size}"
+                )
+            if ocl_min is not None and ocl_min < 0:
+                bad.append(f"out_cache_loc min={ocl_min} < 0")
+            if sl_min is not None and sl_min < 0:
+                bad.append(f"seq_lens min={sl_min} < 0")
+
+            if bad:
+                logger.error(
+                    "[decode-oob] pre-replay bounds VIOLATION worker=%s mode=%s bs=%d: %s | "
+                    "req_pool_indices=%s out_cache_loc=%s seq_lens=%s",
+                    "draft" if self.model_runner.is_draft_worker else "target",
+                    forward_batch.forward_mode.name,
+                    forward_batch.batch_size,
+                    "; ".join(bad),
+                    rpi.tolist() if rpi is not None else None,
+                    ocl[:32].tolist() if ocl is not None else None,
+                    sl.tolist() if sl is not None else None,
+                )
+                # Fail fast so we get a python-side traceback instead of a
+                # cudaErrorLaunchFailure that swallows the culprit.
+                raise RuntimeError(f"decode-oob pre-replay bounds: {bad}")
+            else:
+                logger.debug(
+                    "[decode-oob] pre-replay bounds OK worker=%s mode=%s bs=%d "
+                    "rpi=[%s,%s]/%s ocl=[%s,%s]/%s sl=[%s,%s]",
+                    "draft" if self.model_runner.is_draft_worker else "target",
+                    forward_batch.forward_mode.name,
+                    forward_batch.batch_size,
+                    rpi_min,
+                    rpi_max,
+                    req_pool_alloc_size,
+                    ocl_min,
+                    ocl_max,
+                    token_pool_size,
+                    sl_min,
+                    sl_max,
+                )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning("[decode-oob] pre-replay bounds check failed: %s", e)
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1254,6 +1348,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
+            if envs.SGLANG_DEBUG_DECODE_OOB.get():
+                self._debug_check_replay_bounds(forward_batch)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if read_done_post_replay:
                 read_done = self.device_module.Event()

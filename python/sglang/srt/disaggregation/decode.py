@@ -2199,6 +2199,15 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
+                if envs.SGLANG_DEBUG_DECODE_OOB.get():
+                    running_rids = {r.rid for r in running_batch.reqs}
+                    dup = [r.rid for r in new_prebuilt_batch.reqs if r.rid in running_rids]
+                    logger.info(
+                        "[decode-oob] merge prebuilt->running: new_rids=%s pool_idx=%s dup_rids=%s",
+                        [r.rid for r in new_prebuilt_batch.reqs],
+                        [r.req_pool_idx for r in new_prebuilt_batch.reqs],
+                        dup,
+                    )
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
                     if self.enable_hisparse:

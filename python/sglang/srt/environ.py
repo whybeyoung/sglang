@@ -241,6 +241,13 @@ class Envs:
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
+    # Diagnostics for the disagg-decode + EAGLE `vectorized_gather_kernel`
+    # OOB crash. When enabled: logs cross-queue rid ownership on
+    # abort_request, logs rid membership when a prebuilt batch merges
+    # into running_batch, and adds pre-graph-replay bounds asserts on
+    # req_pool_indices / out_cache_loc. Costs a device sync per replay
+    # so keep off in production.
+    SGLANG_DEBUG_DECODE_OOB = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
