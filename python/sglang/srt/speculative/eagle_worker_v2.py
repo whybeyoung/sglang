@@ -596,6 +596,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
+        # Seed sanity — hidden_states arrives from target verify (or
+        # draft-extend). If it is already NaN/Inf here, the first draft
+        # forward will produce NaN logits and everything downstream (topk,
+        # embedding of next step) collapses. Also assert topk_index in
+        # [0, vocab_size) to catch a bad target-side sample.
+        maybe_detect_nan(
+            hidden_states,
+            "draft_forward pre-loop: seed hidden_states from spec_info",
+        )
+        maybe_detect_inf(
+            hidden_states,
+            "draft_forward pre-loop: seed hidden_states from spec_info",
+        )
+        maybe_detect_oob(
+            topk_index,
+            0,
+            self.draft_runner.model_config.vocab_size,
+            "draft_forward pre-loop: seed topk_index OOB vs vocab_size="
+            f"{self.draft_runner.model_config.vocab_size}",
+        )
 
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
@@ -681,6 +701,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if (c := self.draft_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
+            # Per-step input sanity — `input_ids` fed to embedding must be in
+            # [0, vocab_size). `hidden_states` (from step i-1, or from the
+            # target verify for step 0) must be finite.
+            maybe_detect_oob(
+                input_ids,
+                0,
+                self.draft_runner.model_config.vocab_size,
+                f"draft_forward step {i}: input_ids OOB vs vocab_size="
+                f"{self.draft_runner.model_config.vocab_size}",
+            )
+            maybe_detect_nan(
+                hidden_states,
+                f"draft_forward step {i}: input hidden_states (before forward)",
+            )
+            maybe_detect_inf(
+                hidden_states,
+                f"draft_forward step {i}: input hidden_states (before forward)",
+            )
             with (
                 forward_context(
                     ForwardContext(
@@ -690,6 +728,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 canary_index_ctx,
             ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
+            # Raw model output sanity — check before slice so we can tell
+            # whether the whole forward went bad (weights / attn overflow) or
+            # only some rows (slice bug / stale rows).
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                f"draft_forward step {i}: raw logits_output.next_token_logits",
+            )
+            maybe_detect_nan(
+                logits_output.hidden_states,
+                f"draft_forward step {i}: raw logits_output.hidden_states",
+            )
             next_token_logits, next_hidden_states, local_positions = (
                 _slice_draft_output_to_local_tokens(
                     logits_output.next_token_logits,
@@ -700,6 +749,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             maybe_detect_nan(next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(next_token_logits, f"draft_forward step {i}")
+            # `next_hidden_states` becomes the input to the next step's
+            # forward — flag it here so a bad step-i output is attributed to
+            # step i, not to step i+1's input probe.
+            maybe_detect_nan(
+                next_hidden_states,
+                f"draft_forward step {i}: sliced next_hidden_states (goes to step {i + 1})",
+            )
             if self.server_args.speculative_use_rejection_sampling:
                 probs, topk_p, topk_index = sample_draft_proposal(
                     next_token_logits,
