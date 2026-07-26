@@ -276,7 +276,141 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
     def _replay_graph(self, shape_key, forward_batch):
+        if envs.SGLANG_DEBUG_DECODE_OOB.get():
+            self._debug_check_replay_bounds(forward_batch)
         return self.backend.replay(shape_key, forward_batch)
+
+    def _debug_check_replay_bounds(self, forward_batch: ForwardBatch) -> None:
+        """SGLANG_DEBUG_DECODE_OOB=1: sync + bounds-check EAGLE draft-graph
+        gather/index_select inputs (req_pool_indices, out_cache_loc, seq_lens,
+        positions) right before backend.replay().
+
+        Mirrors DecodeCudaGraphRunner._debug_check_replay_bounds, but the
+        offending kernel here is indexSelectSmallIndex (draft _replay_graph)
+        instead of vectorized_gather_kernel (target-verify decode replay).
+        On violation we raise so we get a Python traceback instead of a
+        cudaErrorLaunchFailure. Includes a device sync so keep off in prod.
+        """
+        try:
+            torch.cuda.synchronize()
+
+            # req_pool_indices is compared against the actual allocated dim-0
+            # of req_to_token, not pool.size (DecodeReqToTokenPool exposes
+            # .size = max_running_requests while the underlying tensor is
+            # [size + pre_alloc_size + 1, max_context_len]).
+            pool = self.model_runner.req_to_token_pool
+            req_pool_alloc_size = (
+                pool.req_to_token.shape[0]
+                if hasattr(pool, "req_to_token") and pool.req_to_token is not None
+                else pool.size
+            )
+            max_context_len = (
+                pool.req_to_token.shape[1]
+                if hasattr(pool, "req_to_token") and pool.req_to_token is not None
+                else None
+            )
+            token_pool_size = (
+                self.model_runner.token_to_kv_pool_allocator.size
+                if self.model_runner.token_to_kv_pool_allocator is not None
+                else None
+            )
+            rpi = forward_batch.req_pool_indices
+            ocl = forward_batch.out_cache_loc
+            sl = forward_batch.seq_lens
+            pos = forward_batch.positions
+
+            def _range(t):
+                if t is None or t.numel() == 0:
+                    return None, None
+                return int(t.min().item()), int(t.max().item())
+
+            rpi_min, rpi_max = _range(rpi)
+            ocl_min, ocl_max = _range(ocl)
+            sl_min, sl_max = _range(sl)
+            pos_min, pos_max = _range(pos)
+
+            bad = []
+            if rpi_max is not None and rpi_max >= req_pool_alloc_size:
+                bad.append(
+                    f"req_pool_indices max={rpi_max} >= req_pool_alloc_size={req_pool_alloc_size}"
+                )
+            if rpi_min is not None and rpi_min < 0:
+                bad.append(f"req_pool_indices min={rpi_min} < 0")
+            if (
+                token_pool_size is not None
+                and ocl_max is not None
+                and ocl_max >= token_pool_size
+            ):
+                bad.append(
+                    f"out_cache_loc max={ocl_max} >= token_pool_size={token_pool_size}"
+                )
+            if ocl_min is not None and ocl_min < 0:
+                bad.append(f"out_cache_loc min={ocl_min} < 0")
+            if sl_min is not None and sl_min < 0:
+                bad.append(f"seq_lens min={sl_min} < 0")
+            if (
+                max_context_len is not None
+                and sl_max is not None
+                and sl_max > max_context_len
+            ):
+                bad.append(
+                    f"seq_lens max={sl_max} > max_context_len={max_context_len}"
+                )
+            if pos_min is not None and pos_min < 0:
+                bad.append(f"positions min={pos_min} < 0")
+            if (
+                max_context_len is not None
+                and pos_max is not None
+                and pos_max >= max_context_len
+            ):
+                bad.append(
+                    f"positions max={pos_max} >= max_context_len={max_context_len}"
+                )
+
+            import logging
+
+            _logger = logging.getLogger(__name__)
+            if bad:
+                _logger.error(
+                    "[decode-oob] draft pre-replay bounds VIOLATION bs=%d raw_bs=%d "
+                    "num_tokens_per_req=%s: %s | "
+                    "req_pool_indices=%s out_cache_loc(head32)=%s seq_lens=%s positions(head32)=%s",
+                    getattr(self, "bs", -1),
+                    getattr(self, "raw_bs", -1),
+                    getattr(self, "captured_req_width", None),
+                    "; ".join(bad),
+                    rpi.tolist() if rpi is not None else None,
+                    ocl[:32].tolist() if ocl is not None else None,
+                    sl.tolist() if sl is not None else None,
+                    pos[:32].tolist() if pos is not None else None,
+                )
+                raise RuntimeError(f"decode-oob draft pre-replay bounds: {bad}")
+            else:
+                _logger.debug(
+                    "[decode-oob] draft pre-replay bounds OK bs=%d "
+                    "rpi=[%s,%s]/%s ocl=[%s,%s]/%s sl=[%s,%s]/%s pos=[%s,%s]/%s",
+                    getattr(self, "bs", -1),
+                    rpi_min,
+                    rpi_max,
+                    req_pool_alloc_size,
+                    ocl_min,
+                    ocl_max,
+                    token_pool_size,
+                    sl_min,
+                    sl_max,
+                    max_context_len,
+                    pos_min,
+                    pos_max,
+                    max_context_len,
+                )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[decode-oob] draft pre-replay bounds check failed: %s", e
+            )
 
     # -----------------------------------------------------------------
     # Helpers
