@@ -148,12 +148,13 @@ class PrefetchOperation(StorageOperation):
             self.completed_tokens += num_tokens
             return True
 
-    def complete_pool_transfers(self) -> bool:
+    def complete_pool_transfers(self, result: dict[str, list[bool]]) -> bool:
         with self._lock:
             if self._terminated_flag:
                 return False
             assert not self.pool_transfers_done
             self.pool_transfers_done = True
+            self.pool_storage_result.update_extra_pool_hit_pages(result)
             return True
 
     def mark_terminate(self):
@@ -669,6 +670,7 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         kv_completed_pages = operation.completed_tokens // self.page_size
+        sidecar_completed_pages: dict[str, List[bool]] = {}
         if not operation.is_terminated() and kv_completed_pages == len(
             operation.hash_value
         ):
@@ -683,8 +685,7 @@ class HybridCacheController(BaseHiCacheController):
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(transfers_nonkv)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            sidecar_completed_pages = self.storage_backend.batch_get_v2(transfers_nonkv)
 
         # It is tricky to determine which thread should release memory of extra pools.
         # There are two cases:
@@ -692,7 +693,7 @@ class HybridCacheController(BaseHiCacheController):
         #    thread is responsible for releasing the extra pool.
         # 2) If complete_pool_transfer() runs AFTER mark_terminate(), then the prefetch IO
         #    thread (current thread) should release the extra pool (in below code).
-        if not operation.complete_pool_transfers():
+        if not operation.complete_pool_transfers(sidecar_completed_pages):
             self.append_host_mem_release(extra_pools=operation.pool_transfers)
 
     def _page_backup(self, operation):
