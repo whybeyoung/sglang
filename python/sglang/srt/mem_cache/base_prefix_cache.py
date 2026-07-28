@@ -26,6 +26,8 @@ from sglang.srt.observability.metrics_collector import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.hicache_storage import SidecarPoolSpec
+    from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
@@ -271,6 +273,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_fast_match_prefix(self) -> bool:
         return False
+
+    def supports_dynamic_hicache_sidecars(self) -> bool:
+        return False
+
+    def register_hicache_draft_pools(
+        self, specs: list[SidecarPoolSpec], entries: list[PoolEntry]
+    ) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support dynamic HiCache sidecars."
+        )
 
     def resolve_node_handle(self, node_handle: Any) -> Any:
         """Map a node handle to its node -- e.g. UnifiedRadixCache looks up the
