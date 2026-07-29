@@ -779,6 +779,18 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Kill-switch for GLM-5.2 MTP IndexShare (reuses the first draft step's DSA
+    # indexer top-k across the rest of the MTP chain, seeded from draft-extend
+    # / prefill). When True, forces the model-config `index_share_for_mtp_iteration`
+    # off at runtime. Use this in PD-disaggregated deployments where prefill is
+    # PP (which cannot co-run speculative_algorithm, see server_args.py L8069):
+    # prefill then never populates `req.output_dsa_topk_indices`, decode always
+    # sees `spec_info.dsa_topk_indices == None`, and the seedless fallback
+    # `can_cuda_graph = False` in eagle_worker_v2.py forces every draft step
+    # onto the DP-attention eager path -- which noticeably depresses MTP accept
+    # rate. Disabling IndexShare drops the seed pretense and lets each MTP
+    # iteration compute its own top-k under a captured CUDA graph.
+    SGLANG_DISABLE_INDEX_SHARE_MTP = EnvBool(False)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for

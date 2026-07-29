@@ -265,9 +265,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         hf_config = self.draft_runner.model_config.hf_config
         # Reuse the first draft step's DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
+        # SGLANG_DISABLE_INDEX_SHARE_MTP is a runtime kill-switch that overrides
+        # the model config -- see environ.py for the PD-with-PP rationale.
         self.index_share_for_mtp_iteration = (
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
+            and not envs.SGLANG_DISABLE_INDEX_SHARE_MTP.get()
         )
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
