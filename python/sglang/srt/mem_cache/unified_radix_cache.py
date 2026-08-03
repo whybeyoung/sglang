@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, TypeVar
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
 
@@ -52,6 +52,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     PrepareLoadBackResult,
     SWAComponent,
     TreeComponent,
+)
+from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
+    UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
@@ -134,6 +137,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        self.enable_session_radix_cache = params.enable_session_radix_cache
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
             component_registry = {
@@ -168,6 +172,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+
+        # Session ref tracking (--enable-session-radix-cache).
+        self.session_refs = UnifiedSessionRefTracker(
+            components=self._components_tuple,
+            tree_core=self.tree_core,
+            enable_session_radix_cache=self.enable_session_radix_cache,
+        )
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
@@ -275,6 +286,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
+        self.session_refs.reset()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -297,17 +309,6 @@ class UnifiedRadixCache(BasePrefixCache):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             attach_hybrid_pool_to_unified_cache,
         )
-
-        # Direct IO layout fixup (must happen before pool creation)
-        if server_args.hicache_io_backend == "direct":
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.override(
-                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
-                )
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, "
-                    "switching to page first direct layout"
-                )
 
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
@@ -534,13 +535,15 @@ class UnifiedRadixCache(BasePrefixCache):
             finally:
                 self.tree_core.evict_device_end(ct)
 
-    def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
+    def inc_lock_ref(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
         result = self.session.try_inc_lock_ref(node_id)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
-        return self.tree_core.inc_lock_ref(node_id)
+        return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
     def dec_lock_ref(
         self,
@@ -555,14 +558,29 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
 
+    def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
+        """Release the tree lock a request holds on its last_node, honoring the
+        components it skipped locking so it never drops a lock it never took."""
+        self.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+            skip_swa=skip_swa,
+        )
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
         swa_uuid_for_lock: Optional[int] = None,
+        skip_lock_node_ids: Optional[dict] = None,
     ) -> None:
         if self.disable:
             return
-        result = self.tree_core.dec_swa_lock_only(node_id, swa_uuid_for_lock)
+        result = self.tree_core.dec_swa_lock_only(
+            node_id, swa_uuid_for_lock, skip_lock_node_ids
+        )
         self._free_values(result.device_frees, result.host_frees)
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
@@ -587,7 +605,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -618,10 +636,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
-            # Truncate if needed
+            # Truncate if needed; the tail free is deferred and batched with
+            # the unaligned tail below so a shared boundary page is emitted once.
+            kv_indices_full = kv_indices
+            tail_free_start = None
             if effective_cache_len < len(token_ids):
-                free_start = max(effective_cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
+                tail_free_start = max(effective_cache_len, req.cache_protected_len)
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -635,22 +655,35 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            # Free unaligned tail (+ deferred truncation tail)
+            segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
+            if tail_free_start is not None:
+                segments.append((kv_indices_full[tail_free_start:], tail_free_start))
+            self.token_to_kv_pool_allocator.free_segments(segments)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices[req.cache_protected_len :],
+                start_pos=req.cache_protected_len,
+            )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
-        )
+        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+
+        if is_insert and result is not None and result.last_device_node is not None:
+            req.last_node = result.last_device_node
 
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+
+        if self.enable_session_radix_cache and result is not None:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if req.finished_reason is not None and not isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -730,11 +763,21 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        self._dec_req_lock(req)
+        # Opt-in: leave the matched-prefix mamba evictable during decode (it is
+        # already COW'd to the request's own slot, never read from this node again).
+        # Safe only because any future COW source is the COWing request's own
+        # admission-locked last_node (recorded only if still present, locked before
+        # the next alloc) -- not this evictable node. A scheduler that matched a
+        # whole batch before locking would break that. Off = original full lock.
+        skip_lock_components = (
+            (ComponentType.MAMBA,)
+            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+            else ()
         )
-        lock_result = self.inc_lock_ref(new_last_node)
+        lock_result = self.inc_lock_ref(
+            new_last_node, skip_lock_components=skip_lock_components
+        )
 
         # Update req fields
         if len(new_indices) < len(kv_indices_orig):
@@ -746,6 +789,8 @@ class UnifiedRadixCache(BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # carry the skip set so this node's dec releases only what we locked
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 
@@ -783,8 +828,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 [action.new_node_id, action.new_child_node_id],
             )
         elif isinstance(action, FreeDeviceKV):
+            # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free(indices)
+                self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             self._execute_and_commit_kv_backup(action)
         else:
@@ -1727,7 +1773,64 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
-    def writing_check(self, write_back: bool = False) -> None:
+    def _count_ready_acks(self, ack_queue) -> int:
+        ready_count = 0
+        for ack in ack_queue:
+            if not ack.finish_event.query():
+                break
+            ready_count += 1
+        return ready_count
+
+    def _sync_hicache_ready_counts(
+        self,
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
+        cc = self.cache_controller
+        if cc is None:
+            write_acks = 0
+            load_acks = 0
+            storage_queue_sizes = ()
+            extra_pool_names = ()
+        else:
+            write_acks = self._count_ready_acks(cc.ack_write_queue)
+            load_acks = self._count_ready_acks(cc.ack_load_queue)
+            extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
+            extra_pool_names = (
+                tuple(extra_release_queues) if self.enable_storage else ()
+            )
+            storage_queue_sizes = (
+                (
+                    cc.prefetch_revoke_queue.qsize(),
+                    cc.prefetch_hit_queue.qsize(),
+                    cc.ack_backup_queue.qsize(),
+                    cc.host_mem_release_queue.qsize(),
+                    *(extra_release_queues[name].qsize() for name in extra_pool_names),
+                )
+                if self.enable_storage
+                else ()
+            )
+
+        ready_counts = torch.tensor(
+            [
+                write_acks,
+                load_acks,
+                *storage_queue_sizes,
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+
+        count_values = list(map(int, ready_counts.tolist()))
+        return (
+            count_values[0],
+            count_values[1],
+            tuple(count_values[2:]),
+            extra_pool_names,
+        )
+
+    def writing_check(
+        self, write_back: bool = False, finish_count: Optional[int] = None
+    ) -> None:
         """Poll write-through completions."""
         cc = self.cache_controller
         if cc is None:
@@ -1745,18 +1848,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # Every rank must enter the all_reduce below; ongoing_write_through can
-        # diverge across ranks (e.g. a backup returning 0 on a subset).
-        finish_count = 0
-        if self.pp_rank == 0:
-            for ack in cc.ack_write_queue:
-                if not ack.finish_event.query():
-                    break
-                finish_count += 1
-
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        if finish_count is None:
+            # Every rank must enter the all_reduce below; ongoing_write_through can
+            # diverge across ranks (e.g. write_backup returning 0 on a subset).
+            finish_count = 0
+            if self.pp_rank == 0:
+                finish_count = self._count_ready_acks(cc.ack_write_queue)
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         # Process completed acks
         while finish_count > 0:
@@ -1766,22 +1868,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
-    def loading_check(self) -> None:
+    def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
         if cc is None:
             return
-        # Every rank must enter the all_reduce below; ongoing_load_back can
-        # diverge across ranks.
-        finish_count = 0
-        if self.pp_rank == 0:
-            for ack in cc.ack_load_queue:
-                if not ack.finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        if finish_count is None:
+            # Every rank must enter the all_reduce below; ongoing_load_back can
+            # diverge across ranks.
+            finish_count = 0
+            if self.pp_rank == 0:
+                finish_count = self._count_ready_acks(cc.ack_load_queue)
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
@@ -1848,18 +1950,43 @@ class UnifiedRadixCache(BasePrefixCache):
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
-        self.writing_check()
-        self.loading_check()
-        if self.enable_storage:
-            self.drain_storage_control_queues()
+
+        if self.pp_size != 1:
+            self.writing_check()
+            self.loading_check()
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+        else:
+            (
+                write_finish_count,
+                load_finish_count,
+                storage_queue_sizes,
+                extra_pool_names,
+            ) = self._sync_hicache_ready_counts()
+            self.writing_check(finish_count=write_finish_count)
+            self.loading_check(finish_count=load_finish_count)
+
+            if self.enable_storage and storage_queue_sizes:
+                n_revoke, n_storage_hit, n_backup, n_release = storage_queue_sizes[:4]
+                extra_release_counts = {
+                    pool_name: count
+                    for pool_name, count in zip(
+                        extra_pool_names,
+                        storage_queue_sizes[4:],
+                    )
+                }
+                self._drain_storage_control_queues_impl(
+                    n_revoke=n_revoke,
+                    n_storage_hit=n_storage_hit,
+                    n_backup=n_backup,
+                    n_release=n_release,
+                    extra_release_counts=extra_release_counts,
+                    log_metrics=True,
+                )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
-
-    def flush_write_through_acks(self) -> None:
-        """Flush pending write-through acknowledgements."""
-        self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
@@ -1897,6 +2024,17 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_mamba(self) -> bool:
         return self.is_mamba_enabled
+
+    # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
+
+    def open_radix_session(self, session_id: str) -> Optional[int]:
+        return self.session_refs.open_radix_session(session_id)
+
+    def ensure_session_generation(self, session_id: str) -> int:
+        return self.session_refs.ensure_session_generation(session_id)
+
+    def release_radix_session(self, session_id: str) -> int:
+        return self.session_refs.release_radix_session(session_id)
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 
@@ -1955,6 +2093,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.all_mamba_values_flatten()
 
     def available_and_evictable_str(self) -> str:
+        # TODO(zhangmj): need more detailed log info for session reference.
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
