@@ -2552,7 +2552,13 @@ def create_custom_parallel_group(
     local_config = sorted(list(set(group_ranks)))
     gathered_configs = [None for _ in range(world_size)]
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    # Coordinate over the world CPU (gloo) group. The default group is NCCL,
+    # and this runs after the KV pool has claimed the remaining GPU memory —
+    # lazily initializing a world NCCL communicator here fails with
+    # "Failed to CUDA calloc" (seen on PP ranks during HiCache sync-group
+    # setup).
+    cpu_group = _WORLD.cpu_group if _WORLD is not None else None
+    torch.distributed.all_gather_object(gathered_configs, local_config, group=cpu_group)
 
     unique_groups = []
     seen_signatures = set()
