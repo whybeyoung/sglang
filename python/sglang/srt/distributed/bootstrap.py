@@ -105,6 +105,9 @@ def init_torch_distributed(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
 
+        if ps.pp_size > 1:
+            _prewarm_pp_p2p()
+
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
@@ -254,6 +257,39 @@ def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
     logger.info(
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
         f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
+    )
+
+
+def _prewarm_pp_p2p() -> None:
+    """Eagerly create the 2-rank NCCL communicators for adjacent PP stages.
+
+    Unbatched torch.distributed send/recv (used by send_tensor_dict /
+    recv_tensor_dict) lazily creates a dedicated 2-rank communicator per
+    rank pair on first use. In PP, first use happens in the scheduler event
+    loop — after the KV pool has claimed the remaining GPU memory — where
+    the communicator allocation fails with "Failed to CUDA calloc".
+    """
+    warmup_start = time.perf_counter()
+    pp_group = get_pp_group()
+    dummy = torch.zeros(1, device=pp_group.device)
+    # Chain order (recv from prev, then send to next) matches each pair's
+    # first send/recv and cannot deadlock.
+    if not pp_group.is_first_rank:
+        dist.recv(
+            dummy,
+            src=pp_group.ranks[pp_group.rank_in_group - 1],
+            group=pp_group.device_group,
+        )
+    if not pp_group.is_last_rank:
+        dist.send(
+            dummy,
+            dst=pp_group.ranks[pp_group.rank_in_group + 1],
+            group=pp_group.device_group,
+        )
+    current_platform.synchronize()
+    logger.info(
+        f"PP P2P communicator warmup completed in "
+        f"{time.perf_counter() - warmup_start:.3f}s"
     )
 
 
