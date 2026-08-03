@@ -164,25 +164,39 @@ def _expand_prefill_causally_kernel(
     num_tokens,
     total_tokens,
     BLOCK: tl.constexpr,
-    BS_P2: tl.constexpr,
+    BS_CHUNK: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total_tokens
 
-    b = tl.arange(0, BS_P2)
-    bmask = b < bs
-    extend = tl.load(extend_seq_lens_ptr + b, mask=bmask, other=0).to(tl.int32)
-    start_locs = tl.cumsum(extend, axis=0) - extend
-
     is_real = offs < num_tokens
     t = tl.where(is_real, offs, 0).to(tl.int32)
-    started = (start_locs[None, :] <= t[:, None]) & bmask[None, :]
-    r = tl.sum(started.to(tl.int32), axis=1) - 1
+
+    # Walk the batch dim in BS_CHUNK slices: the (BLOCK, BS_CHUNK) tiles must
+    # stay under triton's max tensor numel (2**20), which a single full-batch
+    # tile breaks for bs > 4096 (e.g. the PP-parallel DeepGEMM warmup sweeps
+    # bs = n_sms * 64).
+    started_count = tl.zeros([BLOCK], dtype=tl.int32)
+    started_extend_sum = tl.zeros([BLOCK], dtype=tl.int32)
+    chunk_start_loc = tl.zeros([1], dtype=tl.int32)
+    for b0 in range(0, bs, BS_CHUNK):
+        b = b0 + tl.arange(0, BS_CHUNK)
+        bmask = b < bs
+        extend = tl.load(extend_seq_lens_ptr + b, mask=bmask, other=0).to(tl.int32)
+        start_locs = chunk_start_loc + tl.cumsum(extend, axis=0) - extend
+        started = (start_locs[None, :] <= t[:, None]) & bmask[None, :]
+        started_count += tl.sum(started.to(tl.int32), axis=1)
+        started_extend_sum += tl.sum(
+            tl.where(started, extend[None, :], 0).to(tl.int32), axis=1
+        )
+        chunk_start_loc += tl.sum(extend, axis=0)
+
+    r = started_count - 1
     r = tl.where(is_real, r, bs - 1).to(tl.int64)
 
     seq_len = tl.load(seq_lens_ptr + r, mask=mask, other=0).to(tl.int32)
     ext = tl.load(extend_seq_lens_ptr + r, mask=mask, other=0).to(tl.int32)
-    start_loc = tl.sum(tl.where(started, extend[None, :], 0).to(tl.int32), axis=1) - ext
+    start_loc = started_extend_sum - ext
     causal = (seq_len - ext + 1) + (t - start_loc)
     causal = tl.where(is_real, causal, 1)
 
@@ -222,7 +236,7 @@ def expand_prefill_causally_triton(
         num_tokens,
         total_tokens,
         BLOCK=BLOCK,
-        BS_P2=triton.next_power_of_2(max(bs, 1)),
+        BS_CHUNK=min(triton.next_power_of_2(max(bs, 1)), 1024),
     )
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,

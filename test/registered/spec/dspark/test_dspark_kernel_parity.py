@@ -320,6 +320,23 @@ def _case_expand_prefill_causally(tc):
         num_tokens=num_tokens,
         padded_num_tokens=num_tokens + 5,
     )
+    # Regression: bs > 4096 made the triton kernel's (BLOCK, BS_P2) tile
+    # exceed triton's max tensor numel (2**20) and fail compilation — hit by
+    # the PP-parallel DeepGEMM warmup, which sweeps bs = n_sms * 64 (4992 on
+    # H20). The kernel now chunks the batch dim.
+    bs_large = 4992
+    extend_large = torch.ones(bs_large, device=DEVICE, dtype=torch.int64)
+    tc._parity(
+        attn_metadata_kernels.ExpandPrefillCausally,
+        req_pool_indices=torch.randperm(8192, device=DEVICE)[:bs_large],
+        seq_lens=_ri(1, 500, (bs_large,)),
+        extend_seq_lens=extend_large,
+        extend_start_loc=torch.cumsum(extend_large, dim=0) - extend_large,
+        seq_lens_cpu=None,
+        extend_seq_lens_cpu=None,
+        num_tokens=bs_large,
+        padded_num_tokens=None,
+    )
     # Loop branch: uniform extend with CPU lens and no padding.
     bs2, block = 8, 6
     tc._parity(
